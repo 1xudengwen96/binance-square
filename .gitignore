@@ -1,0 +1,14 @@
+node_modules/
+data/
+.env
+*.log
+.DS_Store
+
+# Local research and scratch output: a competitor teardown, screenshots of their
+# console, and one-off scrape dumps. This repo is public, so these stay on disk.
+/bnsbot-功能汇总.md
+/out.json
+/r1.txt
+/r2.txt
+/r3.html
+/shots/01-accounts.png

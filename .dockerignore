@@ -1,0 +1,24 @@
+# The database holds the Square posting keys. Baking it into an image layer would put
+# credentials into anything that can pull the image — the volume is the only place it
+# should ever live.
+data/
+*.db
+*.db-wal
+*.db-shm
+
+# Local credentials, if a .env was ever created.
+.env
+.env.*
+
+node_modules
+npm-debug.log*
+
+# Rebuilt inside the image.
+shots/
+*.md
+!README.md
+.git/
+.gitignore
+.dockerignore
+Dockerfile
+docker-compose.yml

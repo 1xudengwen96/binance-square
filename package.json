@@ -1,0 +1,32 @@
+{
+  "name": "squareforge",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Local, single-user Binance Square content forge: collect market material, render fact-checked posts from templates, review, publish.",
+  "engines": {
+    "node": ">=24"
+  },
+  "scripts": {
+    "dev": "tsx watch src/server/app.ts",
+    "start": "tsx src/server/app.ts",
+    "collect": "tsx src/cli.ts collect",
+    "preview": "tsx src/cli.ts preview",
+    "db:init": "tsx src/cli.ts db:init",
+    "test": "tsx --test test/*.test.ts",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "better-sqlite3": "^11.5.0",
+    "dotenv": "^16.4.5",
+    "fastify": "^5.2.0",
+    "sharp": "^0.35.5",
+    "undici": "^7.30.0"
+  },
+  "devDependencies": {
+    "@types/better-sqlite3": "^7.6.12",
+    "@types/node": "^24.0.0",
+    "tsx": "^4.19.2",
+    "typescript": "^5.7.2"
+  }
+}

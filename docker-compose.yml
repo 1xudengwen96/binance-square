@@ -1,0 +1,36 @@
+services:
+  squareforge:
+    build: .
+    image: squareforge:latest
+    container_name: squareforge
+    restart: unless-stopped
+    init: true
+
+    # Bound to the host's loopback on purpose. The panel has no login — it only checks
+    # Host / Origin / a custom header — so exposing 0.0.0.0:8787 would let anything that
+    # can reach the port flip schedules, overwrite keys, or publish to your Square
+    # accounts. With this binding the reachability is the same as running it natively:
+    # open http://127.0.0.1:8787 on this machine only.
+    ports:
+      - "127.0.0.1:8787:8787"
+
+    volumes:
+      # Holds squareforge.db (with the posting keys) plus data/charts. Keep this
+      # directory off any shared/synced path.
+      - ./data:/app/data
+
+    environment:
+      HOST: 0.0.0.0
+      PORT: "8787"
+      DB_PATH: /app/data/squareforge.db
+      TZ: Asia/Shanghai
+      # Keys are configured in the panel and stored in the mounted database. Only set
+      # these if you would rather supply them from the host environment:
+      # OPENAI_API_KEY: ${OPENAI_API_KEY}
+
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:8787/healthz').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"]
+      interval: 60s
+      timeout: 6s
+      start_period: 30s
+      retries: 3
