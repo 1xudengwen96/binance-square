@@ -6,13 +6,21 @@ import { fileURLToPath } from 'node:url';
 import { Store } from '../db/index.ts';
 import { collect, generate, generateFromPool, publishDue, pauseState, reroll } from '../pipeline.ts';
 import { pool, refreshPool } from '../hot/pool.ts';
-import { nextSlot, nextSlotFor, settingsFrom, beijingDayStart } from '../schedule.ts';
+import { nextSlot, nextSlotFor, settingsFrom, saveSettings, beijingDayStart } from '../schedule.ts';
 import { templates as builtinTemplates } from '../content/templates.ts';
 import { DEFAULT_SETTINGS, STYLE_LABELS, type Settings } from '../config.ts';
 import { isStructuralDuplicate } from '../engine/guard.ts';
 import { line, tick, type TickResult } from '../daemon.ts';
 import { analyze, CATEGORY_LABELS, signalLabel } from '../stats/insight.ts';
 import { dashboard } from '../stats/dashboard.ts';
+import { backupAgeHours, BACKUP_STALE_HOURS } from '../backup.ts';
+import { attributeConversions } from '../money/conversion.ts';
+import { scoreAll } from '../rank/score.ts';
+import { distributionRows } from '../rank/observations.ts';
+import { armsOf } from '../rank/experiments.ts';
+import { playbook } from '../rank/playbook.ts';
+import { brainFor } from '../brain/brain.ts';
+import { reflect } from '../brain/author.ts';
 import { TRACKS, UNIMPLEMENTED_TRACKS, trackById } from '../studio/tracks.ts';
 import { CONCEPTS } from '../studio/concepts.ts';
 import { conceptPerformance, nextTopics, summarize } from '../studio/evidence.ts';
@@ -174,6 +182,9 @@ app.get('/api/status', (_req, reply) => {
  */
 function queueWarnings(db: Store): string[] {
   const out: string[] = [];
+  const age = backupAgeHours();
+  if (age == null) out.push('还没有任何数据库备份。这里存着全部内容与长期记忆，一旦文件损坏就全没了 —— 备份在每天自动循环里跑，手动触发一次：npx tsx scripts/backup.ts');
+  else if (age > BACKUP_STALE_HOURS) out.push(`最近的数据库备份是 ${Math.round(age)} 小时前的，自动备份可能没在跑。`);
   const orphans = db.db
     .prepare("SELECT COUNT(*) AS n FROM posts WHERE status = 'approved' AND account_id IS NULL")
     .get() as { n: number };
@@ -296,6 +307,92 @@ app.get('/api/stats/summary', (req, reply) => {
 app.get('/api/dashboard', (req, reply) => {
   const q = req.query as { days?: string };
   return reply.send(dashboard(store, { days: Number(q.days) > 0 ? Number(q.days) : 14 }));
+});
+
+/* ------------------------------------------------------------------ rank --- */
+
+/** What we currently believe about the distribution engine, and how close each claim is to earning it. */
+app.get('/api/rank', (req, reply) => {
+  const q = req.query as { days?: string };
+  const days = Math.max(1, Math.min(90, Number(q.days) > 0 ? Number(q.days) : 30));
+  const target = settingsFrom(store).targetMetric;
+  const verdicts = scoreAll(store, { days, writeMemory: false, target });
+  const curve = distributionRows(store, days).map(r => ({
+    postId: r.post_id, publishedAt: r.published_at, firstRead: r.first_read, v1h: r.v1h, v3h: r.v3h, v8h: r.v8h, v24h: r.v24h,
+    growth1h: r.growth_1h, lateShare: r.late_share, surfaced: r.surfaced, boardKind: r.board_kind, hoursToBoard: r.hours_to_board,
+    arms: armsOf(store, r.post_id),
+  }));
+  const arms = store.db.prepare('SELECT experiment, arm, COUNT(*) AS n FROM post_arms GROUP BY 1,2 ORDER BY 1,2').all();
+  const pb = playbook(store, { verdicts });
+  return reply.send({
+    verdicts,
+    curve,
+    arms,
+    playbook: { hashtagTotal: pb.hashtagTotal, attachChart: pb.attachChart, opening: pb.opening, acting: pb.acting },
+    memory: store.memoryLedger(),
+    target,
+    conversion: {
+      days: store.conversions(14),
+      totals: store.db
+        .prepare('SELECT COALESCE(SUM(rebate_usd),0) AS rebate, COALESCE(SUM(clicks),0) AS clicks, COUNT(*) AS n FROM conversion_daily')
+        .get(),
+    },
+    brain: brainFor(store, settingsFrom(store)) ? { model: settingsFrom(store).llmModel, provider: settingsFrom(store).llmProvider } : null,
+  });
+});
+
+/** Ask the brain (if configured) to distil the latest measurements into next steps. */
+app.post('/api/rank/reflect', async (_req, reply) => {
+  const brain = brainFor(store, settingsFrom(store));
+  const r = await reflect(store, brain, {});
+  store.log('rank_reflect', { stored: r.stored, notes: r.notes });
+  return reply.send({ ...r, brain: brain ? { provider: brain.provider, model: brain.model } : null });
+});
+
+app.post('/api/memory/forget', (req, reply) => {
+  const b = (req.body ?? {}) as { key?: string; reason?: string };
+  if (!b.key) return reply.code(400).send({ error: '缺少 key' });
+  store.forgetMemory(b.key, b.reason || '操作者手动撤销');
+  return reply.send({ ok: true });
+});
+
+/** The numbers Binance shows only in its own dashboard, typed in once a day. */
+app.get('/api/conversion', (_req, reply) => {
+  const s = settingsFrom(store);
+  return reply.send({
+    days: store.conversions(30),
+    target: s.targetMetric,
+    totals: store.db
+      .prepare('SELECT COALESCE(SUM(rebate_usd),0) AS rebate, COALESCE(SUM(clicks),0) AS clicks, COALESCE(SUM(followers),0) AS followers, COUNT(*) AS n FROM conversion_daily')
+      .get(),
+    attributed: store.db.prepare('SELECT COUNT(*) AS posts, COALESCE(SUM(rebate_usd),0) AS rebate FROM post_conversion').get(),
+  });
+});
+
+app.post('/api/conversion', (req, reply) => {
+  const b = (req.body ?? {}) as { day?: string; clicks?: number | string; followers?: number | string; rebateUsd?: number | string; note?: string };
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(b.day ?? '')) return reply.code(400).send({ error: '日期格式应为 YYYY-MM-DD' });
+  const num = (v: unknown): number | null => (v === '' || v == null ? null : Number(v));
+  const rebate = num(b.rebateUsd);
+  const clicks = num(b.clicks);
+  const followers = num(b.followers);
+  if ([rebate, clicks, followers].every(v => v == null)) return reply.code(400).send({ error: '至少填一项' });
+  if ([rebate, clicks, followers].some(v => v != null && !Number.isFinite(v))) return reply.code(400).send({ error: '数字格式不对' });
+  store.putConversion(b.day!, { clicks, followers, rebateUsd: rebate, note: b.note?.trim() || null });
+  const r = attributeConversions(store, {});
+  store.log('conversion_entered', { day: b.day, rebate, clicks, followers, attributed: r.posts });
+  return reply.send({ ok: true, attributed: r });
+});
+
+app.post('/api/conversion/target', (req, reply) => {
+  const b = (req.body ?? {}) as { target?: string };
+  if (b.target !== 'views' && b.target !== 'money') return reply.code(400).send({ error: 'target 只能是 views 或 money' });
+  if (b.target === 'money' && !store.db.prepare('SELECT COUNT(*) n FROM conversion_daily').get()) {
+    return reply.code(400).send({ error: '还没有录入过任何一天的后台数字，先录一天再切' });
+  }
+  const s = settingsFrom(store);
+  saveSettings(store, { ...s, targetMetric: b.target });
+  return reply.send({ ok: true, target: b.target });
 });
 
 /** The comparison pool itself, so the numbers behind a conclusion can be inspected. */

@@ -63,12 +63,18 @@ export function polishAcceptable(original: string, out: string, facts: Fact[]): 
   return { ok: true };
 }
 
-export async function polish(cfg: LlmConfig | null, original: string, facts: Fact[], persona = ''): Promise<PolishResult> {
+export async function polish(cfg: LlmConfig | null, original: string, facts: Fact[], persona = '', notes = ''): Promise<PolishResult> {
   if (!cfg || !cfg.apiKey || !cfg.model) return { text: original, changed: false, reason: 'AI 未启用或未配置' };
 
   // A persona may change tone but never the hard rules, so it is appended as an explicit
   // subordinate line rather than folded into the system prompt where it could dilute them.
-  const system = persona.trim() ? `${SYSTEM}\n\n【本账号语气】${persona.trim()}（只影响措辞，不得放宽上面任何一条硬性限制）` : SYSTEM;
+  // The account's standing lessons are subordinate for the same reason: they may change which
+  // phrasing survives, never what may be claimed.
+  const extra = [
+    persona.trim() ? `【本账号语气】${persona.trim()}` : '',
+    notes.trim() ? `【本账号从数据里学到的（只影响取舍与措辞，不得放宽上面任何一条硬性限制）】\n${notes.trim()}` : '',
+  ].filter(Boolean).join('\n\n');
+  const system = extra ? `${SYSTEM}\n\n${extra}（这些补充只影响措辞，不得放宽任何一条硬性限制）` : SYSTEM;
 
   let raw: string;
   try {

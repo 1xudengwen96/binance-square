@@ -9,7 +9,9 @@ import { beijingDayStart } from '../schedule.ts';
 import { llmConfigFor } from '../pipeline.ts';
 import { polish } from '../llm/polish.ts';
 import { buildChartFor } from '../chart/forSymbol.ts';
-import { SquareClient } from '../publisher/square.ts';
+import { SquareClient, MAX_ARTICLE_CHARS } from '../publisher/square.ts';
+import { preFlight } from '../engine/preflight.ts';
+import type { Fact } from '../engine/types.ts';
 import { getAccountSecret } from '../secrets.ts';
 import { wordBank } from '../content/wordbank.ts';
 import { nextCheckDue, readPost } from '../stats/backfill.ts';
@@ -252,7 +254,23 @@ export async function runStudio(
         store.updateStudioArticle(a.id, { coverUrl, coverPath: path });
       }
 
-      const r = await client.publishArticle({ title: a.title, bodyTextOnly: a.body, coverUrl });
+      // Same last-mile guarantee as the short posts: whatever happened after drafting — polish,
+      // an edit in the panel — the bytes about to be sent are checked once more.
+      const pf = preFlight({
+        text: a.body,
+        facts: (JSON.parse(a.facts_json ?? 'null') as Fact[] | null) ?? null,
+        disclaimerRequired: true,
+        sensitiveWords: settings.sensitiveWords,
+        maxChars: MAX_ARTICLE_CHARS,
+      });
+      if (!pf.ok) {
+        store.updateStudioArticle(a.id, { status: 'rejected', error: `发布前合规检查拦下：${pf.reason}` });
+        report.accounts.find(x => x.accountId === a.account_id)?.skipped.push(`#${a.id} 发布前拦下：${pf.reason}`);
+        continue;
+      }
+      if (pf.text !== a.body) store.updateStudioArticle(a.id, { body: pf.text });
+
+      const r = await client.publishArticle({ title: a.title, bodyTextOnly: pf.text, coverUrl });
       if (r.ok && r.postId) {
         store.updateStudioArticle(a.id, { status: 'published', squarePostId: r.postId, url: r.url ?? null, publishedAt: Date.now() });
         store.recordConceptWritten(a.concept_id, a.track_id, 0, 0);

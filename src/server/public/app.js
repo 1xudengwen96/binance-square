@@ -29,6 +29,7 @@ const ICON = {
   overview: '<path d="M3 13h8V3H3zM13 21h8V11h-8zM13 3v4h8V3zM3 17v4h8v-4z"/>',
   board: '<path d="M3 20h18M6 16V9M11 16V4M16 16v-5M21 16v-8"/>',
   insights: '<path d="M21 12a9 9 0 11-9-9v9z"/>',
+  rank: '<path d="M3 17l6-6 4 3 7-8"/><path d="M14 6h6v6"/><path d="M3 21h18"/>',
   pool: '<path d="M3 17l5-6 4 3 4-6 5 4M3 21h18"/>',
   materials: '<path d="M4 6h16M4 12h16M4 18h10"/>',
   templates: '<path d="M4 4h7v7H4zM13 4h7v4h-7zM13 11h7v9h-7zM4 14h7v6H4z"/>',
@@ -48,6 +49,7 @@ const NAV = [
   ['总览', [
     ['overview', '概览', '现在的状态、今天发了什么、下一步会发生什么', ICON.overview],
     ['board', '数据板', '发帖时间、节奏、账号分工与效果的图形视图', ICON.board],
+    ['rank', '流量引擎', '用实验去问币安的推荐系统要什么样的内容', ICON.rank],
     ['insights', '效果分析', '哪类内容更吸引人，需要样本量才成立', ICON.insights],
   ]],
   ['内容', [
@@ -143,6 +145,7 @@ async function render() {
   const el = $('#main');
   if (TAB === 'overview') el.innerHTML = await overview();
   else if (TAB === 'board') el.innerHTML = await boardView();
+  else if (TAB === 'rank') el.innerHTML = await rankView();
   else if (TAB === 'accounts') el.innerHTML = await accountsView();
   else if (TAB === 'pool') el.innerHTML = await poolView();
   else if (TAB === 'materials') el.innerHTML = await materialsView();
@@ -1166,6 +1169,199 @@ async function setAccountRole(id, role) {
 }
 
 
+/* --------------------------------------------------------------- 流量引擎 --- */
+
+let RANK_DAYS = 30;
+/** Mirrors ATTRIBUTION_WINDOW_HOURS in src/money/conversion.ts — shown so the number is interpretable. */
+const ATTRIBUTION_WINDOW = 36;
+const setRankDays = n => { RANK_DAYS = n; render(); };
+
+async function saveConversion() {
+  const body = {
+    day: document.querySelector('#cv-day').value,
+    clicks: document.querySelector('#cv-clicks').value,
+    followers: document.querySelector('#cv-followers').value,
+    rebateUsd: document.querySelector('#cv-rebate').value,
+  };
+  if (!body.day) return toast('先选日期', true);
+  try {
+    const r = await api('/api/conversion', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body) });
+    toast(`已记录，归因到 ${r.attributed.posts} 条帖子${r.attributed.unattributed ? `（${r.attributed.unattributed} 没能分下去）` : ''}`);
+    await render();
+  } catch (e) { toast(e.message, true); }
+}
+
+async function setTarget(t) {
+  try {
+    await api('/api/conversion/target', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ target: t }) });
+    toast(t === 'money' ? '实验结论今后按「每千次浏览返佣」判定' : '实验结论按浏览量判定');
+    await render();
+  } catch (e) { toast(e.message, true); }
+}
+
+const RANK_STATUS = {
+  rule: ['on', '已成立 · 会照它写'],
+  leaning: ['info', '倾向 · 还不敢当规则'],
+  flat: ['plain', '测过了 · 差别不大'],
+  observing: ['warn', '样本不足 · 不下结论'],
+};
+
+/** A tiny multi-point curve: this is what "the engine kept pushing it" looks like. */
+function sparkline(points) {
+  const pts = points.map((v, i) => ({ i, v })).filter(p => p.v != null);
+  if (pts.length < 2) return '<span class="muted">读数不足</span>';
+  const W = 96, H = 26, max = Math.max(...pts.map(p => p.v)), min = Math.min(...pts.map(p => p.v));
+  const x = i => 2 + (i / 5) * (W - 4);
+  const y = v => H - 2 - (max === min ? (H - 4) / 2 : ((v - min) / (max - min)) * (H - 4));
+  const line = pts.map(p => `${x(p.i).toFixed(1)},${y(p.v).toFixed(1)}`).join(' ');
+  const last = pts[pts.length - 1];
+  return `<svg width="${W}" height="${H}" viewBox="0 0 ${W} ${H}"><polyline points="${line}" fill="none" stroke="var(--blue)" stroke-width="1.6"/>`
+    + `<circle cx="${x(last.i).toFixed(1)}" cy="${y(last.v).toFixed(1)}" r="2.4" fill="var(--accent)"/></svg>`;
+}
+
+async function rankView() {
+  ensureTip();
+  const [d, cv] = await Promise.all([api('/api/rank?days=' + RANK_DAYS), api('/api/conversion')]);
+  const chips = [7, 14, 30, 60].map(n => `<button class="chip ${n === RANK_DAYS ? 'on' : ''}" onclick="setRankDays(${n})">最近 ${n} 天</button>`).join('');
+  const counts = {
+    rule: d.verdicts.filter(v => v.status === 'rule').length,
+    leaning: d.verdicts.filter(v => v.status === 'leaning').length,
+    observing: d.verdicts.filter(v => v.status === 'observing').length,
+    flat: d.verdicts.filter(v => v.status === 'flat').length,
+  };
+  const tile = (label, value, sub, rows) => `<div class="tile"${rows ? tip(label, rows) : ''}>
+    <div class="lbl">${label}</div><div class="v">${value}</div><div class="s">${sub}</div></div>`;
+
+  const entered = cv.days.length;
+  const money = cv.totals.rebate || 0;
+  const per1k = cv.attributed.posts && d.curve.reduce((s, c) => s + (c.v8h ?? c.v3h ?? c.firstRead ?? 0), 0) > 0
+    ? (money / d.curve.reduce((s, c) => s + (c.v8h ?? c.v3h ?? c.firstRead ?? 0), 0) * 1000) : null;
+  const today = new Date(Date.now() + 8 * 3600000).toISOString().slice(0, 10);
+  const convCard = `<div class="card" style="margin-top:14px">
+    <div class="card-hd"><h3>今天从币安后台抄三个数</h3><span class="sub">广场不给点击和返佣接口，只能手填 —— 30 秒，填了系统才有资格谈"哪条内容挣钱"</span></div>
+    <div class="form-grid">
+      <div class="field"><span class="cap">日期</span><input type="date" id="cv-day" value="${today}"></div>
+      <div class="field"><span class="cap">链接点击</span><input type="number" id="cv-clicks" min="0" placeholder="0"></div>
+      <div class="field"><span class="cap">新增粉丝</span><input type="number" id="cv-followers" min="0" placeholder="0"></div>
+      <div class="field"><span class="cap">返佣（USDT）</span><input type="number" id="cv-rebate" min="0" step="0.01" placeholder="0"></div>
+    </div>
+    <div class="row"><button class="btn primary" onclick="saveConversion()">记下</button>
+      <span class="seg">
+        <button class="${cv.target === 'views' ? 'on' : ''}" onclick="setTarget('views')">按浏览量优化</button>
+        <button class="${cv.target === 'money' ? 'on' : ''}" onclick="setTarget('money')">按返佣优化</button>
+      </span>
+      <span class="muted">${entered ? `已录 ${entered} 天，累计返佣 ${money.toFixed(2)} USDT，归因到 ${cv.attributed.posts} 条帖子` : '一天都还没录 —— 「按返佣优化」要等你录入至少一天'}</span></div>
+    <div class="hint">返佣是怎么分到每条帖子头上的：把当天总额按各帖<b>当时已积累的浏览量</b>加权摊下去，回看窗口 ${ATTRIBUTION_WINDOW} 小时。这是近似，不是账单 —— 它假设"看得多就点得多"，而这恰恰是待验证的东西。所以按返佣选出来的规则，要等它和按浏览量的结论对得上，才值得信。</div>
+    ${cv.days.length ? `<div class="tw" style="margin-top:10px"><table><thead><tr><th>日期</th><th class="num">点击</th><th class="num">新粉</th><th class="num">返佣</th><th>录入于</th></tr></thead><tbody>
+      ${cv.days.slice(0, 8).map(x => `<tr><td>${esc(x.day)}</td><td class="num">${x.clicks ?? '—'}</td><td class="num">${x.followers ?? '—'}</td><td class="num">${x.rebate_usd != null ? x.rebate_usd.toFixed(2) : '—'}</td><td class="muted">${ago(x.entered_at)}</td></tr>`).join('')}
+    </tbody></table></div>` : ''}
+  </div>`;
+
+  const kpis = `<div class="grid gkpi">
+    ${tile('已成立的规则', counts.rule, counts.rule ? '已写入长期记忆，正在影响写法' : '还没有任何一条判断攒够样本',
+      d.verdicts.filter(v => v.status === 'rule').map(v => [v.id, v.arms.map(a => `${a.arm}:${a.median ?? '—'}`).join(' ')]) )}
+    ${tile('正在观察', counts.observing, `另有 ${counts.leaning} 条已现倾向`, d.verdicts.filter(v => v.status === 'observing').map(v => [v.id, `还差 ${v.missing} 条`] ))}
+    ${tile('已观察帖子', d.curve.length, '按 20 分钟 / 1 / 3 / 8 / 24 小时回看', null)}
+    ${tile('每千次浏览返佣', per1k == null ? '<span style="font-size:18px">还没录</span>' : `${per1k.toFixed(2)}<small> USDT</small>`,
+      per1k == null ? '录一次后台数字，系统才开始优化真正挣钱那一环' : `累计 ${money.toFixed(2)} USDT / ${entered} 天`,
+      [['累计返佣', `${money.toFixed(2)} USDT`], ['录入天数', `${entered} 天`], ['当前优化目标', d.target === 'money' ? '每千次浏览返佣' : '浏览量'], ['归因方式', `${ATTRIBUTION_WINDOW} 小时窗口内按已积累浏览量加权`], ['提醒', '这是近似：它假设看得多就点得多，而这正是要验证的假设']])}
+    ${tile('长期记忆', d.memory.length, '条当前生效的判断', d.memory.slice(0, 6).map(m => [m.kind, `${m.text.slice(0, 28)}… 置信 ${(m.confidence * 100).toFixed(0)}%`]))}
+    ${tile('AI 大脑', d.brain ? '已接入' : '未启用', d.brain ? `${d.brain.provider} · ${d.brain.model}` : '没有大脑也照常运转：规则由测量直接得出',
+      d.brain ? [['提供方', d.brain.provider], ['模型', d.brain.model], ['权限', '只改写与排序，不得新增数字或币种']] : [['状态', '未配置或已关闭'], ['影响', '自我迭代仍在工作，只是少一层归纳']] )}
+  </div>`;
+
+  const cards = d.verdicts.map(v => {
+    const [cls, label] = RANK_STATUS[v.status] ?? ['', v.status];
+    const max = Math.max(0, ...v.arms.map(a => a.median ?? 0));
+    const bars = v.arms.map(a => `<div class="hbar${a.median == null ? ' off' : ''}">
+        <span>${esc(a.arm)}</span>
+        <span class="track"><i style="width:${a.median == null || !max ? 0 : Math.max(3, (a.median / max) * 100)}%;background:${v.winner === a.arm ? 'var(--green)' : 'var(--blue)'}"></i></span>
+        <span class="v"${tip(`${v.id} · ${a.arm}`, [['中位', a.median == null ? '无读数' : Math.round(a.median).toLocaleString('en-US')], ['样本', `${a.n} 条`], ['最好一条', a.best == null ? '—' : Math.round(a.best).toLocaleString('en-US')]])}>${a.median == null ? '—' : Math.round(a.median).toLocaleString('en-US')}<span class="muted">${a.n} 条</span></span>
+      </div>`).join('');
+    return `<div class="card" style="margin-top:14px">
+      <div class="card-hd"><h3>${esc(v.claim)}</h3>
+        <span class="right"><span class="pill ${cls}">${label}</span>${v.status === 'observing' ? `<span class="muted">还差 ${v.missing} 条</span>` : ''}</span></div>
+      <div class="kv" style="gap:8px;margin-bottom:10px">
+        <span class="pill plain">${v.mode === 'experiment' ? '主动实验：机器人随机分配' : '观察：从已发生的事里读'}</span>
+        <span class="pill plain">指标 ${esc(v.metric)}</span>
+        <span class="pill plain">置信 ${(v.confidence * 100).toFixed(0)}%</span>
+        <span class="pill ${v.stratified.strata >= 2 ? 'plain' : 'warn'}" ${tip('分层比较', [['可比层数', `${v.stratified.strata} 层`], ['被丢掉的层', `${v.stratified.dropped} 层（层内只有一个臂）`], ['层内差距', v.stratified.gap == null ? '—' : v.stratified.gap], ['相对差距', v.stratified.rel == null ? '—' : ((v.stratified.rel * 100).toFixed(0) + '%')], ['为什么分层', '浏览量最大的影响因素是哪个币、它当时多热，比写法的影响大一到两个数量级']], true)}>${v.stratified.strata} 层内比</span>
+        <span class="pill ${v.replicated === true ? 'on' : v.replicated === false ? 'bad' : 'plain'}"${tip('时间对半验证', [['前半段赢家', v.replicated == null ? '无法判定' : '见后半'], ['结论', v.replicated === true ? '两半一致' : v.replicated === false ? '两半不一致 —— 噪声' : '样本不够分两半']])}>${v.replicated === true ? '两半一致' : v.replicated === false ? '两半打架' : '未验证'}</span>
+        <span class="pill ${Math.abs(v.effect) >= 0.15 ? 'warn' : 'plain'}"${tip('混比（不分层）', [['相对差距', (v.effect * 100).toFixed(0) + '%'], ['用途', '只作对照：如果混比很大而分层很小，说明那个差是币的热度']])}>混比 ${(v.effect * 100).toFixed(0)}%</span>
+        ${v.status === 'observing' ? `<span class="muted">还差 ${v.missing} 条</span>` : ''}
+      </div>
+      <div class="hbars">${bars}</div>
+      ${v.action ? `<div class="alert good" style="margin-top:10px"><svg viewBox="0 0 24 24"><path d="M20 6L9 17l-5-5"/></svg><div>${esc(v.action)}</div></div>` : ''}
+      ${v.note ? `<div class="alert warn" style="margin-top:10px"><svg viewBox="0 0 24 24"><path d="M12 9v4M12 17h.01M10.3 3.9L2.4 18a2 2 0 001.7 3h15.8a2 2 0 001.7-3L13.7 3.9a2 2 0 00-3.4 0z"/></svg><div>${esc(v.note)}</div></div>` : ''}
+      <div class="hint" style="margin-top:9px"><b>怎么测：</b>${esc(v.how)}<br><b>代价：</b>${esc(v.risk)}</div>
+    </div>`;
+  }).join('');
+
+  const curve = d.curve.length ? d.curve.map(c => `<tr>
+      <td class="num">#${c.postId}</td>
+      <td>${sparkline([c.firstRead, c.v1h, c.v3h, c.v8h, c.v24h])}</td>
+      <td class="num">${c.firstRead ?? '—'}</td>
+      <td class="num">${c.v8h ?? c.v3h ?? '—'}</td>
+      <td class="num"${tip('首小时增速', [['20 分钟 → 1 小时', c.growth1h == null ? '读数不足' : c.growth1h.toFixed(2) + '×'], ['含义', '接近 1 表示基本没被再推；越大表示持续被分发']])}>${c.growth1h == null ? '—' : c.growth1h.toFixed(2) + '×'}</td>
+      <td>${c.surfaced ? `<span class="pill on">${esc(c.boardKind || '上过榜')}</span>${c.hoursToBoard != null ? `<span class="sub">${c.hoursToBoard} 小时后上榜</span>` : ''}` : '<span class="pill plain">未上榜</span>'}</td>
+      <td>${Object.keys(c.arms || {}).length ? Object.entries(c.arms).map(([k, a]) => `<span class="tag">${esc(k.replace('h_', ''))}=${esc(a)}</span>`).join(' ') : '<span class="muted">早于实验</span>'}</td>
+    </tr>`).join('') : '<tr><td colspan="7"><div class="empty"><b>还没有分发曲线</b><span>帖子发出 20 分钟后出现第一个读数。</span></div></td></tr>';
+
+  const mem = d.memory.length ? d.memory.map(m => `<tr>
+      <td><span class="pill plain">${esc(m.kind)}</span></td>
+      <td>${esc(m.text)}<span class="sub">${esc(m.key)} · 来自 ${esc(m.source)}${m.history_n > 1 ? ` · 这是第 ${m.history_n} 版` : ''}</span></td>
+      <td class="num"${tip('置信度', [['置信', (m.confidence * 100).toFixed(0) + '%'], ['证据', m.evidence_n + ' 条'], ['被引用', m.use_count + ' 次'], ['记下于', fmtTs(m.created_at)]])}>${(m.confidence * 100).toFixed(0)}%</td>
+      <td class="num">${m.evidence_n}</td>
+      <td class="num">${ago(m.created_at)}</td>
+      <td><button class="btn sm danger" onclick="forgetMemory('${esc(m.key)}')">撤销</button></td>
+    </tr>`).join('') : '<tr><td colspan="6"><div class="empty"><b>还没有形成任何长期判断</b><span>当某条假设的样本与差距同时够了，结论会写进这里，并在之后每次写作时被读到。</span></div></td></tr>';
+
+  const acting = d.playbook?.acting?.length
+    ? `<div class="alert"><svg viewBox="0 0 24 24"><path d="M12 16v-4M12 8h.01"/><circle cx="12" cy="12" r="9"/></svg>
+       <div>这一轮正在生效：${d.playbook.acting.map(a => esc(a.text)).join('； ')}。主题标签 ${d.playbook.hashtagTopics} 个 · ${d.playbook.attachChart ? '带图' : '不带图'} · 收尾${d.playbook.opening === 'question' ? '提问' : '陈述'}</div></div>`
+    : '<div class="hint" style="margin-top:10px">现在还没有任何一条判断在影响写法 —— 每一篇仍按默认（带图、1 个主题标签、陈述收尾）。这不是没生效，是它还没拿到足够样本。</div>';
+
+  return `
+  <div class="card">
+    <div class="card-hd"><h3>流量引擎</h3><span class="sub">读不到币安的算法，所以用实验去问它</span>
+      <span class="right">
+        <div class="chips">${chips}</div>
+        <button class="btn sm" onclick="rankReflect()">立即归纳一次</button>
+      </span></div>
+    <div class="hint" style="margin-top:0">流程是固定的：先写下可被证伪的假设 → 机器人在发帖前按臂分配并记录 → 分档回看把浏览曲线变成分发事实 → 只有样本量和差距同时够格，才升为规则 → 规则写进长期记忆，之后每次写作前被读到。任何一条测出反果，旧结论会被新结论覆盖而不是删除，「我们曾经以为」也是要留下的。</div>
+    ${acting}
+    <div style="margin-top:12px">${kpis}</div>
+  </div>
+  ${convCard}
+  ${cards}
+  <div class="card" style="margin-top:14px">
+    <div class="card-hd"><h3>每条帖子的分发形状</h3><span class="sub">绝对浏览量混着币本身的热度，曲线形状才是引擎的决定</span></div>
+    <div class="tw"><table><thead><tr><th class="num">帖子</th><th>20m→24h</th><th class="num">首读</th><th class="num">最新</th><th class="num">首小时增速</th><th>上榜</th><th>本篇实验臂</th></tr></thead>
+      <tbody>${curve}</tbody></table></div>
+  </div>
+  <div class="card" style="margin-top:14px">
+    <div class="card-hd"><h3>长期记忆</h3><span class="sub">机器人现在记得的事，以及每条的出处和证据量</span></div>
+    <div class="tw"><table><thead><tr><th>类型</th><th>内容</th><th class="num">置信</th><th class="num">证据</th><th class="num">记下于</th><th></th></tr></thead>
+      <tbody>${mem}</tbody></table></div>
+    <div class="hint">撤销一条记忆后，它不会在下一轮又被 AI 想出来 —— 只有重新测出同样的结果才会再写进来。</div>
+  </div>`;
+}
+
+async function rankReflect() {
+  toast('归纳中…');
+  try {
+    const r = await api('/api/rank/reflect', { method: 'POST' });
+    toast(`写入 ${r.stored.length} 条判断${r.notes.length ? ' · ' + r.notes[0] : ''}`);
+    await render();
+  } catch (e) { toast('归纳失败：' + e.message, true); }
+}
+
+async function forgetMemory(key) {
+  if (!confirm('撤销这条判断？它会保留在历史里，但不再影响写作。')) return;
+  await api('/api/memory/forget', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ key }) });
+  toast('已撤销');
+  await render();
+}
 /* ------------------------------------------------------------------ 工作室 --- */
 
 let STUDIO_OPEN = 0;

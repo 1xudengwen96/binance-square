@@ -20,7 +20,14 @@ export const wordBank: Record<string, string> = {
   /* ---------------------------------------------------- risk phrases --- */
   // These are used as standalone lines, so each variant carries its own terminator.
   'phrase.risk': '{注意仓位。|别上头。|控制一下风险。|自己把握分寸。}',
-  'phrase.notAdvice': '{以上仅为信息整理，不构成建议。|个人观点，不构成投资建议。|数据摆在这儿，决定你自己做。}',
+  'phrase.notAdvice': '{以上仅为信息整理，不构成建议。|个人观点，不构成投资建议。}',
+  // This line reads like a disclaimer and is not one. It used to live in `phrase.notAdvice`,
+  // where the compliance gate could not tell them apart and let four published posts go out
+  // with no disclaimer at all. It is a closing punch; keep it that way.
+  'phrase.yourCall': '{数据摆在这儿，决定你自己做。|数据就在这儿，决定由你自己做。}',
+  // The question arm of `h_opening`. Deliberately asks for the reader's read, never for their
+  // action — 「要跟吗」 is one word away from 带单, which the compliance gate rejects outright.
+  'closing.question': '{这个位置你怎么看？|你更在意哪一头，费还是量？|这种状态你见过反转吗？|你的判断和这个数一致吗？}',
   'phrase.hindsight': '{事后看都简单，当时谁不慌。|消息出来之前谁也没料到。}',
 
   /* ------------------------------------------------- opinion: 资金费率 --- */

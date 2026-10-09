@@ -29,6 +29,12 @@ export interface Settings {
   crossAccountGapMinutes: number;
   /** How long a coin stays reserved to the account that first took it. */
   crossAccountCoinExclusionMinutes: number;
+  /**
+   * How long the same account must wait before saying anything else about the same coin's same
+   * kind of signal. Four funding posts about one coin in six hours each looked novel on its own
+   * and read as one person shouting about one number.
+   */
+  coinSignalCooldownMinutes: number;
   /** Rows older than this are deleted outright; expiry is separate and much shorter. */
   dataRetentionDays: number;
   /** Chart PNGs are regenerable, so unreferenced ones go after this long. */
@@ -63,6 +69,13 @@ export interface Settings {
    * earn an equal share of the schedule.
    */
   categoryWeights: Record<string, number>;
+
+  /**
+   * What the experiment engine should be optimising for. `views` is measurable automatically and
+   * is a proxy; `money` uses the rebate figures the operator types in once a day, apportioned
+   * across posts by views. Switching to `money` does nothing until at least one day is entered.
+   */
+  targetMetric: 'views' | 'money';
 
   /* --- optional AI polish layer --- */
   llmEnabled: boolean;
@@ -105,6 +118,7 @@ export const STYLE_LABELS: Record<string, string> = {
 };
 
 export const DEFAULT_SETTINGS: Settings = {
+  targetMetric: 'views',
   dailyCap: 12,
   postsPerDay: 8,
   minIntervalMinutes: 45,
@@ -119,6 +133,7 @@ export const DEFAULT_SETTINGS: Settings = {
   fingerprintCooldownMinutes: 720,
   crossAccountGapMinutes: 14,
   crossAccountCoinExclusionMinutes: 360,
+  coinSignalCooldownMinutes: 720,
   dataRetentionDays: 14,
   chartRetentionHours: 72,
   autoRun: true,

@@ -283,6 +283,88 @@ CREATE TABLE IF NOT EXISTS studio_lessons (
   detail       TEXT NOT NULL,
   created_at   INTEGER NOT NULL
 );
+
+/*
+ * The robot's long-term memory. One ledger for every durable belief — what the distribution
+ * engine rewards, what an audience responded to, what the operator said once and meant.
+ *
+ * Append-then-supersede rather than UPDATE: a belief that changed must leave behind the belief
+ * it replaced, because "we used to think posting at 23:00 worked" is itself the kind of thing
+ * that stops a system from repeating a mistake it already made once.
+ */
+CREATE TABLE IF NOT EXISTS brain_memory (
+  id           INTEGER PRIMARY KEY AUTOINCREMENT,
+  kind         TEXT NOT NULL,             -- rank-rule|content-lesson|audience-fact|engine-model|instruction
+  key          TEXT NOT NULL,             -- stable identity; a new finding on the same key retires the old one
+  text         TEXT NOT NULL,
+  confidence   REAL NOT NULL DEFAULT 0.5,
+  evidence_n   INTEGER NOT NULL DEFAULT 0,
+  source       TEXT NOT NULL,             -- rank-score|studio-evidence|brain|operator|audit
+  status       TEXT NOT NULL DEFAULT 'active',   -- active|superseded|rejected|expired
+  supersedes   INTEGER,
+  superseded_by INTEGER,
+  created_at   INTEGER NOT NULL,
+  last_used_at INTEGER,
+  use_count    INTEGER NOT NULL DEFAULT 0,
+  expires_at   INTEGER
+);
+CREATE UNIQUE INDEX IF NOT EXISTS brain_memory_active_key ON brain_memory(key) WHERE status = 'active';
+CREATE INDEX IF NOT EXISTS brain_memory_kind ON brain_memory(kind, status);
+
+/*
+ * What the distribution engine did with a post, derived from the checkpoint curve.
+ *
+ * The absolute view count is the least informative number here: it mixes the coin's own heat
+ * with the algorithm's decision. The *shape* is the decision — a post shown only to followers
+ * stops growing within an hour, one that gets picked up keeps accruing, and the delay before it
+ * first appears on a public board is the engine's own latency, measured rather than guessed.
+ */
+CREATE TABLE IF NOT EXISTS post_distribution (
+  post_id      INTEGER PRIMARY KEY REFERENCES posts(id),
+  first_read   INTEGER,
+  v1h          INTEGER,
+  v3h          INTEGER,
+  v8h          INTEGER,
+  v24h         INTEGER,
+  growth_1h    REAL,
+  late_share   REAL,
+  surfaced     INTEGER NOT NULL DEFAULT 0,
+  board_kind   TEXT,
+  hours_to_board REAL,
+  computed_at  INTEGER NOT NULL
+);
+
+/* Which arm of which experiment each post was written under. Without this the comparisons are
+ * folklore — the assignment has to be on record before the outcome is known. */
+CREATE TABLE IF NOT EXISTS post_arms (
+  post_id     INTEGER NOT NULL REFERENCES posts(id),
+  experiment  TEXT NOT NULL,
+  arm         TEXT NOT NULL,
+  assigned_at INTEGER NOT NULL,
+  PRIMARY KEY (post_id, experiment)
+);
+
+/*
+ * The numbers Binance shows the operator but no public API returns: clicks, new followers,
+ * rebate. Entered by hand, once a day, thirty seconds. Everything downstream is an apportionment
+ * of these against view counts, which is a reasonable guess and not an accounting statement —
+ * the panel says so wherever it uses them.
+ */
+CREATE TABLE IF NOT EXISTS conversion_daily (
+  day        TEXT PRIMARY KEY,          -- Beijing date the operator read the dashboard
+  clicks     INTEGER,
+  followers  INTEGER,
+  rebate_usd REAL,
+  note       TEXT,
+  entered_at INTEGER NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS post_conversion (
+  post_id     INTEGER PRIMARY KEY REFERENCES posts(id),
+  rebate_usd  REAL NOT NULL DEFAULT 0,
+  clicks      REAL NOT NULL DEFAULT 0,
+  attributed_at INTEGER NOT NULL
+);
 `;
 
 export class Store {
@@ -1015,6 +1097,89 @@ export class Store {
     return this.db.prepare('SELECT * FROM studio_lessons ORDER BY id DESC LIMIT ?').all(limit) as never;
   }
 
+  /* ---------------------------------------------------------------- memory */
+
+  /**
+   * Record a durable belief. Same key + same sentence refreshes confidence and evidence; same key
+   * with a different sentence retires the old one instead of overwriting it, so the history of
+   * what we believed and stopped believing survives.
+   */
+  remember(m: {
+    kind: string; key: string; text: string; confidence?: number; evidenceN?: number; source: string; ttlMinutes?: number;
+  }): number {
+    const now = Date.now();
+    const existing = this.db
+      .prepare("SELECT id, text, confidence, evidence_n FROM brain_memory WHERE key = ? AND status = 'active'")
+      .get(m.key) as { id: number; text: string; confidence: number; evidence_n: number } | undefined;
+    if (existing && existing.text === m.text) {
+      this.db
+        .prepare('UPDATE brain_memory SET confidence = ?, evidence_n = ?, last_used_at = ? WHERE id = ?')
+        .run(m.confidence ?? existing.confidence, Math.max(existing.evidence_n, m.evidenceN ?? 0), now, existing.id);
+      return existing.id;
+    }
+    if (existing) {
+      this.db.prepare('UPDATE brain_memory SET status = ?, superseded_by = NULL, last_used_at = ? WHERE id = ?')
+        .run('superseded', now, existing.id);
+    }
+    const res = this.db
+      .prepare(
+        `INSERT INTO brain_memory (kind, key, text, confidence, evidence_n, source, created_at, supersedes, expires_at)
+         VALUES (@k, @ke, @t, @c, @n, @s, @at, @sup, @exp)`,
+      )
+      .run({
+        k: m.kind, ke: m.key, t: m.text, c: m.confidence ?? 0.5, n: m.evidenceN ?? 0, s: m.source, at: now,
+        sup: existing?.id ?? null, exp: m.ttlMinutes ? now + m.ttlMinutes * 60_000 : null,
+      });
+    if (existing) this.db.prepare('UPDATE brain_memory SET superseded_by = ? WHERE id = ?').run(Number(res.lastInsertRowid), existing.id);
+    return Number(res.lastInsertRowid);
+  }
+
+  activeMemory(kind?: string): MemoryRow[] {
+    const sql = kind
+      ? "SELECT * FROM brain_memory WHERE status = 'active' AND kind = ? ORDER BY confidence DESC, evidence_n DESC, id DESC"
+      : "SELECT * FROM brain_memory WHERE status = 'active' ORDER BY confidence DESC, evidence_n DESC, id DESC";
+    return (kind ? this.db.prepare(sql).all(kind) : this.db.prepare(sql).all()) as MemoryRow[];
+  }
+
+  touchMemory(ids: number[]): void {
+    if (!ids.length) return;
+    this.db
+      .prepare(`UPDATE brain_memory SET last_used_at = ?, use_count = use_count + 1 WHERE id IN (${ids.map(() => '?').join(',')})`)
+      .run(Date.now(), ...ids);
+  }
+
+  forgetMemory(key: string, reason: string): void {
+    this.db
+      .prepare("UPDATE brain_memory SET status = 'rejected', text = text || ' —— 已撤销：' || ? WHERE key = ? AND status = 'active'")
+      .run(reason, key);
+  }
+
+  memoryLedger(limit = 200): (MemoryRow & { history_n: number })[] {
+    return this.db
+      .prepare(
+        `SELECT b.*, (SELECT COUNT(*) FROM brain_memory h WHERE h.key = b.key) AS history_n
+         FROM brain_memory b WHERE b.status = 'active' ORDER BY b.kind, b.confidence DESC LIMIT ?`,
+      )
+      .all(limit) as (MemoryRow & { history_n: number })[];
+  }
+
+  /* ----------------------------------------------------------- conversion */
+
+  putConversion(day: string, v: { clicks?: number | null; followers?: number | null; rebateUsd?: number | null; note?: string | null }): void {
+    this.db
+      .prepare(
+        `INSERT INTO conversion_daily (day, clicks, followers, rebate_usd, note, entered_at)
+         VALUES (@d, @c, @f, @r, @n, @e)
+         ON CONFLICT(day) DO UPDATE SET clicks = COALESCE(excluded.clicks, clicks), followers = COALESCE(excluded.followers, followers),
+           rebate_usd = COALESCE(excluded.rebate_usd, rebate_usd), note = COALESCE(excluded.note, note), entered_at = excluded.entered_at`,
+      )
+      .run({ d: day, c: v.clicks ?? null, f: v.followers ?? null, r: v.rebateUsd ?? null, n: v.note ?? null, e: Date.now() });
+  }
+
+  conversions(days = 30): { day: string; clicks: number | null; followers: number | null; rebate_usd: number | null; note: string | null; entered_at: number }[] {
+    return this.db.prepare('SELECT * FROM conversion_daily ORDER BY day DESC LIMIT ?').all(days) as never;
+  }
+
   /* ------------------------------------------------------------- settings */
   getSetting<T>(key: string, fallback: T): T {
     const row = this.db.prepare('SELECT value FROM settings WHERE key = ?').get(key) as { value: string } | undefined;
@@ -1250,6 +1415,27 @@ export class Store {
       .all(now) as AccountRow[];
   }
 
+  /**
+   * Has this account already said something about this coin's this signal recently?
+   *
+   * The template fingerprint cannot catch it: four posts about one coin's funding rate were
+   * written from four different templates over six hours, each technically fresh, together
+   * reading as one person shouting about one number. The cooldown is per (coin, category)
+   * because a coin's funding rate and its listing news are genuinely different subjects.
+   */
+  recentCoinSignal(accountId: number | null, symbol: string, category: string, sinceMs: number): number {
+    const scope = accountId === null ? 'p.account_id IS NULL' : 'p.account_id = @a';
+    return (
+      this.db
+        .prepare(
+          `SELECT COUNT(*) AS n FROM posts p JOIN materials m ON m.id = p.material_id
+           WHERE ${scope} AND m.symbol = @s AND m.category = @c
+             AND p.status IN ('draft','approved','published') AND COALESCE(p.published_at, p.created_at) >= @t`,
+        )
+        .get({ a: accountId, s: symbol, c: category, t: sinceMs }) as { n: number }
+    ).n;
+  }
+
   /** Posts already committed to an account today, for its own quota. */
   accountPostsToday(accountId: number, sinceUtcMs: number): number {
     const rows = this.db
@@ -1466,6 +1652,23 @@ export interface ListAttribution {
   shares: number | null;
   reactions: number | null;
   checked_at: number | null;
+}
+
+export interface MemoryRow {
+  id: number;
+  kind: string;
+  key: string;
+  text: string;
+  confidence: number;
+  evidence_n: number;
+  source: string;
+  status: string;
+  supersedes: number | null;
+  superseded_by: number | null;
+  created_at: number;
+  last_used_at: number | null;
+  use_count: number;
+  expires_at: number | null;
 }
 
 /** A published post with everything an analysis needs to attribute its performance. */

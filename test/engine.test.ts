@@ -194,6 +194,7 @@ const ATTENTION_CTX: Context = {
     payer: '多头',
     intervalHours: 8,
     ratio: 1.42,
+    prevRatio: 1.43,
     ratioDiff: -0.01,
     longPct: 58.6,
     shortPct: 41.4,

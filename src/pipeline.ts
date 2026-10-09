@@ -22,7 +22,8 @@ import { mergeSameStory } from './material/merge.ts';
 import { buildChartFor } from './chart/forSymbol.ts';
 import { readFileSync } from 'node:fs';
 import { extname } from 'node:path';
-import { SquareClient, type PublishOutcome } from './publisher/square.ts';
+import { SquareClient, MAX_BODY_CHARS, type PublishOutcome } from './publisher/square.ts';
+import { preFlight } from './engine/preflight.ts';
 import { polish } from './llm/polish.ts';
 import { getAccountSecret, getSecret } from './secrets.ts';
 import type { LlmConfig } from './llm/providers.ts';
@@ -30,17 +31,58 @@ import type { Fact } from './engine/types.ts';
 import type { Material } from './material/types.ts';
 import type { Settings } from './config.ts';
 import { matrixEligibleAccounts } from './studio/lock.ts';
+import { planArms, recordArms } from './rank/experiments.ts';
+import { playbook } from './rank/playbook.ts';
+import { scoreAll } from './rank/score.ts';
+import { writingNotes } from './brain/author.ts';
+import type { Verdict } from './rank/score.ts';
+
+/** A line from the word bank, chosen by the same seed that chose the draft, so a preview repeats. */
+function pickBank(key: string, seed: string | number): string {
+  const raw = wordBank[key] ?? '';
+  const opts = raw.startsWith('{') ? raw.slice(1, -1).split('|') : [raw];
+  const h = typeof seed === 'number' ? seed : hashString(seed);
+  return opts[Math.abs(h) % opts.length]!;
+}
 
 const DISCLAIMER_BANK = /^(phrase\.notAdvice|disclaimer\.)/;
 
+/**
+ * What a disclaimer actually says, checked against the rendered text.
+ *
+ * The gate used to ask "did this draft draw from a bank named like a disclaimer", and one of
+ * that bank's three variants was 「数据摆在这儿，决定你自己做」— a shrug, not a disclaimer. Four
+ * published posts went out with no compliance line and nothing complained. A sentence either
+ * disclaims advice or it does not; that is a property of the text.
+ */
+const DISCLAIMER_RE = /不构成[^。\n]{0,10}建议|仅为信息整理|仅供参考|不构成任何建议|DYOR|请自行判断/i;
+export const carriesDisclaimer = (text: string): boolean => DISCLAIMER_RE.test(text);
+
 /** Square's own hashtag grammar — anything outside it renders as dead text. */
 const HASHTAG_OK = /^[\p{L}\p{N}_]{2,60}$/u;
+
+/**
+ * The thinnest post worth publishing, in distinct numeric claims. One number plus an opinion is
+ * what a single-event tool can also print; measured on the first day, the 60–88 character
+ * funding notes carried exactly one number each and were also the ones repeated four times on
+ * the same coin. Below this floor the draft is dropped rather than sent.
+ */
+export const MIN_DISTINCT_FACTS = 3;
+
+export function tooThin(facts: Fact[], text: string): string | null {
+  const distinct = new Set(facts.filter(f => f.kind === 'number' && f.value !== null).map(f => f.field));
+  if (distinct.size >= MIN_DISTINCT_FACTS) return null;
+  // A long post that leans on two numbers is still an argument; a short one is a shrug.
+  if (distinct.size >= 2 && text.length >= 160) return null;
+  return `信息量不足：${distinct.size} 个独立数字（门槛 ${MIN_DISTINCT_FACTS} 个），${text.length} 字`;
+}
 
 const DISCLAIMER_LINES = new Set(
   Object.entries(wordBank)
     .filter(([k]) => DISCLAIMER_BANK.test(k))
     .flatMap(([, v]) => (v.startsWith('{') ? v.slice(1, -1).split('|') : [v]))
-    .map(s => s.trim()),
+    .map(s => s.trim())
+    .filter(s => DISCLAIMER_RE.test(s)),
 );
 
 /** Templates this account may use. Blocking one is per-account so two accounts can be
@@ -56,13 +98,44 @@ function defsForAccount(all: ReturnType<Store['allTemplates']>, account?: Accoun
  * page, which is a distribution surface the write API hands over for free. It goes
  * above the disclaimer so the legal line stays last.
  */
-export function withHashtags(text: string, m: Material): string {
+/**
+ * One topical tag next to the coin tag, up to `total` hashtags on the post.
+ *
+ * A bare `#BTC` competes with every bitcoin post ever published; the topic feeds are where a
+ * small account actually gets placed. This is also an experiment arm (`h_hashtag_count`), so the
+ * count is a parameter rather than a constant — and it counts what a reader sees, coin tag
+ * included, because that is the thing the engine can react to.
+ */
+const TOPIC_TAGS: Record<string, string> = {
+  attention: '热度榜', funding: '资金费率', long_short: '多空比', market_move: '行情异动',
+  leaderboard: '涨跌榜', sentiment: '市场情绪', stablecoin: '稳定币', trending: '热搜',
+  onchain: '链上数据', dex: 'DEX', liquidation: '爆仓', open_interest: '持仓变化',
+  announcement: '币安公告', newsflash: '快讯', etf_flow: 'ETF',
+};
+
+export function withHashtags(text: string, m: Material, total = 2): string {
   const tag = [m.symbol, ...m.symbols].map(s => (s ?? '').trim()).find(s => HASHTAG_OK.test(s));
   if (!tag) return text;
-  if (new RegExp(`#${tag.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}(?![\\p{L}\\p{N}_])`, 'iu').test(text)) return text;
+  const topical = Math.max(0, total - 1);
+  const wanted = [`#${tag}`, ...[m.category, 'crypto'].slice(0, topical).map(c => `#${TOPIC_TAGS[c] ?? 'crypto'}`)];
+  // A tag already anywhere in the text counts as present — inline in a sentence still puts the
+  // post on that page, and repeating it reads as padding.
+  const already = (t: string) =>
+    new RegExp(`${t.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}(?![\\p{L}\\p{N}_])`, 'iu').test(text);
   const lines = text.split('\n');
+  const add = wanted.filter(t => !already(t));
+  if (!add.length) return text;
+  // Insert above the disclaimer so the compliance line stays the last thing a reader sees.
   const at = DISCLAIMER_LINES.has((lines[lines.length - 1] ?? '').trim()) ? lines.length - 1 : lines.length;
-  lines.splice(at, 0, `#${tag}`);
+  const existing = (lines[at - 1] ?? '').trim();
+  if (existing && /^#/.test(existing)) {
+    // A previous run already left a tag line here; extend it rather than stacking paragraphs.
+    const merged = existing.split(/\s+/).filter(Boolean);
+    for (const t of [...add].reverse()) if (!merged.includes(t)) merged.splice(1, 0, t);
+    lines[at - 1] = merged.join(' ');
+    return lines.join('\n');
+  }
+  lines.splice(at, 0, add.join(' '));
   // Templates already breathe between paragraphs; only add the separator it lacks.
   if ((lines[at - 1] ?? '').trim()) lines.splice(at, 0, '');
   return lines.join('\n');
@@ -195,10 +268,16 @@ export function llmConfigFor(store: Store, settings: Settings): LlmConfig | null
 }
 
 /** Run the rewrite pass and keep a record of why it was rejected, if it was. */
-async function applyPolish(store: Store, settings: Settings, text: string, facts: Fact[], persona = ''): Promise<{ text: string; note?: string }> {
+async function applyPolish(
+  store: Store, settings: Settings, text: string, facts: Fact[], persona = '',
+  ctx: { category?: string; subType?: string | null; symbol?: string | null } = {},
+): Promise<{ text: string; note?: string }> {
   const cfg = llmConfigFor(store, settings);
   if (!cfg || !cfg.apiKey || !cfg.model) return { text };
-  const r = await polish(cfg, text, facts, persona);
+  // The writer reads its own memory before drafting. Cheap when the ledger is empty, which is
+  // what it should be — an unfounded belief must not outrank a measured one.
+  const notes = writingNotes(store, { category: ctx.category, subType: ctx.subType ?? null, symbol: ctx.symbol ?? null });
+  const r = await polish(cfg, text, facts, persona, notes);
   return r.changed ? { text: r.text, note: 'ai_polished' } : { text, note: `ai_rejected: ${r.reason}` };
 }
 
@@ -212,6 +291,9 @@ export async function generate(
   const account = opts.account;
   const defs = defsForAccount(store.allTemplates(), account);
   const report: GenerateReport = { created: [], skipped: [] };
+  // Scored once per pass: every draft in a tick should see the same beliefs, and scoring is a
+  // table scan, not something to repeat per post.
+  const rankVerdicts: Verdict[] = scoreAll(store, { writeMemory: false });
   const eff = account ? settingsForAccount(settings, account) : settings;
   const styles = account ? accountStyles(account) : [eff.style];
   // A draft now reserves its minute a day ahead, so generation is bounded by what the queue can
@@ -254,6 +336,10 @@ export async function generate(
       break;
     }
     const seed = personaSeed(m.id, account?.id ?? 0, slot.at);
+    if (!opts.dryRun && m.symbol && store.recentCoinSignal(account?.id ?? null, m.symbol, m.category, Date.now() - eff.coinSignalCooldownMinutes * 60_000)) {
+      report.skipped.push(`${m.title}: 这个币的「${m.category}」类内容 ${Math.round(eff.coinSignalCooldownMinutes / 60)} 小时内已经发过`);
+      continue;
+    }
     const candidates = eligible(m, defs, settings, recentlyUsed);
     if (!candidates.length) {
       report.skipped.push(`${m.title}: 所有匹配模版都在冷却中`);
@@ -272,18 +358,32 @@ export async function generate(
       continue;
     }
     let text = c.text;
+    // The arm is drawn before the post exists, so an outcome can never be explained by whoever
+    // chose the winner afterwards.
+    const arms = planArms({ seed: hashString(`${seed}:arms`), verdicts: rankVerdicts });
+    const pb = playbook(store, { verdicts: rankVerdicts, arms });
+    if (pb.opening === 'question' && !/[？?]/.test(text) && !opts.dryRun) {
+      text = `${text}\n${pickBank('closing.question', seed)}`;
+    }
     // Only append a disclaimer the copy did not already carry.
-    if (eff.appendDisclaimer && !c.result.trace.banks.some(b => DISCLAIMER_BANK.test(b))) {
+    if (eff.appendDisclaimer && !carriesDisclaimer(text)) {
       text = `${text}\n${wordBank['disclaimer.default']}`;
     }
-    const polished = await applyPolish(store, eff, text, c.result.facts, account?.persona_note ?? '');
+    const polished = await applyPolish(store, eff, text, c.result.facts, account?.persona_note ?? '', m);
     text = polished.text;
     // Tagged after polish: a model must never get the chance to reword a hashtag.
-    if (eff.appendHashtags) text = withHashtags(text, m);
+    if (eff.appendHashtags) text = withHashtags(text, m, pb.hashtagTotal);
+    if (!opts.dryRun) {
+      const thin = tooThin(c.result.facts, text);
+      if (thin) {
+        report.skipped.push(`${m.title}: ${thin}`);
+        continue;
+      }
+    }
 
     // Any material that names a single coin can carry its chart.
     let images: string[] = [];
-    if (eff.attachChart && m.symbol && !opts.dryRun) {
+    if (eff.attachChart && pb.attachChart && m.symbol && !opts.dryRun) {
       const f = m.facts as Record<string, unknown>;
       const pick = (k: string): number | null => (typeof f[k] === 'number' ? (f[k] as number) : null);
       try {
@@ -318,6 +418,7 @@ export async function generate(
       images,
     });
     if (account) store.updatePost(id, { accountId: account.id });
+    recordArms(store, id, arms);
     // Consume the material. Without this every account's pass sees the same unused list
     // and drafts the same events, which is the duplication the matrix exists to avoid.
     store.markMaterialUsed(m.id);
@@ -360,6 +461,8 @@ export interface PublishReport {
   published: { id: number; url?: string }[];
   uncertain: { id: number; label: string }[];
   failed: { id: number; label: string }[];
+  /** Things the last-mile gate fixed rather than blocked — worth surfacing, not alarming. */
+  notes: string[];
   paused: boolean;
 }
 
@@ -373,7 +476,7 @@ export async function publishDue(
   settings: Settings,
   opts: { live?: boolean; apiKey?: string; account?: AccountRow } = {},
 ): Promise<PublishReport> {
-  const report: PublishReport = { attempted: 0, published: [], uncertain: [], failed: [], paused: false };
+  const report: PublishReport = { attempted: 0, published: [], uncertain: [], failed: [], notes: [], paused: false };
   const acct = opts.account ?? null;
   const apiKey = opts.apiKey ?? (acct ? getAccountSecret(store, acct.id) : process.env.SQUARE_API_KEY ?? '');
   if (!opts.live) {
@@ -432,6 +535,26 @@ export async function publishDue(
     }
     justSent.push(post.text);
 
+    // The last gate is on the bytes about to be sent, not on the draft as it was written:
+    // polish, panel edits and rerolls all happen after the generation-time checks.
+    const pf = preFlight({
+      text: post.text,
+      facts: (JSON.parse(post.facts_json ?? 'null') as Fact[] | null) ?? null,
+      disclaimerRequired: (acct ? settingsForAccount(settings, acct) : settings).appendDisclaimer,
+      sensitiveWords: settings.sensitiveWords,
+      maxChars: MAX_BODY_CHARS,
+    });
+    if (!pf.ok) {
+      store.updatePost(post.id, { status: 'rejected', error: `发布前合规检查拦下：${pf.reason}` });
+      report.failed.push({ id: post.id, label: `发布前拦下：${pf.reason}` });
+      continue;
+    }
+    if (pf.text !== post.text) {
+      store.updatePostText(post.id, pf.text);
+      report.notes.push(`#${post.id} 发布前${pf.note}`);
+    }
+    const finalText = pf.text;
+
     // Charts are uploaded just-in-time: the presigned URL is only valid for a
     // short window, so it must not be done at draft-creation time.
     const imageUrls: string[] = [];
@@ -452,7 +575,7 @@ export async function publishDue(
 
     let outcome: PublishOutcome;
     try {
-      outcome = await client.publish(post.text, imageUrls);
+      outcome = await client.publish(finalText, imageUrls);
     } catch (err) {
       outcome = { ok: false, kind: 'network', label: err instanceof Error ? err.message : String(err) };
     }
@@ -534,7 +657,7 @@ export async function reroll(
   if ('error' in c) return { ok: false, error: c.error };
 
   let text = c.text;
-  if (settings.appendDisclaimer && !c.result.trace.banks.some(b => DISCLAIMER_BANK.test(b))) {
+  if (settings.appendDisclaimer && !carriesDisclaimer(text)) {
     text = `${text}\n${wordBank['disclaimer.default']}`;
   }
   const polished = await applyPolish(store, settings, text, c.result.facts);
@@ -580,6 +703,7 @@ export async function generateFromPool(
   store.syncTemplates(builtinTemplates);
   const defs = defsForAccount(store.allTemplates(), opts.account);
   const report: PoolGenerateReport = { matureCount: 0, created: [], skipped: [], errors: [] };
+  const rankVerdicts: Verdict[] = scoreAll(store, { writeMemory: false });
   const acct = opts.account ?? null;
   const eff = acct ? settingsForAccount(settings, acct) : settings;
   const styles = acct ? accountStyles(acct) : [eff.style];
@@ -630,6 +754,10 @@ export async function generateFromPool(
       break;
     }
     const facts = dossier(e);
+    if (store.recentCoinSignal(acct?.id ?? null, e.symbol, 'attention', Date.now() - eff.coinSignalCooldownMinutes * 60_000)) {
+      report.skipped.push({ symbol: e.symbol, why: `这个币的热度内容 ${Math.round(eff.coinSignalCooldownMinutes / 60)} 小时内已经发过` });
+      continue;
+    }
     const material = makeMaterial({
       category: 'attention',
       subType: e.tag ? 'topic' : 'follow',
@@ -656,15 +784,25 @@ export async function generateFromPool(
     }
 
     let text = c.text;
-    if (eff.appendDisclaimer && !c.result.trace.banks.some(b => DISCLAIMER_BANK.test(b))) {
+    const arms = planArms({ seed: hashString(`${material.id}:arms`), verdicts: rankVerdicts });
+    const pb = playbook(store, { verdicts: rankVerdicts, arms });
+    if (pb.opening === 'question' && !/[？?]/.test(text)) {
+      text = `${text}\n${pickBank('closing.question', material.id)}`;
+    }
+    if (eff.appendDisclaimer && !carriesDisclaimer(text)) {
       text = `${text}\n${wordBank['disclaimer.default']}`;
     }
-    const polished = await applyPolish(store, eff, text, c.result.facts, acct?.persona_note ?? '');
+    const polished = await applyPolish(store, eff, text, c.result.facts, acct?.persona_note ?? '', material);
     text = polished.text;
-    if (eff.appendHashtags) text = withHashtags(text, material);
+    if (eff.appendHashtags) text = withHashtags(text, material, pb.hashtagTotal);
+    const thin = tooThin(c.result.facts, text);
+    if (thin) {
+      report.skipped.push({ symbol: e.symbol, why: thin });
+      continue;
+    }
 
     let chart: string | null = null;
-    if (eff.attachChart) {
+    if (eff.attachChart && pb.attachChart) {
       try {
         const built = await buildChartFor(
           {
@@ -698,6 +836,7 @@ export async function generateFromPool(
       images: chart ? [chart] : [],
     });
     if (acct) store.updatePost(id, { accountId: acct.id });
+    recordArms(store, id, arms);
     store.markMaterialUsed(material.id);
     // One post per attention rise; the coin stays blocked until the cooldown passes.
     store.claim(e.symbol, id, e.score, acct?.id ?? null);

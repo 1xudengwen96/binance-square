@@ -3,11 +3,16 @@ import { Store, type AccountRow } from './db/index.ts';
 import { collect, generate, generateForMatrix, generateFromPool, publishDue, pauseState } from './pipeline.ts';
 import { settingsFrom } from './schedule.ts';
 import { backfillStats, tuneTemplateWeights } from './stats/backfill.ts';
+import { observeDistribution } from './rank/observations.ts';
+import { scoreAll } from './rank/score.ts';
+import { expireMemories } from './brain/memory.ts';
+import { attributeConversions } from './money/conversion.ts';
 import { sampleSquareBoards } from './stats/benchmarks.ts';
 import { retire } from './lifecycle.ts';
 import { matrixEligibleAccounts } from './studio/lock.ts';
 import { runStudio } from './studio/runner.ts';
 import { getSecret } from './secrets.ts';
+import { backupDatabase } from './backup.ts';
 
 /**
  * The unattended loop. One tick = collect → expire stale material → split the hot coins
@@ -25,11 +30,20 @@ export interface TickResult {
   published: number;
   uncertain: number;
   failed: number;
+  /// Posts waiting for their minute — waiting, not broken.
+  deferred: number;
   statsUpdated: number;
   benchmarked: number;
   studioDrafted: number;
   studioPublished: number;
   tuned: number;
+  /** Posts whose distribution shape was recomputed from the checkpoint curve. */
+  observed: number;
+  /** Hypotheses that have earned a rule, and how many are still gathering samples. */
+  rules: number;
+  /// Posts carrying apportioned rebate credit this tick.
+  conversionAttributed: number;
+  testing: number;
   expired: number;
   accountsRun: number;
   notes: string[];
@@ -38,8 +52,8 @@ export interface TickResult {
 export async function tick(store: Store, opts: { live?: boolean; statsEveryTicks?: number; benchEveryTicks?: number; tickNo?: number } = {}): Promise<TickResult> {
   const settings = settingsFrom(store);
   const res: TickResult = {
-    at: Date.now(), collected: 0, poolCreated: 0, eventCreated: 0, published: 0, uncertain: 0,
-    failed: 0, statsUpdated: 0, benchmarked: 0, studioDrafted: 0, studioPublished: 0, tuned: 0, expired: 0, accountsRun: 0, notes: [],
+    at: Date.now(), collected: 0, poolCreated: 0, eventCreated: 0, published: 0, uncertain: 0, deferred: 0,
+    failed: 0, statsUpdated: 0, benchmarked: 0, studioDrafted: 0, studioPublished: 0, tuned: 0, observed: 0, rules: 0, testing: 0, conversionAttributed: 0, expired: 0, accountsRun: 0, notes: [],
   };
 
   const pause = pauseState(store);
@@ -131,7 +145,11 @@ export async function tick(store: Store, opts: { live?: boolean; statsEveryTicks
         const p = await publishDue(store, settings, { live: true, ...t });
         res.published += p.published.length;
         res.uncertain += p.uncertain.length;
-        res.failed += p.failed.length;
+        // A post waiting for its minute is not a failed post. Folding the two together made a
+        // healthy queue look like an outage — the line read 「失败1」 on a day nothing failed.
+        const deferred = p.failed.filter(f => /未到发布时刻/.test(f.label)).length;
+        res.deferred += deferred;
+        res.failed += p.failed.length - deferred;
         if (p.uncertain.length) res.notes.push(`${p.uncertain.length} 条状态未知，需人工到广场确认`);
         if (p.paused) res.notes.push(`${t.account?.label ?? '账号'}已自动暂停`);
       } catch (err) {
@@ -167,9 +185,30 @@ export async function tick(store: Store, opts: { live?: boolean; statsEveryTicks
       const t = tuneTemplateWeights(store, {});
       res.tuned = t.adjusted.length;
       if (t.skipped) res.notes.push(`调权跳过：${t.skipped}`);
+      // The curve only becomes knowledge if someone reads it: distribution facts, then the
+      // hypotheses scored against them, then whatever earned the right to be called a rule.
+      res.observed = observeDistribution(store);
+      // Re-apportion any newly entered conversion figures before scoring, so a number typed in
+      // this morning is reflected in this afternoon's verdicts.
+      const conv = attributeConversions(store, {});
+      if (conv.posts) res.conversionAttributed = conv.posts;
+      const verdicts = scoreAll(store, { writeMemory: true, target: settings.targetMetric });
+      res.rules = verdicts.filter(v => v.status === 'rule').length;
+      res.testing = verdicts.filter(v => v.status === 'observing').length;
+      const exp = expireMemories(store);
+      if (exp) res.notes.push(`长期记忆里 ${exp} 条已过期的判断被撤下`);
     } catch (err) {
       res.notes.push(`stats 失败：${String(err).slice(0, 100)}`);
     }
+  }
+
+  // Once a day, on the first tick that finds it due. Everything the robot has learned lives in
+  // one SQLite file, and the last time this mattered the audit had already shipped four posts.
+  try {
+    const b = backupDatabase(store);
+    if (b.made) res.notes.push(`已备份数据库${b.removed ? `，清掉 ${b.removed} 份旧的` : ''}`);
+  } catch (err) {
+    res.notes.push(`备份失败：${String(err).slice(0, 100)}`);
   }
 
   store.log('tick', res);
@@ -184,9 +223,10 @@ export function line(r: TickResult): string {
   return (
     `[${stamp}] 素材+${r.collected}${r.expired ? ` 过期${r.expired}` : ''} ` +
     `${r.accountsRun ? `${r.accountsRun}号` : '单号'}发帖${r.poolCreated}${r.eventCreated ? ` 事件${r.eventCreated}` : ''} ` +
-    `发布${r.published}${r.uncertain ? ` 待确认${r.uncertain}` : ''}${r.failed ? ` 失败${r.failed}` : ''}` +
+    `发布${r.published}${r.uncertain ? ` 待确认${r.uncertain}` : ''}${r.deferred ? ` 顺延${r.deferred}` : ''}${r.failed ? ` 失败${r.failed}` : ''}` +
     `${r.statsUpdated ? ` 回抓${r.statsUpdated}` : ''}${r.tuned ? ` 调权${r.tuned}` : ''}` +
     `${r.studioDrafted || r.studioPublished ? ` 文章${r.studioPublished}稿${r.studioDrafted}` : ''}` +
+    `${r.observed ? ` 分发${r.observed}条${r.rules ? ` 规则${r.rules}` : ''}` : ''}` +
     `${r.notes.length ? `  (${r.notes.join('; ')})` : ''}`
   );
 }

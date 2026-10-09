@@ -459,8 +459,8 @@ export const templates: TemplateDef[] = [
     subType: 'funding_extreme',
     angle: '玩梗',
     style: 'joke',
-    requires: [{ path: 'cashtag' }, { path: 'funding' }, { path: 'payer' }],
-    body: `{{cashtag}} 费率 {{funding|rate}}，{{#if annualized}}年化 {{annualized|fixed:1}}%，{{/if}}{{#if payer == '多头'}}多头在付费{{#else}}空头在付费{{/if}}。
+    requires: [{ path: 'cashtag' }, { path: 'funding' }, { path: 'payer' }, { path: 'intervalHours' }],
+    body: `{{cashtag}} 费率 {{funding|rate}}，每 {{intervalHours|fixed:0}} 小时结一次{{#if annualized}}，年化 {{annualized|fixed:1}}%{{/if}}，{{#if payer == '多头'}}多头在付费{{#else}}空头在付费{{/if}}。
 翻译一下：{{#if payer == '多头'}}想拿多单，得先交停车费。{{#else}}做空也不是白做的，一样有人收你钱。{{/if}}
 {{@joke.cta}}`,
   },
@@ -739,9 +739,12 @@ export const templates: TemplateDef[] = [
     category: 'long_short',
     subType: 'account_ratio',
     style: 'emotion',
-    requires: [{ path: 'cashtag' }, { path: 'ratio' }],
+    // Same reason as `short.funding`: the material already carries the previous reading and the
+    // split, so a flash post can say three things instead of one. A single ratio with a mood
+    // attached is what every other tool can print; the movement is the part only we have.
+    requires: [{ path: 'cashtag' }, { path: 'ratio' }, { path: 'prevRatio' }, { path: 'ratioDiff' }],
     body: `持仓速报👀
-{{cashtag}} 多空比 {{ratio|fixed:2}}，{{#if ratio > 2}}多头很集中{{#elif ratio > 1.3}}多头明显占优{{#elif ratio > 0.9}}两边差不多{{#else}}空头占优{{/if}}。{{@cta.short}}
+{{cashtag}} {{scope}}多空比 {{ratio|fixed:2}}，上期 {{prevRatio|fixed:2}}（{{#if ratioDiff >= 0}}+{{/if}}{{ratioDiff|fixed:2}}），{{#if ratio > 2}}多头很集中{{#elif ratio > 1.3}}多头明显占优{{#elif ratio > 0.9}}两边差不多{{#else}}空头占优{{/if}}。{{@cta.short}}
 {{#maybe 35}}{{@cta.follow}}{{/maybe}}`,
   },
   {
@@ -750,9 +753,12 @@ export const templates: TemplateDef[] = [
     category: 'funding',
     subType: 'funding_extreme',
     style: 'capital',
-    requires: [{ path: 'cashtag' }, { path: 'funding' }, { path: 'payer' }],
+    // Three independent numbers, not one. The measured first day: this template shipped four
+    // posts that each carried a single rate, and they were both the repeated ones and the
+    // unread ones. A 速报 can still be short — it just cannot be one fact plus an opinion.
+    requires: [{ path: 'cashtag' }, { path: 'funding' }, { path: 'payer' }, { path: 'intervalHours' }, { path: 'price' }],
     body: `费率速报👀
-{{cashtag}} {{funding|rate}}，{{#if payer == '多头'}}多头在付费{{#else}}空头在付费{{/if}}。{{@cta.short}}
+{{cashtag}} 当期 {{funding|rate}}，每 {{intervalHours|fixed:0}} 小时结算，{{#if payer == '多头'}}多头{{#else}}空头{{/if}}在付费；现价 {{price|money}}。{{@cta.short}}
 {{#maybe 35}}{{@cta.follow}}{{/maybe}}`,
   },
   {
@@ -1011,8 +1017,8 @@ export const templates: TemplateDef[] = [
     subType: 'funding_extreme',
     angle: '拥挤度',
     style: 'emotion',
-    requires: [{ path: 'cashtag' }, { path: 'payer' }, { path: 'longRatio' }],
-    body: `{{cashtag}} 费率 {{funding|rate}}，{{payer}}在付；账户这边多空比 {{longRatio|fixed:2}}。
+    requires: [{ path: 'cashtag' }, { path: 'payer' }, { path: 'longRatio' }, { path: 'intervalHours' }],
+    body: `{{cashtag}} 费率 {{funding|rate}}，每 {{intervalHours|fixed:0}} 小时结算，{{payer}}在付；账户这边多空比 {{longRatio|fixed:2}}。
 {{#if longRatio > 2 && payer == '多头'}}人挤在多这一边，还在给对面交钱——{{@take.funding.long}}。
 {{#elif longRatio < 0.9 && payer == '空头'}}空单占多数，又是付费的那一方，{{@take.funding.short}}。
 {{#elif payer == '多头'}}{{@take.funding.long}}，但人数没到极端，还在可接受的范围里。
