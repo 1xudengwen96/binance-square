@@ -54,6 +54,10 @@ interface RawVo {
   commentCount?: number;
   shareCount?: number;
   totalReactionCount?: number;
+  /** Articles only. On a post the text sits in `content`; on an article `content` is empty. */
+  bodyTextOnly?: string;
+  /** Articles only — a post cannot be subscribed to, an article can. */
+  subscribeCount?: number;
 }
 
 export interface BackfillReport {
@@ -64,9 +68,29 @@ export interface BackfillReport {
 }
 
 /** Square's own post reader. Open, no auth, live counters. */
-async function readPost(contentId: string): Promise<RawVo | null> {
+export async function readPost(contentId: string): Promise<RawVo | null> {
   const res = await fetchJson<{ data?: RawVo }>(`${B}/v1/public/pgc/content/${contentId}`, { timeoutMs: 15_000, retries: 1 });
   return res?.data ?? null;
+}
+
+/**
+ * Did the article body actually land?
+ *
+ * The read route puts a post's text in `content` and an article's in `bodyTextOnly`, leaving
+ * `content` empty. Checking the wrong field makes a successful publish look exactly like a
+ * silently-truncated one, which is the difference between "retry" and "leave it alone" — and
+ * retrying a publish duplicates it. So this asserts on the field articles actually use.
+ */
+export async function verifyArticlePublished(contentId: string, expectedBody: string): Promise<{ ok: boolean; storedChars: number; detail: string }> {
+  const vo = await readPost(contentId);
+  if (!vo) return { ok: false, storedChars: 0, detail: '读不到这篇内容' };
+  const stored = (vo.bodyTextOnly ?? '').trim();
+  const want = expectedBody.trim();
+  if (!stored) return { ok: false, storedChars: 0, detail: 'bodyTextOnly 为空，文章正文可能未写入' };
+  if (stored.length < want.length) {
+    return { ok: false, storedChars: stored.length, detail: `正文被截断：发出 ${want.length} 字，广场只存下 ${stored.length} 字` };
+  }
+  return { ok: true, storedChars: stored.length, detail: `正文完整存入 ${stored.length} 字` };
 }
 
 export async function backfillStats(store: Store): Promise<BackfillReport> {

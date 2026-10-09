@@ -37,6 +37,47 @@ test('a drill reports what it would send but commits nothing', async () => {
   }
 });
 
+test('a batch sharing one scheduled minute publishes once, not five times', async () => {
+  // The real failure this pins: `allowed` only means the daily cap is not hit, and the slot
+  // it returns is routinely in the future. Reading `allowed` as "post now" sent five drafts
+  // to Square inside one minute — the exact burst that makes an account read as a bot.
+  const dir = mkdtempSync(join(tmpdir(), 'sf-burst-'));
+  const store = Store.open(join(dir, 't.db'));
+  try {
+    const slot = Date.now() - 60_000;
+    for (let i = 0; i < 5; i++) {
+      store.db
+        .prepare(
+          `INSERT INTO posts (material_id, template_id, text, status, created_at, scheduled_at)
+           VALUES (NULL, NULL, ?, 'approved', ?, ?)`,
+        )
+        .run(`$TOK 多空比 ${2 + i}.10，多头占 6${i}.9%。测试正文，不构成投资建议。`, slot, slot);
+    }
+    const r = await publishDue(store, { ...DEFAULT_SETTINGS }, { live: false });
+    assert.equal(r.attempted, 1, `one tick must release at most one post, attempted ${r.attempted}`);
+    assert.ok(r.failed.some(f => /未到发布时刻/.test(f.label)), 'the rest must be explicitly deferred, not silently dropped');
+  } finally {
+    store.close();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('a single due post is not blocked by its own queue entry', async () => {
+  // The mirror-image regression: the spacing clock sees scheduled drafts, so without
+  // excluding the candidate a post due right now would treat its own slot as a prior claim
+  // and defer itself forever.
+  const dir = mkdtempSync(join(tmpdir(), 'sf-selfblock-'));
+  const store = Store.open(join(dir, 't.db'));
+  try {
+    approvedPost(store);
+    const r = await publishDue(store, { ...DEFAULT_SETTINGS }, { live: false });
+    assert.equal(r.attempted, 1, 'one due post with no history must be attempted');
+  } finally {
+    store.close();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
 test('the dedup source stays clean after a drill', async () => {
   const dir = mkdtempSync(join(tmpdir(), 'sf-drill2-'));
   const store = Store.open(join(dir, 't.db'));

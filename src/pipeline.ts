@@ -29,6 +29,7 @@ import type { LlmConfig } from './llm/providers.ts';
 import type { Fact } from './engine/types.ts';
 import type { Material } from './material/types.ts';
 import type { Settings } from './config.ts';
+import { matrixEligibleAccounts } from './studio/lock.ts';
 
 const DISCLAIMER_BANK = /^(phrase\.notAdvice|disclaimer\.)/;
 
@@ -213,6 +214,19 @@ export async function generate(
   const report: GenerateReport = { created: [], skipped: [] };
   const eff = account ? settingsForAccount(settings, account) : settings;
   const styles = account ? accountStyles(account) : [eff.style];
+  // A draft now reserves its minute a day ahead, so generation is bounded by what the queue can
+  // actually deliver: unbounded drafting buries the day's target in material that expires before
+  // its own slot arrives. Preview is exempt — looking at what an account would post should never
+  // be blocked by how busy it already is.
+  if (!opts.dryRun) {
+    const pending = store.pendingQueueCount(account?.id ?? null);
+    const room = eff.postsPerDay - pending;
+    if (room <= 0) {
+      report.skipped.push(`待发布已有 ${pending} 条，达到该号每天 ${eff.postsPerDay} 条的目标，本轮不再生成`);
+      return report;
+    }
+    want = Math.min(want, room);
+  }
   const pool = selectBalanced(store.unusedMaterials(want * 4), want * 2, settings.categoryWeights).filter(
     m => !account || materialAllowedForAccount(m, account),
   );
@@ -230,9 +244,13 @@ export async function generate(
   for (const m of pool) {
     if (report.created.length >= want) break;
     const when = Date.now() + report.created.length * nominalGap(eff);
-    const slot = account ? nextSlotFor(store, settings, account, when) : nextSlot(store, eff, when);
+    const slot = account ? nextSlotFor(store, settings, account, when, null, true) : nextSlot(store, eff, when, null, true);
     if (!slot.allowed) {
       report.skipped.push(slot.reason);
+      break;
+    }
+    if (!opts.dryRun && rolledPastToday(slot)) {
+      report.skipped.push('今天的发帖时段已经排满，再写就只能排到明天 —— 停在这里，不写过期的草稿');
       break;
     }
     const seed = personaSeed(m.id, account?.id ?? 0, slot.at);
@@ -317,6 +335,15 @@ function nominalGap(settings: Settings): number {
 }
 
 /**
+ * A slot rolled into tomorrow means today's window is already full. Writing another draft then
+ * produces a post whose material expires before its minute arrives — the queue cap counts posts,
+ * this reads the clock, and only the second one knows when to stop.
+ */
+function rolledPastToday(slot: { reason: string }): boolean {
+  return slot.reason.includes('已顺延');
+}
+
+/**
  * Templates eligible for this material, with recently-used ones held back so the
  * feed does not become one template with the symbol swapped out. A category with a
  * single template is allowed to reuse it — the structural duplicate guard is what
@@ -358,14 +385,29 @@ export async function publishDue(
   }
 
   const client = new SquareClient({ apiKey, dryRun: !opts.live, proxyUrl: acct?.proxy_url ?? '' });
-  const due = (acct ? store.approvedForAccount(acct.id, 20) : store.postsByStatus('approved', 20)).filter(p => (p.scheduled_at ?? 0) <= Date.now());
+  const due = (acct ? store.approvedForAccount(acct.id, 20) : store.postsByStatus('approved', 20))
+    .filter(p => (p.scheduled_at ?? 0) <= Date.now())
+    // Oldest first. The account path already returns rows in schedule order, but the
+    // no-account path comes back newest-first, and a defer-then-break loop over that looks
+    // at the newest post, finds four siblings already claiming its minute, defers it — and
+    // never reaches the one that was genuinely due.
+    .sort((a, b) => (a.scheduled_at ?? a.created_at) - (b.scheduled_at ?? b.created_at) || a.id - b.id);
   // Posts queued in the same run must not duplicate each other either.
   const justSent: string[] = [];
 
   for (const post of due) {
-    const slot = acct ? nextSlotFor(store, settings, acct) : nextSlot(store, settings);
+    const candidate = { id: post.id, at: post.scheduled_at ?? post.created_at };
+    const slot = acct ? nextSlotFor(store, settings, acct, Date.now(), candidate) : nextSlot(store, settings, Date.now(), candidate);
     if (!slot.allowed) {
       report.failed.push({ id: post.id, label: slot.reason });
+      break;
+    }
+    // `allowed` only means the day's cap has not been reached. The slot it hands back is
+    // the next *legal* moment, which is routinely in the future — and posting anyway is what
+    // made five drafts go out inside one minute. The interval and the active window are only
+    // real if someone refuses to post before their time.
+    if (slot.at > Date.now()) {
+      report.failed.push({ id: post.id, label: `未到发布时刻，顺延到 ${new Date(slot.at + 8 * 3600_000).toISOString().slice(5, 16).replace('T', ' ')} 北京（${slot.reason}）` });
       break;
     }
     report.attempted++;
@@ -567,11 +609,24 @@ export async function generateFromPool(
     ? store.recentPostsFromOthers(acct.id, Date.now() - settings.crossAccountCoinExclusionMinutes * 60_000).map(r => r.text)
     : [];
 
-  for (const [i, e] of mature.slice(0, opts.count ?? 2).entries()) {
+  // Same ceiling as `generate`, and the same reason: a draft whose minute lands after tonight's
+  // window is a draft that expires before anyone reads it.
+  const room = eff.postsPerDay - store.pendingQueueCount(acct?.id ?? null);
+  if (room <= 0) {
+    report.skipped.push({ symbol: '*', why: `待发布已排到 ${eff.postsPerDay} 条上限，本轮不再生成` });
+    return report;
+  }
+  const budget = Math.min(opts.count ?? 2, room);
+
+  for (const [i, e] of mature.slice(0, budget).entries()) {
     const when = Date.now() + i * nominalGap(eff);
-    const slot = acct ? nextSlotFor(store, settings, acct, when) : nextSlot(store, eff, when);
+    const slot = acct ? nextSlotFor(store, settings, acct, when, null, true) : nextSlot(store, eff, when, null, true);
     if (!slot.allowed) {
       report.skipped.push({ symbol: e.symbol, why: slot.reason });
+      break;
+    }
+    if (rolledPastToday(slot)) {
+      report.skipped.push({ symbol: e.symbol, why: '今天的发帖时段已排满，再写就只能排到明天' });
       break;
     }
     const facts = dossier(e);
@@ -681,7 +736,10 @@ export interface MatrixGenerateReport {
  */
 export async function generateForMatrix(store: Store, settings: Settings): Promise<MatrixGenerateReport> {
   const report: MatrixGenerateReport = { accounts: [], matureCount: 0, errors: [] };
-  const accounts = store.activeAccounts();
+  // Accounts the studio owns are skipped: a teaching account must not also be drawing
+  // mixed-voice short posts from this queue, or the persona the track exists to build is
+  // undone by the module that was never meant to touch it.
+  const accounts = matrixEligibleAccounts(store);
   if (!accounts.length) return report;
 
   try {

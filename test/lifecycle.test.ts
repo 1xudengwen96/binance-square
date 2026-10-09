@@ -146,3 +146,25 @@ test('a draft with no material is left alone', () => {
     rmSync(dir, { recursive: true, force: true });
   }
 });
+
+test('an approved post is expired too, not just a draft', () => {
+  // The hole this pins: with autoPublish on, a draft is created already `approved` and never
+  // sits in `draft` long enough to be swept. Expiring drafts only therefore left the stale
+  // backlog alive on exactly the path that matters — 120 hours-old market claims sat
+  // queued to publish over the following four days.
+  const { store, dir, charts } = temp();
+  try {
+    const now = Date.now();
+    const stale = mat('funding', 'funding_extreme', 'STALEAPPROVED', now - 6 * HOUR); // past 3h
+    store.insertMaterial(stale);
+    store.addPost({ materialId: stale.id, templateId: null, text: 't', status: 'approved', scheduledAt: now });
+
+    const r = retire(store, S, charts, now);
+    assert.equal(r.staleDrafts, 1, 'an approved post on expired material must be reaped');
+    const row = store.db.prepare("SELECT status FROM posts WHERE material_id = ?").get(stale.id) as { status: string };
+    assert.equal(row.status, 'rejected');
+  } finally {
+    store.close();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});

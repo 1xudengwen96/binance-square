@@ -4,6 +4,14 @@ data/
 *.log
 .DS_Store
 
+# A database backup is the same material as the live database: every account's Square key
+# row is in it. `data/` was never the only copy that could be committed by accident.
+backup/
+*.db
+*.db-wal
+*.db-shm
+_tick.json
+
 # Local research and scratch output: a competitor teardown, screenshots of their
 # console, and one-off scrape dumps. This repo is public, so these stay on disk.
 /bnsbot-功能汇总.md

@@ -99,7 +99,14 @@ export function pruneOrphanCharts(store: Store, chartsDir: string, settings: Set
  * ratio drafted at 3h ago is not a post waiting for review, it is a wrong statement about
  * the market waiting to be approved. They are rejected rather than deleted so the record
  * of what was generated survives.
+ *
+ * `approved` must be included. With autoPublish on, a draft is created already approved and
+ * never sits in `draft` long enough to be swept — so expiring drafts only left the stale
+ * backlog alive on the path that matters most, and 120 hours-old market claims were queued
+ * to go out over the following four days.
  */
+const RETIRABLE = "'draft','approved'";
+
 export function retireStaleDrafts(store: Store, now = Date.now()): number {
   let total = 0;
   for (const [category, minutes] of Object.entries(TTL_MINUTES)) {
@@ -107,7 +114,7 @@ export function retireStaleDrafts(store: Store, now = Date.now()): number {
       .prepare(
         `UPDATE posts SET status = 'rejected', error = '素材过期，草稿自动作废（' || ? || ' 类保质期已过）'
          FROM materials m
-         WHERE posts.material_id = m.id AND posts.status = 'draft' AND m.category = ? AND m.occurred_at < ?`,
+         WHERE posts.material_id = m.id AND posts.status IN (${RETIRABLE}) AND m.category = ? AND m.occurred_at < ?`,
       )
       .run(category, category, now - minutes * 60_000).changes;
   }
@@ -116,7 +123,7 @@ export function retireStaleDrafts(store: Store, now = Date.now()): number {
     .prepare(
       `UPDATE posts SET status = 'rejected', error = '素材过期，草稿自动作废'
        FROM materials m
-       WHERE posts.material_id = m.id AND posts.status = 'draft' AND m.category NOT IN (${[...known].map(() => '?').join(',')})
+       WHERE posts.material_id = m.id AND posts.status IN (${RETIRABLE}) AND m.category NOT IN (${[...known].map(() => '?').join(',')})
          AND m.occurred_at < ?`,
     )
     .run(...known, now - DEFAULT_TTL_MINUTES * 60_000).changes;

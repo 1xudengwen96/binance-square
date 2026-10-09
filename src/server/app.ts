@@ -11,7 +11,13 @@ import { templates as builtinTemplates } from '../content/templates.ts';
 import { DEFAULT_SETTINGS, STYLE_LABELS, type Settings } from '../config.ts';
 import { isStructuralDuplicate } from '../engine/guard.ts';
 import { line, tick, type TickResult } from '../daemon.ts';
-import { analyze } from '../stats/insight.ts';
+import { analyze, CATEGORY_LABELS, signalLabel } from '../stats/insight.ts';
+import { dashboard } from '../stats/dashboard.ts';
+import { TRACKS, UNIMPLEMENTED_TRACKS, trackById } from '../studio/tracks.ts';
+import { CONCEPTS } from '../studio/concepts.ts';
+import { conceptPerformance, nextTopics, summarize } from '../studio/evidence.ts';
+import { assertTextOnTrack, trackForAccount } from '../studio/lock.ts';
+import { nextArticleSlot, polishArticleDraft, runStudio } from '../studio/runner.ts';
 
 import { SquareClient } from '../publisher/square.ts';
 import { accountSecretView, getAccountSecret, getSecret, secretViews, setAccountSecret, setSecret, SECRET_NAMES, type SecretName } from '../secrets.ts';
@@ -80,6 +86,21 @@ function llmConfigFrom(s: Settings, override?: Partial<LlmConfig>): LlmConfig {
 
 app.get('/', (_req, reply) => reply.type('text/html').send(ui));
 
+/**
+ * Stylesheet and script, read once at boot like the HTML. An allowlist rather than a static
+ * handler: this directory also sits next to nothing user-supplied, but a route that resolves a
+ * caller-provided filename inside a folder holding the posting keys is a mistake waiting to be
+ * found, and there are exactly two files to serve.
+ */
+const ASSETS: Record<string, { file: string; type: string }> = {
+  '/app.css': { file: 'app.css', type: 'text/css; charset=utf-8' },
+  '/app.js': { file: 'app.js', type: 'text/javascript; charset=utf-8' },
+};
+for (const [route, a] of Object.entries(ASSETS)) {
+  const body = readFileSync(join(here, 'public', a.file), 'utf8');
+  app.get(route, (_req, reply) => reply.type(a.type).header('cache-control', 'no-cache').send(body));
+}
+
 /** Cheap liveness probe for Docker's HEALTHCHECK and any reverse proxy. No DB writes. */
 app.get('/healthz', (_req, reply) => {
   const s = settingsFrom(store);
@@ -90,10 +111,21 @@ app.get('/api/status', (_req, reply) => {
   const s = settingsFrom(store);
   const slot = nextSlot(store, s);
   const pause = pauseState(store);
+  const bindings = store.studioAccounts();
   return reply.send({
     settings: { ...DEFAULT_SETTINGS, ...s },
     styleLabels: STYLE_LABELS,
+    // The account page needs these to offer "跑长文 / 跑短帖" without a second round trip to
+    // the studio endpoint, which pulls concept performance for every binding.
+    availableTracks: TRACKS.map(t => ({ id: t.id, label: t.label, summary: t.summary })),
     publishedToday: store.publishedToday(beijingDayStart()),
+    pending: store.pendingQueueCount(),
+    // Approved work with no account is queued in name only. The overview has to say so, or the
+    // queue number reads like capacity instead of a dead end.
+    orphanPending: (store.db
+      .prepare("SELECT COUNT(*) AS n FROM posts WHERE status IN ('draft','approved') AND account_id IS NULL")
+      .get() as { n: number }).n,
+    templateCount: store.allTemplates().length,
     next: slot,
     pause,
     hasKey: Boolean(getSecret(store, 'squareApiKey')),
@@ -101,12 +133,26 @@ app.get('/api/status', (_req, reply) => {
     materials: store.materialCounts(),
     unused: store.unusedCount(),
     performance: store.templatePerformance(),
-    accounts: store.allAccounts().map(a => ({
-      ...a,
-      key: accountSecretView(store, a.id),
-      today: store.accountPostsToday(a.id, beijingDayStart()),
-      next: nextSlotFor(store, settingsFrom(store), a),
-    })),
+    accounts: store.allAccounts().map(a => {
+      const b = bindings.find(x => x.account_id === a.id);
+      const track = b ? trackById(b.track_id) : undefined;
+      return {
+        ...a,
+        key: accountSecretView(store, a.id),
+        today: store.accountPostsToday(a.id, beijingDayStart()),
+        // Same reason as on the board: the matrix clock is not this account's clock any more.
+        next: track ? { allowed: true, at: nextArticleSlot(store, a.id, track), reason: `长文 · 每 ${track.cadence.minGapHours} 小时最多一篇` } : nextSlotFor(store, settingsFrom(store), a),
+        // What this account is *for*. Binding lives in the studio table and cadence lives in the
+        // accounts table, and an operator who has to open two pages to know which account does
+        // which job will end up with two accounts doing the same job.
+        pending: store.pendingQueueCount(a.id),
+        trackId: b?.track_id ?? null,
+        trackLabel: b ? (track?.label ?? b.track_id) : null,
+        // A studio account's quota is measured in articles, so "0 / 24" would be nonsense on
+        // the card that says what it actually does.
+        articlesPerDay: track && b ? (b.articles_per_day ?? track.cadence.articlesPerDay) : null,
+      };
+    }),
     loop: { lastTick },
     warnings: queueWarnings(store),
   });
@@ -120,6 +166,11 @@ app.get('/api/status', (_req, reply) => {
  * be published solely by the fallback path — and that one reads the key from the environment,
  * not from the key stored in the panel. Approving such a post looks like progress and is
  * actually a dead end, which is worth saying out loud.
+ *
+ * The second case is newer and was created by the studio itself: binding an account to a
+ * track removes it from the mixed-style matrix, so everything already approved on that
+ * account stops being reachable. That is the persona lock working as designed, but a
+ * designed dead end is still a dead end if nobody tells you about it.
  */
 function queueWarnings(db: Store): string[] {
   const out: string[] = [];
@@ -132,12 +183,34 @@ function queueWarnings(db: Store): string[] {
         '否则请驳回后在有启用账号的情况下重新生成，新草稿才会带上账号。',
     );
   }
+
+  const bound = db.studioAccounts().filter(b => b.enabled && b.pause_matrix);
+  for (const b of bound) {
+    const stranded = db.db
+      .prepare("SELECT COUNT(*) AS n FROM posts WHERE status = 'approved' AND account_id = ?")
+      .get(b.account_id) as { n: number };
+    if (!stranded.n) continue;
+    const label = (db.accountById(b.account_id)?.label ?? String(b.account_id));
+    out.push(
+      `${stranded.n} 条已通过帖子属于「${label}」，但该账号已绑定「${trackById(b.track_id)?.label ?? b.track_id}」赛道，` +
+        '按人设隔离规则它不再从短帖矩阵取稿，这些帖子因此不会发出。' +
+        '要它们照发：在工作室页解除绑定；要深耕赛道：另开一个号做教学号，这个号回到短帖流（矩阵的正确用法）。',
+    );
+  }
   return out;
 }
 
 app.get('/api/materials', (req, reply) => {
   const q = req.query as { limit?: string };
-  return reply.send(store.recentMaterials(Number(q.limit ?? 60)));
+  // The label travels with the row: `open_interest/oi_shift` is a database key, and every page
+  // that lists material would otherwise have to keep its own translation table.
+  return reply.send(
+    store.recentMaterials(Number(q.limit ?? 60)).map(m => ({
+      ...m,
+      categoryCn: CATEGORY_LABELS[m.category] ?? m.category,
+      signalCn: signalLabel(m.category, m.subType),
+    })),
+  );
 });
 
 /** Serve a generated chart. The filename is whitelisted so this cannot read arbitrary paths. */
@@ -154,17 +227,20 @@ app.get('/charts/:file', (req, reply) => {
 });
 
 app.get('/api/posts', (req, reply) => {
-  const q = req.query as { status?: string; sort?: string };
+  const q = req.query as { status?: string; sort?: string; limit?: string };
   const ALL = ['draft', 'approved', 'published', 'uncertain', 'failed', 'rejected'];
   const statuses = q.status && ALL.includes(q.status) ? [q.status] : ALL;
   const sort = q.sort === 'views' ? 'views' : 'recent';
-  const rows = store.postsForList({ statuses, sort });
+  const rows = store.postsForList({ statuses, sort, limit: Math.min(500, Number(q.limit) > 0 ? Number(q.limit) : 150) });
   // Surfacing is reported separately from views because the two have different fixes; a post
   // that appeared on a public board is a different outcome than one that only got read.
   const surfaced = store.surfacedPostIds(rows.map(p => p.square_post_id).filter((x): x is string => Boolean(x)));
   return reply.send(
     rows.map(p => ({
       ...p,
+      signalCn: signalLabel(p.category, p.sub_type),
+      categoryCn: p.category ? (CATEGORY_LABELS[p.category] ?? p.category) : null,
+      styleCn: p.style ? (STYLE_LABELS[p.style as keyof typeof STYLE_LABELS] ?? p.style) : null,
       images: (JSON.parse(p.images_json ?? '[]') as string[]).map(p2 => `/charts/${p2.split(/[\\/]/).pop()}`),
       stats: p.views == null ? null : { views: p.views, likes: p.likes, comments: p.comments, shares: p.shares, reactions: p.reactions, checked_at: p.checked_at },
       onBoard: p.square_post_id ? surfaced.has(p.square_post_id) : false,
@@ -216,9 +292,113 @@ app.get('/api/stats/summary', (req, reply) => {
   return reply.send(analyze(store, { days }));
 });
 
+/** The operational board: what went out, when, on which account. No sample-size floor. */
+app.get('/api/dashboard', (req, reply) => {
+  const q = req.query as { days?: string };
+  return reply.send(dashboard(store, { days: Number(q.days) > 0 ? Number(q.days) : 14 }));
+});
+
 /** The comparison pool itself, so the numbers behind a conclusion can be inspected. */
 app.get('/api/benchmarks', (_req, reply) => {
   return reply.send({ pool: store.boardCount(), rows: store.boardRows(40) });
+});
+
+/* ------------------------------------------------------------------ studio --- */
+
+/** Everything the 工作室 page needs in one round trip. */
+app.get('/api/studio', (_req, reply) => {
+  const bindings = store.studioAccounts();
+  const tracks = bindings.map(b => {
+    const perf = conceptPerformance(store, b.track_id);
+    return {
+      accountId: b.account_id,
+      label: b.label,
+      trackId: b.track_id,
+      trackLabel: trackById(b.track_id)?.label ?? b.track_id,
+      enabled: b.enabled,
+      pauseMatrix: b.pause_matrix,
+      articlesPerDay: b.articles_per_day,
+      performance: perf,
+      next: nextTopics(store, b.track_id, { limit: 4 }),
+      summary: summarize(store, b.track_id),
+    };
+  });
+  const articles = store.studioArticles('all', 40);
+  const stats = store.studioLatestStats(articles.map(a => a.id));
+  return reply.send({
+    tracks,
+    // The refusal list is shown before binding, not after a draft gets rejected for it.
+    availableTracks: TRACKS.map(t => ({ id: t.id, label: t.label, summary: t.summary, refusals: t.refusals.map(r => r.why), tradeoffs: t.tradeoffs, cadence: t.cadence })),
+    unimplemented: UNIMPLEMENTED_TRACKS,
+    unboundAccounts: store.allAccounts().filter(a => a.enabled && !bindings.some(b => b.account_id === a.id))
+      .map(a => ({ id: a.id, label: a.label })),
+    articles: articles.map(a => ({
+      ...a,
+      stats: stats.get(a.id) ?? null,
+      sections: (() => {
+        try {
+          return JSON.parse(a.sections_json ?? '[]');
+        } catch {
+          return [];
+        }
+      })(),
+    })),
+    lessons: store.lessons(20),
+  });
+});
+
+app.post('/api/studio/bind', (req, reply) => {
+  const b = (req.body ?? {}) as { accountId?: number; trackId?: string; pauseMatrix?: boolean };
+  const account = b.accountId ? store.accountById(b.accountId) : null;
+  if (!account) return reply.code(400).send({ error: '账号不存在' });
+  const track = trackById(b.trackId ?? '');
+  if (!track) return reply.code(400).send({ error: '这条赛道本工具还不能实现，原因见页面上的说明' });
+  store.ensureConceptRows(track.id, CONCEPTS.filter(c => c.trackId === track.id).map(c => c.id));
+  store.bindStudioTrack(account.id, track.id, { pauseMatrix: b.pauseMatrix !== false });
+  store.log('studio_bind', { accountId: account.id, trackId: track.id });
+  return reply.send({ ok: true, accountId: account.id, trackId: track.id });
+});
+
+app.post('/api/studio/unbind', (req, reply) => {
+  const b = (req.body ?? {}) as { accountId?: number };
+  if (!b.accountId) return reply.code(400).send({ error: '缺少 accountId' });
+  store.unbindStudioTrack(b.accountId);
+  store.log('studio_unbind', { accountId: b.accountId });
+  return reply.send({ ok: true });
+});
+
+/** One studio pass: compose drafts, and publish only when explicitly live. */
+app.post('/api/studio/run', async (req, reply) => {
+  const b = (req.body ?? {}) as { live?: boolean };
+  try {
+    return reply.send(await runStudio(store, settingsFrom(store), { live: Boolean(b.live) }));
+  } catch (err) {
+    return reply.code(500).send({ error: err instanceof Error ? err.message : String(err) });
+  }
+});
+
+app.post('/api/studio/articles/:id/:act', async (req, reply) => {
+  const { id, act } = req.params as { id: string; act: string };
+  const article = store.studioArticle(Number(id));
+  if (!article) return reply.code(404).send({ error: 'not found' });
+  if (act === 'approve') {
+    // The lock runs again at approval, not only at compose time: the body may have been
+    // edited in the panel since it was drafted.
+    const track = article.account_id ? trackForAccount(store, article.account_id) : undefined;
+    if (!track) return reply.code(400).send({ error: '该文章没有赛道绑定，无法判断人设边界' });
+    const gate = assertTextOnTrack(track, `${article.title}\n${article.body}`, 'compose');
+    if (!gate.ok) return reply.code(400).send({ error: `越出赛道边界：${gate.reasons.join('；')}` });
+    store.updateStudioArticle(article.id, { status: 'approved', scheduledAt: Date.now() });
+    return reply.send({ ok: true });
+  }
+  if (act === 'reject') {
+    store.updateStudioArticle(article.id, { status: 'rejected' });
+    return reply.send({ ok: true });
+  }
+  if (act === 'polish') {
+    return reply.send(await polishArticleDraft(store, settingsFrom(store), article.id));
+  }
+  return reply.code(400).send({ error: `未知操作 ${act}` });
 });
 
 app.get('/api/pool', async (req, reply) => {
@@ -362,8 +542,13 @@ app.post('/api/llm/test', async (req, reply) => {
 });
 
 app.get('/api/templates', (_req, reply) => {
-  const rows = store.db.prepare('SELECT * FROM templates ORDER BY category, id').all() as Record<string, unknown>[];
-  return reply.send(rows);
+  const rows = store.db.prepare('SELECT * FROM templates ORDER BY category, id').all() as (Record<string, unknown> & { category: string | null; sub_type: string | null; style: string | null })[];
+  return reply.send(rows.map(t => ({
+    ...t,
+    categoryCn: t.category ? (CATEGORY_LABELS[t.category] ?? t.category) : null,
+    signalCn: t.sub_type ? signalLabel(t.category, t.sub_type) : null,
+    styleCn: t.style ? (STYLE_LABELS[t.style as keyof typeof STYLE_LABELS] ?? t.style) : null,
+  })));
 });
 
 app.patch('/api/templates/:id', (req, reply) => {

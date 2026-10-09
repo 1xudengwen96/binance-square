@@ -189,6 +189,100 @@ CREATE TABLE IF NOT EXISTS accounts (
   created_at           INTEGER NOT NULL,
   updated_at           INTEGER NOT NULL
 );
+
+/* ============================================================================
+ * Studio — the 赛道 workspace.
+ *
+ * Deliberately its own tables rather than columns on posts. The main pipeline
+ * optimises for variety (seven voices over one event); a 赛道 optimises for the
+ * opposite (one voice, recognisable in three seconds). Sharing storage would let
+ * each quietly redefine the other's rows, and the first symptom would be a teaching
+ * account inheriting a mixed-style cadence it never asked for.
+ * ========================================================================== */
+
+-- One account, one track. The binding is what the persona lock enforces against.
+CREATE TABLE IF NOT EXISTS studio_accounts (
+  account_id   INTEGER PRIMARY KEY REFERENCES accounts(id),
+  track_id     TEXT NOT NULL,
+  bound_at     INTEGER NOT NULL,
+  -- The account stops producing for the main matrix while studio owns it, so a single
+  -- account cannot serve two contradictory personas on the same day.
+  pause_matrix INTEGER NOT NULL DEFAULT 1,
+  articles_per_day INTEGER,
+  enabled      INTEGER NOT NULL DEFAULT 1
+);
+
+-- Curriculum state. The definition lives in code; this table holds what has been done
+-- and how it went, so a restart never loses the account's accumulated course.
+CREATE TABLE IF NOT EXISTS studio_concepts (
+  concept_id   TEXT NOT NULL,
+  track_id     TEXT NOT NULL,
+  written      INTEGER NOT NULL DEFAULT 0,
+  written_at   INTEGER,
+  publish_count INTEGER NOT NULL DEFAULT 0,
+  median_views INTEGER NOT NULL DEFAULT 0,
+  samples      INTEGER NOT NULL DEFAULT 0,
+  -- A concept can go stale (the example it used no longer holds). The scheduler re-offers
+  -- these instead of treating written as permanently done.
+  needs_update INTEGER NOT NULL DEFAULT 0,
+  last_error   TEXT,
+  PRIMARY KEY (concept_id, track_id)
+);
+
+CREATE TABLE IF NOT EXISTS studio_articles (
+  id           INTEGER PRIMARY KEY AUTOINCREMENT,
+  track_id     TEXT NOT NULL,
+  concept_id   TEXT NOT NULL,
+  account_id   INTEGER REFERENCES accounts(id),
+  -- The claim re-checker needs this: "持仓还在增加" is only falsifiable against the same
+  -- coin's current data, not against anything in the article text.
+  symbol       TEXT,
+  title        TEXT NOT NULL,
+  body         TEXT NOT NULL,
+  sections_json TEXT,
+  facts_json   TEXT,
+  cover_path   TEXT,
+  cover_url    TEXT,
+  status       TEXT NOT NULL DEFAULT 'draft',   -- draft|approved|published|rejected|uncertain|failed
+  created_at   INTEGER NOT NULL,
+  scheduled_at INTEGER,
+  published_at INTEGER,
+  square_post_id TEXT,
+  url          TEXT,
+  expires_at   INTEGER,      -- claims with a time window stop being safe to cite after this
+  window_claims_json TEXT,   -- the falsifiable statements evidence.ts watches
+  refusal_hits TEXT,
+  error        TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_studio_article_status ON studio_articles(status, scheduled_at);
+
+-- Measured outcomes per article, same checkpoint idea as post_stat_checks but with the
+-- article-only fields. Views alone cannot tell a good article from a lucky coin.
+CREATE TABLE IF NOT EXISTS studio_observations (
+  article_id   INTEGER NOT NULL REFERENCES studio_articles(id),
+  checkpoint   INTEGER NOT NULL,
+  at           INTEGER NOT NULL,
+  views        INTEGER,
+  likes        INTEGER,
+  comments     INTEGER,
+  shares       INTEGER,
+  reactions    INTEGER,
+  subscribers  INTEGER,
+  on_board     INTEGER NOT NULL DEFAULT 0,
+  PRIMARY KEY (article_id, checkpoint)
+);
+
+-- What the module learned about itself. A published claim cannot be edited (the API is
+-- create-only), so a contradicted claim is recorded and the phrasing is tightened going
+-- forward — the only honest form of self-correction available.
+CREATE TABLE IF NOT EXISTS studio_lessons (
+  id           INTEGER PRIMARY KEY AUTOINCREMENT,
+  article_id   INTEGER,
+  concept_id   TEXT,
+  kind         TEXT NOT NULL,       -- contradicted|confirmed|underperformed|overperformed
+  detail       TEXT NOT NULL,
+  created_at   INTEGER NOT NULL
+);
 `;
 
 export class Store {
@@ -230,6 +324,16 @@ export class Store {
     for (const col of ['shares', 'reactions']) {
       if (!has('post_stats', col)) this.db.exec(`ALTER TABLE post_stats ADD COLUMN ${col} INTEGER`);
       if (!has('post_stat_checks', col)) this.db.exec(`ALTER TABLE post_stat_checks ADD COLUMN ${col} INTEGER`);
+    }
+    // The studio tables shipped first without `symbol`, and the panel created them before
+    // the claim re-checker needed it. Same trap as above, so it is patched the same way.
+    for (const [col, decl] of [
+      ['symbol', 'TEXT'],
+      ['refusal_hits', 'TEXT'],
+      ['expires_at', 'INTEGER'],
+      ['window_claims_json', 'TEXT'],
+    ] as const) {
+      if (!has('studio_articles', col)) this.db.exec(`ALTER TABLE studio_articles ADD COLUMN ${col} ${decl}`);
     }
   }
 
@@ -496,10 +600,30 @@ export class Store {
   }
 
   publishedToday(sinceUtcMs: number): number {
-    const row = this.db
+    // Articles count. The 100/day ceiling is per key, and a studio article spends it exactly
+    // like a short post — a counter that ignored them let one account send 30 posts and 10
+    // articles while reporting 30/30.
+    const posts = this.db
       .prepare(`SELECT COUNT(*) AS n FROM posts WHERE status = 'published' AND published_at >= ?`)
       .get(sinceUtcMs) as { n: number };
-    return row.n;
+    const articles = this.db
+      .prepare(`SELECT COUNT(*) AS n FROM studio_articles WHERE status = 'published' AND published_at >= ?`)
+      .get(sinceUtcMs) as { n: number };
+    return posts.n + articles.n;
+  }
+
+  /** Drafts waiting for review plus approved posts waiting for their minute. */
+  pendingQueueCount(accountId: number | null = null): number {
+    const scope = accountId === null ? '' : 'AND account_id = @a';
+    const params = accountId === null ? {} : { a: accountId };
+    const rows = this.db
+      .prepare(
+        `SELECT COUNT(*) AS n FROM posts WHERE status IN ('draft','approved') ${scope}
+         UNION ALL
+         SELECT COUNT(*) AS n FROM studio_articles WHERE status IN ('draft','approved') ${scope}`,
+      )
+      .all(params) as { n: number }[];
+    return rows.reduce((sum, r) => sum + r.n, 0);
   }
 
   /* ------------------------------------------------------------- stats */
@@ -688,6 +812,209 @@ export class Store {
       .all(Date.now() - days * 86_400_000) as PerformanceRow[];
   }
 
+  /**
+   * Published articles shaped like `performanceRows`, so the time and account axes can treat
+   * one content stream instead of two. The two tables will stay separate — an article carries a
+   * concept, a tier and a claim-check that a post has no use for — but "what went out and when"
+   * is the same question for both.
+   */
+  articleRows(days = 30): PerformanceRow[] {
+    return this.db
+      .prepare(
+        `SELECT a.id, COALESCE(a.published_at, a.created_at) AS published_at, a.account_id, ac.label AS account_label,
+                NULL AS template_id, a.concept_id AS template_name, '教学' AS style,
+                a.concept_id AS category, NULL AS sub_type, a.symbol, a.title AS text,
+                1 AS has_chart, LENGTH(a.body) AS chars,
+                o.views, o.likes, o.comments, o.shares, o.reactions, a.square_post_id,
+                o.subscribers, o.on_board AS surfaced
+         FROM studio_articles a
+         LEFT JOIN accounts ac ON ac.id = a.account_id
+         LEFT JOIN studio_observations o ON o.article_id = a.id
+           AND o.checkpoint = (SELECT MAX(checkpoint) FROM studio_observations WHERE article_id = a.id)
+         WHERE a.status = 'published' AND COALESCE(a.published_at, a.created_at) >= ?
+         ORDER BY published_at DESC`,
+      )
+      .all(Date.now() - days * 86_400_000) as PerformanceRow[];
+  }
+
+  /* ------------------------------------------------------------------ studio */
+
+  studioBinding(accountId: number): StudioBinding | undefined {
+    return this.db.prepare('SELECT * FROM studio_accounts WHERE account_id = ?').get(accountId) as StudioBinding | undefined;
+  }
+
+  /** Which accounts the studio owns. `pause_matrix` ones are excluded from the main feed. */
+  studioAccounts(): (StudioBinding & { label: string; enabled_main: number })[] {
+    return this.db
+      .prepare('SELECT sa.*, a.label, a.enabled AS enabled_main FROM studio_accounts sa JOIN accounts a ON a.id = sa.account_id')
+      .all() as (StudioBinding & { label: string; enabled_main: number })[];
+  }
+
+  bindStudioTrack(accountId: number, trackId: string, opts: { pauseMatrix?: boolean; articlesPerDay?: number | null } = {}): void {
+    this.db
+      .prepare(
+        `INSERT INTO studio_accounts (account_id, track_id, bound_at, pause_matrix, articles_per_day, enabled)
+         VALUES (?, ?, ?, ?, ?, 1)
+         ON CONFLICT(account_id) DO UPDATE SET
+           track_id = excluded.track_id,
+           pause_matrix = excluded.pause_matrix,
+           articles_per_day = excluded.articles_per_day`,
+      )
+      .run(accountId, trackId, Date.now(), opts.pauseMatrix === false ? 0 : 1, opts.articlesPerDay ?? null);
+  }
+
+  unbindStudioTrack(accountId: number): void {
+    this.db.prepare('DELETE FROM studio_accounts WHERE account_id = ?').run(accountId);
+  }
+
+  conceptStates(trackId: string): StudioConceptState[] {
+    return this.db.prepare('SELECT * FROM studio_concepts WHERE track_id = ?').all(trackId) as StudioConceptState[];
+  }
+
+  /** Read the curriculum in, creating a row for any concept added since the last run. */
+  ensureConceptRows(trackId: string, conceptIds: string[]): number {
+    const stmt = this.db.prepare(
+      'INSERT OR IGNORE INTO studio_concepts (concept_id, track_id, written) VALUES (?, ?, 0)',
+    );
+    let added = 0;
+    this.db.transaction(() => {
+      for (const id of conceptIds) added += stmt.run(id, trackId).changes;
+    })();
+    return added;
+  }
+
+  recordConceptWritten(conceptId: string, trackId: string, medianViews: number, samples: number): void {
+    this.db
+      .prepare(
+        `UPDATE studio_concepts
+         SET written = 1, written_at = ?, publish_count = publish_count + 1, median_views = ?, samples = ?, needs_update = 0
+         WHERE concept_id = ? AND track_id = ?`,
+      )
+      .run(Date.now(), Math.round(medianViews), samples, conceptId, trackId);
+  }
+
+  markConceptStale(conceptId: string, trackId: string): void {
+    this.db.prepare('UPDATE studio_concepts SET needs_update = 1 WHERE concept_id = ? AND track_id = ?').run(conceptId, trackId);
+  }
+
+  addArticle(a: {
+    trackId: string;
+    conceptId: string;
+    accountId: number | null;
+    symbol?: string | null;
+    title: string;
+    body: string;
+    sections?: unknown;
+    facts?: unknown;
+    coverPath?: string | null;
+    scheduledAt?: number | null;
+    expiresAt?: number | null;
+    windowClaims?: unknown;
+  }): number {
+    const res = this.db
+      .prepare(
+        `INSERT INTO studio_articles
+         (track_id, concept_id, account_id, symbol, title, body, sections_json, facts_json, cover_path, status, created_at, scheduled_at, expires_at, window_claims_json)
+         VALUES (?,?,?,?,?,?,?,?,?,'draft',?,?,?,?)`,
+      )
+      .run(
+        a.trackId, a.conceptId, a.accountId, a.symbol ?? null, a.title, a.body,
+        JSON.stringify(a.sections ?? null), JSON.stringify(a.facts ?? null), a.coverPath ?? null,
+        Date.now(), a.scheduledAt ?? null, a.expiresAt ?? null, JSON.stringify(a.windowClaims ?? null),
+      );
+    return Number(res.lastInsertRowid);
+  }
+
+  updateStudioArticle(id: number, patch: Partial<Record<string, unknown>> & { status?: string }): void {
+    const map: Record<string, unknown> = {};
+    const cols: Record<string, string> = {
+      status: 'status', title: 'title', body: 'body', coverUrl: 'cover_url', coverPath: 'cover_path',
+      scheduledAt: 'scheduled_at', publishedAt: 'published_at', squarePostId: 'square_post_id',
+      url: 'url', error: 'error', refusalHits: 'refusal_hits', expiresAt: 'expires_at',
+    };
+    for (const [k, col] of Object.entries(cols)) {
+      if (k in patch) map[col] = patch[k as keyof typeof patch];
+    }
+    if (!Object.keys(map).length) return;
+    const keys = Object.keys(map);
+    this.db
+      .prepare(`UPDATE studio_articles SET ${keys.map(k => `${k} = @${k}`).join(', ')} WHERE id = @__id`)
+      .run({ ...map, __id: id });
+  }
+
+  studioArticle(id: number): StudioArticle | undefined {
+    return this.db.prepare('SELECT * FROM studio_articles WHERE id = ?').get(id) as StudioArticle | undefined;
+  }
+
+  /**
+   * The latest minute an article for this account already owns — published, queued, or drafted.
+   * Articles need their own clock: they live in a separate table, and a long post published two
+   * minutes after another one costs the account reach it cannot get back.
+   */
+  lastArticleClaimAt(accountId: number, horizon = Date.now() + 7 * 86_400_000): number {
+    const row = this.db
+      .prepare(
+        `SELECT MAX(COALESCE(published_at, scheduled_at, created_at)) AS t FROM studio_articles
+         WHERE account_id = @a AND status IN ('draft','approved','published') AND COALESCE(scheduled_at, created_at) <= @h`,
+      )
+      .get({ a: accountId, h: horizon }) as { t: number | null };
+    return row.t ?? 0;
+  }
+
+  studioArticles(status: string[] | 'all' = 'all', limit = 60): StudioArticle[] {
+    if (status === 'all') {
+      return this.db.prepare('SELECT * FROM studio_articles ORDER BY id DESC LIMIT ?').all(limit) as StudioArticle[];
+    }
+    const marks = status.map(() => '?').join(',');
+    return this.db.prepare(`SELECT * FROM studio_articles WHERE status IN (${marks}) ORDER BY id DESC LIMIT ?`).all(...status, limit) as StudioArticle[];
+  }
+
+  recordStudioObservation(articleId: number, checkpoint: number, s: StudioStatSample & { onBoard?: boolean }): void {
+    this.db
+      .prepare(
+        `INSERT INTO studio_observations (article_id, checkpoint, at, views, likes, comments, shares, reactions, subscribers, on_board)
+         VALUES (?,?,?,?,?,?,?,?,?,?)
+         ON CONFLICT(article_id, checkpoint) DO UPDATE SET
+           at = excluded.at, views = excluded.views, likes = excluded.likes, comments = excluded.comments,
+           shares = excluded.shares, reactions = excluded.reactions, subscribers = excluded.subscribers,
+           on_board = excluded.on_board`,
+      )
+      .run(articleId, checkpoint, Date.now(), s.views ?? null, s.likes ?? null, s.comments ?? null, s.shares ?? null, s.reactions ?? null, s.subscribers ?? null, s.onBoard ? 1 : 0);
+  }
+
+  studioObservations(articleId: number): (StudioStatSample & { checkpoint: number; at: number; on_board: number })[] {
+    return this.db
+      .prepare('SELECT checkpoint, at, views, likes, comments, shares, reactions, subscribers, on_board FROM studio_observations WHERE article_id = ? ORDER BY checkpoint')
+      .all(articleId) as (StudioStatSample & { checkpoint: number; at: number; on_board: number })[];
+  }
+
+  /** Latest reading per article — the list view must not issue one query per row. */
+  studioLatestStats(ids: number[]): Map<number, StudioStatSample & { at: number; on_board: number }> {
+    const out = new Map<number, StudioStatSample & { at: number; on_board: number }>();
+    if (!ids.length) return out;
+    const rows = this.db
+      .prepare(
+        `SELECT o.article_id, o.at, o.views, o.likes, o.comments, o.shares, o.reactions, o.subscribers, o.on_board
+         FROM studio_observations o
+         JOIN (SELECT article_id, MAX(checkpoint) cp FROM studio_observations GROUP BY article_id) m
+           ON m.article_id = o.article_id AND m.cp = o.checkpoint
+         WHERE o.article_id IN (${ids.map(() => '?').join(',')})`,
+      )
+      .all(...ids) as (StudioStatSample & { article_id: number; at: number; on_board: number })[];
+    for (const r of rows) out.set(r.article_id, { at: r.at, views: r.views, likes: r.likes, comments: r.comments, shares: r.shares, reactions: r.reactions, subscribers: r.subscribers, on_board: r.on_board });
+    return out;
+  }
+
+  addLesson(l: { articleId?: number | null; conceptId?: string | null; kind: string; detail: string }): void {
+    this.db
+      .prepare('INSERT INTO studio_lessons (article_id, concept_id, kind, detail, created_at) VALUES (?,?,?,?,?)')
+      .run(l.articleId ?? null, l.conceptId ?? null, l.kind, l.detail, Date.now());
+  }
+
+  lessons(limit = 40): { id: number; article_id: number | null; concept_id: string | null; kind: string; detail: string; created_at: number }[] {
+    return this.db.prepare('SELECT * FROM studio_lessons ORDER BY id DESC LIMIT ?').all(limit) as never;
+  }
+
   /* ------------------------------------------------------------- settings */
   getSetting<T>(key: string, fallback: T): T {
     const row = this.db.prepare('SELECT value FROM settings WHERE key = ?').get(key) as { value: string } | undefined;
@@ -717,6 +1044,39 @@ export class Store {
           .prepare("SELECT MAX(published_at) AS t FROM posts WHERE account_id = ? AND status IN ('published','uncertain') AND published_at <= ?")
           .get(accountId, now);
     return (row as { t: number | null }).t ?? 0;
+  }
+
+  /**
+   * The latest moment already claimed by this account — published *or* merely scheduled.
+   *
+   * `lastPublishAt` alone cannot space a batch: during one tick nothing has gone out yet,
+   * so every draft computes the same next slot and they all fire in the same minute. The
+   * queue has to be part of the clock for the interval to mean anything.
+   *
+   * `beforeId` excludes one post from its own clock. Without it a draft scheduled for now
+   * would see its own slot as a prior claim and push itself an interval into the future,
+   * so nothing could ever be published — a self-block that looks identical to correct
+   * spacing until you try it.
+   */
+  lastSlotClaimedAt(accountId: number | null = null, horizon = Date.now() + 86_400_000, before?: { id: number; at: number } | null): number {
+    const published = this.lastPublishAt(accountId, horizon);
+    // Only claims that sort strictly before the candidate count as "previous". Ties on the
+    // same scheduled minute are broken by id, so a batch collapsed onto one slot releases
+    // exactly one post instead of either all of them (the original bug) or none of them.
+    const prior = before ? 'AND (COALESCE(scheduled_at, created_at) < @bAt OR (COALESCE(scheduled_at, created_at) = @bAt AND id < @bId))' : '';
+    const params: Record<string, unknown> = accountId === null ? { h: horizon } : { a: accountId, h: horizon };
+    if (before) {
+      params.bAt = before.at;
+      params.bId = before.id;
+    }
+    const scoped = accountId === null ? '' : 'account_id = @a AND';
+    const row = this.db
+      .prepare(
+        `SELECT MAX(COALESCE(scheduled_at, created_at)) AS t FROM posts
+         WHERE ${scoped} status IN ('draft','approved') AND COALESCE(scheduled_at, created_at) <= @h ${prior}`,
+      )
+      .get(params) as { t: number | null } | undefined;
+    return Math.max(published, row?.t ?? 0);
   }
 
   lastEvent(kind: string) {
@@ -892,11 +1252,14 @@ export class Store {
 
   /** Posts already committed to an account today, for its own quota. */
   accountPostsToday(accountId: number, sinceUtcMs: number): number {
-    return (
-      this.db
-        .prepare("SELECT COUNT(*) AS n FROM posts WHERE account_id = ? AND status = 'published' AND published_at >= ?")
-        .get(accountId, sinceUtcMs) as { n: number }
-    ).n;
+    const rows = this.db
+      .prepare(
+        `SELECT COUNT(*) AS n FROM posts WHERE account_id = @a AND status = 'published' AND published_at >= @s
+         UNION ALL
+         SELECT COUNT(*) AS n FROM studio_articles WHERE account_id = @a AND status = 'published' AND published_at >= @s`,
+      )
+      .all({ a: accountId, s: sinceUtcMs }) as { n: number }[];
+    return rows.reduce((sum, r) => sum + r.n, 0);
   }
 
   /**
@@ -1034,6 +1397,61 @@ export interface BoardSample {
 
 export type BoardRow = BoardSample & { seen_count: number };
 
+/** An account's 赛道 binding. One track per account — that is the point of the table. */
+export interface StudioBinding {
+  account_id: number;
+  track_id: string;
+  bound_at: number;
+  pause_matrix: number;
+  articles_per_day: number | null;
+  enabled: number;
+}
+
+export interface StudioConceptState {
+  concept_id: string;
+  track_id: string;
+  written: number;
+  written_at: number | null;
+  publish_count: number;
+  median_views: number;
+  samples: number;
+  needs_update: number;
+  last_error: string | null;
+}
+
+export interface StudioArticle {
+  id: number;
+  track_id: string;
+  concept_id: string;
+  account_id: number | null;
+  symbol: string | null;
+  title: string;
+  body: string;
+  sections_json: string | null;
+  facts_json: string | null;
+  cover_path: string | null;
+  cover_url: string | null;
+  status: string;
+  created_at: number;
+  scheduled_at: number | null;
+  published_at: number | null;
+  square_post_id: string | null;
+  url: string | null;
+  expires_at: number | null;
+  window_claims_json: string | null;
+  refusal_hits: string | null;
+  error: string | null;
+}
+
+export interface StudioStatSample {
+  views: number | null;
+  likes: number | null;
+  comments: number | null;
+  shares: number | null;
+  reactions: number | null;
+  subscribers: number | null;
+}
+
 /** What the list view adds on top of a post row: attribution and the latest reading. */
 export interface ListAttribution {
   category: string | null;
@@ -1071,6 +1489,10 @@ export interface PerformanceRow {
   shares: number | null;
   reactions: number | null;
   square_post_id: string | null;
+  // Articles only: a post has no subscriber count, and "surfaced" for a post is answered by the
+  // board-sample table rather than by a column on the row.
+  subscribers?: number | null;
+  surfaced?: number | null;
 }
 
 function rowToMaterial(r: MaterialRow): Material {

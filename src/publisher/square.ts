@@ -17,6 +17,16 @@ export const DAILY_POST_LIMIT = 100;
 export const DAILY_UPLOAD_LIMIT = 400;
 export const MAX_IMAGES = 4;
 export const MAX_BODY_CHARS = 2000;
+/**
+ * Measured, not guessed: a 2700-character article published cleanly (content
+ * 375169413966150), so the 2000 ceiling above is our own short-post constant and not the
+ * API's limit for `contentType: 2`. The real ceiling is still unmeasured — cover validation
+ * runs before length validation, so an over-long body with a bad cover fails on the cover
+ * and reveals nothing. 6000 is set as a working bound, and exceeding it is a hard error
+ * rather than a truncation: a teaching article cut off mid-explanation is worse than one
+ * that refuses to publish.
+ */
+export const MAX_ARTICLE_CHARS = 6000;
 
 export type FailureKind =
   | 'auth'
@@ -175,6 +185,43 @@ export class SquareClient {
       return { ok: false, kind: 'content', label: `图片最多 ${MAX_IMAGES} 张` };
     }
     const r = await this.call<{ id?: string; shareLink?: string }>(`${V1}/content/add`, body);
+    return SquareClient.interpret(r, d => ({
+      ok: true,
+      postId: d.id ? String(d.id) : undefined,
+      url: d.shareLink ?? (d.id ? `https://www.binance.com/square/post/${d.id}` : undefined),
+    }));
+  }
+
+  /**
+   * Publish a 长文 (contentType 2). Measured behaviour, all of it different from posts:
+   *
+   * - `cover` takes the hosted **imageUrl**, not the upload fileTicket. The ticket form has
+   *   no reason to be tried; the URL path returns `000000` and renders.
+   * - A title is required, and exactly one cover — `imageList` cannot be combined with it.
+   * - The body comes back on `content/{id}` in **`bodyTextOnly`**, while `content` is empty.
+   *   Reading the wrong field looks exactly like a silently-empty article, so verify with
+   *   `readArticleBody()` rather than the post path.
+   * - Articles carry a `subscribeCount`. A post is a feed item; an article is a followable
+   *     asset, which is the mechanism behind "教学复利".
+   * - `$BTC` / `#BTC` still have to be inside the body text. The probe article mentioned
+   *   CTSI in prose only and came back with `coinPairList` but an empty `hashtagList`.
+   */
+  async publishArticle(a: { title: string; bodyTextOnly: string; coverUrl: string }): Promise<PublishOutcome> {
+    const title = a.title.trim();
+    const body = a.bodyTextOnly.trim();
+    const payload = { contentType: 2, title, bodyTextOnly: body, cover: a.coverUrl };
+
+    if (this.opts.dryRun) {
+      this.opts.log?.(`[dry-run] POST article "${title}" ${body.length}字 cover=${a.coverUrl.slice(0, 60)}`);
+      return { ok: true, postId: 'dry-run', label: 'dry-run，未发送' };
+    }
+    if (!title) return { ok: false, kind: 'content', label: '文章必须有标题' };
+    if (!a.coverUrl) return { ok: false, kind: 'content', label: '文章必须有一张封面图' };
+    if (body.length > MAX_ARTICLE_CHARS) {
+      return { ok: false, kind: 'content', label: `正文超过文章上限 ${MAX_ARTICLE_CHARS} 字 (${body.length})，不做截断` };
+    }
+
+    const r = await this.call<{ id?: string; shareLink?: string }>(`${V1}/content/add`, payload);
     return SquareClient.interpret(r, d => ({
       ok: true,
       postId: d.id ? String(d.id) : undefined,

@@ -34,6 +34,36 @@ export const CATEGORY_LABELS: Record<string, string> = {
   liquidation: '爆仓', open_interest: '持仓异动', etf_flow: 'ETF 资金流',
 };
 
+/**
+ * Chinese display labels for the `category/sub_type` slugs. These reach the screen as "具体信号",
+ * and `onchain/hl_funding` makes an operator guess instead of read.
+ */
+export const SUBTYPE_LABELS: Record<string, string> = {
+  'announcement/campaign': '活动', 'announcement/delisting': '下架公告', 'announcement/listing': '上新公告',
+  'announcement/maintenance': '系统维护', 'announcement/news': '交易所消息',
+  'attention/follow': '关注人数', 'attention/topic': '热议话题',
+  'dex/trending_pool': '热门池放量',
+  'funding/funding_extreme': '费率极值',
+  'leaderboard/gainers': '涨幅榜', 'leaderboard/losers': '跌幅榜',
+  'long_short/account_ratio': '账户多空比', 'long_short/position_ratio': '持仓多空比',
+  'market_move/dump': '急跌', 'market_move/spike': '急拉', 'market_move/new_high': '创新高',
+  'market_move/new_low': '创新低', 'market_move/volume_surge': '放量', 'market_move/ma_golden': '金叉', 'market_move/ma_death': '死叉',
+  'newsflash/exchange': '快讯·交易所', 'newsflash/general': '快讯·综合', 'newsflash/institution': '快讯·机构',
+  'newsflash/project': '快讯·项目方', 'newsflash/regulation': '快讯·监管', 'newsflash/security': '快讯·安全',
+  'onchain/hl_funding': 'HL 费率分歧', 'onchain/hl_move': 'HL 持仓异动',
+  'open_interest/oi_shift': '持仓量异动',
+  'sentiment/fear_greed': '恐惧贪婪指数',
+  'stablecoin/supply_shift': '发行量变化',
+  'trending/hot_board': '热搜榜',
+};
+
+/** `category/sub_type` → 「链上数据 · HL 费率分歧」. Falls back to whatever is known. */
+export function signalLabel(category: string | null, subType: string | null): string {
+  const cat = category ? (CATEGORY_LABELS[category] ?? category) : '未分类';
+  const sub = category && subType ? (SUBTYPE_LABELS[`${category}/${subType}`] ?? subType) : null;
+  return sub ? `${cat} · ${sub}` : cat;
+}
+
 export interface GroupStat {
   key: string;
   label: string;
@@ -137,7 +167,7 @@ interface DimSpec {
 
 const DIMS: DimSpec[] = [
   { key: 'category', label: '内容分类', keyOf: r => (r.category ? CATEGORY_LABELS[r.category] ?? r.category : null) },
-  { key: 'subType', label: '具体信号', keyOf: r => (r.category && r.sub_type ? `${r.category}/${r.sub_type}` : null) },
+  { key: 'subType', label: '具体信号', keyOf: r => (r.category && r.sub_type ? signalLabel(r.category, r.sub_type) : null) },
   { key: 'style', label: '写作风格', keyOf: r => (r.style ? STYLE_LABELS[r.style as keyof typeof STYLE_LABELS] ?? r.style : null) },
   { key: 'template', label: '模版', keyOf: r => r.template_name ?? r.template_id },
   { key: 'coin', label: '币种', keyOf: r => r.symbol, matchesBoardCoin: true },

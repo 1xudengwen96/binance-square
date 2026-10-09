@@ -3,6 +3,12 @@ import { DEFAULT_SETTINGS, type Settings } from './config.ts';
 
 const BJ_OFFSET_MS = 8 * 3600_000;
 
+/**
+ * How far ahead a new draft may reserve a minute. One day is deliberately wider than the
+ * active window: the queue-depth cap in `generate` is what stops drafts piling up, not this.
+ */
+export const QUEUE_LOOKAHEAD_MS = 86_400_000;
+
 /** Start of the current Beijing calendar day, as a UTC epoch. */
 export function beijingDayStart(now = Date.now()): number {
   return Math.floor((now + BJ_OFFSET_MS) / 86_400_000) * 86_400_000 - BJ_OFFSET_MS;
@@ -43,8 +49,20 @@ export interface SlotDecision {
 /**
  * When may the next post go out? Honours the daily cap, the minimum gap between
  * posts, the active window, and the hard Binance ceiling.
+ *
+ * `queueAhead` is for the generation side. A draft is written now but published later, so it
+ * has to reserve a minute that nobody else has taken — which means it must look at slots the
+ * queue already claims. The publish gate must NOT do that: a future draft is not evidence that
+ * the post in front of it is late, and spacing on those claims starved the queue for seven
+ * hours on the day the burst was found.
  */
-export function nextSlot(store: Store, s: Settings, now = Date.now()): SlotDecision {
+export function nextSlot(
+  store: Store,
+  s: Settings,
+  now = Date.now(),
+  candidate?: { id: number; at: number } | null,
+  queueAhead = false,
+): SlotDecision {
   const publishedToday = store.publishedToday(beijingDayStart(now));
   if (publishedToday >= s.dailyCap) {
     return { allowed: false, at: now, reason: `今日已发 ${publishedToday}/${s.dailyCap}，达到自设上限` };
@@ -53,12 +71,15 @@ export function nextSlot(store: Store, s: Settings, now = Date.now()): SlotDecis
     return { allowed: false, at: now, reason: '已达币安官方 100 帖/天硬上限' };
   }
 
-  const last = store.lastEvent('published');
+  // Spacing reads the post table, not the event log. The two drift apart whenever a post is
+  // published without an event, and neither used to see drafts already sitting in the queue —
+  // which is how a whole batch ended up scheduled at the same minute.
+  const last = store.lastSlotClaimedAt(null, queueAhead ? now + QUEUE_LOOKAHEAD_MS : now, candidate);
   const gapMs = nominalIntervalMinutes(s) * 60_000;
-  let at = Math.max(now, (last?.at ?? 0) + gapMs);
+  let at = Math.max(now, last + gapMs);
 
   const minGapMs = s.minIntervalMinutes * 60_000;
-  if (last && at - last.at < minGapMs) at = last.at + minGapMs;
+  if (last && at - last < minGapMs) at = last + minGapMs;
 
   if (!insideActiveWindow(s, at)) {
     const rolled = rollIntoWindow(s, at);
@@ -112,7 +133,14 @@ export function settingsForAccount(base: Settings, a: AccountRow): Settings {
  * spammy; the matrix-wide gap keeps ten accounts from firing in one recognisable
  * burst, which is the shape platform abuse detection looks for.
  */
-export function nextSlotFor(store: Store, base: Settings, a: AccountRow, now = Date.now()): SlotDecision {
+export function nextSlotFor(
+  store: Store,
+  base: Settings,
+  a: AccountRow,
+  now = Date.now(),
+  candidate?: { id: number; at: number } | null,
+  queueAhead = false,
+): SlotDecision {
   const s = settingsForAccount(base, a);
   const mine = store.accountPostsToday(a.id, beijingDayStart(now));
   if (mine >= s.dailyCap) {
@@ -122,10 +150,15 @@ export function nextSlotFor(store: Store, base: Settings, a: AccountRow, now = D
     return { allowed: false, at: now, reason: `${a.label} 达到币安单号 100 帖/天硬上限` };
   }
 
+  const horizon = queueAhead ? now + QUEUE_LOOKAHEAD_MS : now;
   const gapMs = nominalIntervalMinutes(s) * 60_000;
-  const atOwn = store.lastPublishAt(a.id, now) + Math.max(gapMs, s.minIntervalMinutes * 60_000);
+  // Both clocks must see drafts already scheduled, not only posts already published, or a
+  // batch generated in one tick collapses onto a single minute. The candidate excludes
+  // itself, otherwise a post due now would see its own slot as a prior claim and defer
+  // itself forever.
+  const atOwn = store.lastSlotClaimedAt(a.id, horizon, candidate) + Math.max(gapMs, s.minIntervalMinutes * 60_000);
   // The shared clock counts every account, including this one.
-  const atMatrix = store.lastPublishAt(null, now) + base.crossAccountGapMinutes * 60_000;
+  const atMatrix = store.lastSlotClaimedAt(null, horizon, candidate) + base.crossAccountGapMinutes * 60_000;
   let at = Math.max(now, atOwn, atMatrix);
 
   if (!insideActiveWindow(s, at)) {
