@@ -100,11 +100,3 @@ export function attributeConversions(store: Store, opts: { days?: number; window
   const totalRebate = rows.reduce((s, r) => s + (r.rebate_usd ?? 0), 0);
   return { days: rows.length, posts: credit.size, totalRebate, unattributed: Number(unattributed.toFixed(2)) };
 }
-
-/** Views accumulated by a given instant — the weight the apportionment uses. */
-export function viewsBy(store: Store, postId: number, at: number): number {
-  const row = store.db
-    .prepare('SELECT views FROM post_stat_checks WHERE post_id = ? AND views IS NOT NULL AND at <= ? ORDER BY at DESC LIMIT 1')
-    .get(postId, at) as { views: number } | undefined;
-  return row?.views ?? 0;
-}

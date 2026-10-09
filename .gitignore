@@ -20,3 +20,5 @@ _tick.json
 /r2.txt
 /r3.html
 /shots/01-accounts.png
+# Canvas artifacts from the same teardown, written by tooling rather than by hand.
+/.qoder-credits/

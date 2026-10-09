@@ -13,7 +13,10 @@ const median = (xs: number[]): number | null => {
 type Row = Distribution & {
   account_id: number | null; category: string | null; style: string | null; template_id: string | null;
   symbol: string | null; chars: number; has_chart: number; published_at: number; text: string;
+  material_score: number | null; rebate_usd: number | null;
+  likes: number | null; comments: number | null; shares: number | null;
   arms?: Record<string, string>;
+  repeatGapHours?: number | null;
 };
 
 /**
@@ -32,19 +35,16 @@ function outcome(row: Row, metric: Metric): number | null {
       return views ?? null;
     case 'growth1h':
       return row.growth_1h;
-    case 'lateShare':
-      return row.late_share;
-    case 'surfacedRate':
-      return row.surfaced;
     case 'engagementPer1k': {
       if (!views || views <= 0) return null;
-      const s = row as unknown as { likes?: number; comments?: number; shares?: number };
-      return (((s.likes ?? 0) + (s.comments ?? 0) + (s.shares ?? 0)) / views) * 1000;
+      // Null counters mean the sweep has not read this post yet; that is not zero engagement.
+      if (row.likes == null && row.comments == null && row.shares == null) return null;
+      return (((row.likes ?? 0) + (row.comments ?? 0) + (row.shares ?? 0)) / views) * 1000;
     }
     case 'rebatePer1k': {
       // Views are the denominator the operator's daily figure can be spread over; a post with no
       // reading cannot carry any credit, so it is excluded rather than scored as zero money.
-      const rebate = (row as unknown as { rebate_usd: number | null }).rebate_usd;
+      const rebate = row.rebate_usd;
       if (!views || views <= 0 || rebate == null) return null;
       return (rebate / views) * 1000;
     }
@@ -61,9 +61,8 @@ function armOf(row: Row, h: Hypothesis): string | null {
       return hour < 8 ? 'late' : hour < 11 ? 'morning' : hour < 15 ? 'midday' : hour < 19 ? 'afternoon' : hour < 23 ? 'evening' : 'late';
     }
     case 'h_repeat_interval': {
-      const gap = row as unknown as { repeatGapHours?: number | null };
-      if (gap.repeatGapHours == null) return null;
-      return gap.repeatGapHours < 6 ? 'within6h' : gap.repeatGapHours < 24 ? '6to24h' : 'over24h';
+      if (row.repeatGapHours == null) return null;
+      return row.repeatGapHours < 6 ? 'within6h' : row.repeatGapHours < 24 ? '6to24h' : 'over24h';
     }
     case 'h_surfacing_shape':
       return row.surfaced ? 'surfaced' : 'unsurfaced';
@@ -107,7 +106,6 @@ export interface Verdict {
 function fmt(metric: Metric, v: number | null): string {
   if (v == null) return '—';
   if (metric === 'views24h') return Math.round(v).toLocaleString('en-US');
-  if (metric === 'surfacedRate') return `${Math.round(v * 100)}%`;
   return v.toFixed(2);
 }
 
@@ -125,7 +123,7 @@ export function scoreAll(store: Store, opts: { days?: number; writeMemory?: bool
   const rows = distributionRows(store, days) as Row[];
   // Pointing the system at money is a real switch, but it only becomes real once the operator
   // has entered a figure. Until then the verdicts stay on views and say so.
-  const moneyReady = opts.target === 'money' && rows.some(r => (r as unknown as { rebate_usd: number | null }).rebate_usd != null);
+  const moneyReady = opts.target === 'money' && rows.some(r => r.rebate_usd != null);
   const armsByPost = new Map<number, Record<string, string>>();
   for (const a of store.db.prepare('SELECT post_id, experiment, arm FROM post_arms').all() as { post_id: number; experiment: string; arm: string }[]) {
     (armsByPost.get(a.post_id) ?? armsByPost.set(a.post_id, {}).get(a.post_id)!)[a.experiment] = a.arm;
@@ -136,7 +134,7 @@ export function scoreAll(store: Store, opts: { days?: number; writeMemory?: bool
   for (const r of [...rows].reverse()) {
     const k = `${r.symbol}|${r.category}`;
     const prev = lastSeen.get(k);
-    (r as unknown as { repeatGapHours: number | null }).repeatGapHours = prev == null ? null : (r.published_at - prev) / 3600_000;
+    r.repeatGapHours = prev == null ? null : (r.published_at - prev) / 3600_000;
     lastSeen.set(k, r.published_at);
   }
   for (const r of rows) r.arms = armsByPost.get(r.post_id) ?? {};
@@ -251,7 +249,7 @@ export function scoreAll(store: Store, opts: { days?: number; writeMemory?: bool
  * remaining difference is much more plausibly the arm.
  */
 function stratumOf(r: Row): string {
-  const score = (r as unknown as { material_score: number | null }).material_score ?? 0;
+  const score = r.material_score ?? 0;
   const band = score >= 85 ? '高热' : score >= 70 ? '中热' : score >= 55 ? '低热' : '冷门';
   return `${r.category ?? '未分类'}|${band}`;
 }

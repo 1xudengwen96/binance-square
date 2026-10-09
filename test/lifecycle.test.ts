@@ -23,6 +23,25 @@ function temp(): { store: Store; dir: string; charts: string } {
 }
 const live = (store: Store) => (store.db.prepare('SELECT COUNT(*) n FROM materials WHERE discarded = 0').get() as { n: number }).n;
 
+test('the drafting pool only offers material that can still be posted', () => {
+  // A flat six-hour lookback returned funding and market_move signals that had already expired.
+  // The drafting pass then skipped them, so each one had taken a pool slot away from a material
+  // that could still have become a post.
+  const { store, dir } = temp();
+  try {
+    const now = Date.now();
+    store.insertMaterial(mat('market_move', 'spike', 'MOVEFRESH', now - 60 * 60_000));   // inside 90m
+    store.insertMaterial(mat('market_move', 'spike', 'MOVESTALE', now - 3 * HOUR));       // past 90m
+    store.insertMaterial(mat('announcement', 'listing', 'ANNOLD', now - 3 * HOUR));       // inside 720m
+    const symbols = store.unusedMaterials(20, now).map(m => m.symbol);
+    assert.deepEqual([...symbols].sort(), ['ANNOLD', 'MOVEFRESH']);
+    assert.ok(!symbols.includes('MOVESTALE'), 'an expired signal must not occupy a pool slot');
+  } finally {
+    store.close();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
 test('each category expires on its own clock, and unknown ones fall back', () => {
   assert.equal(ttlFor('market_move'), 90);
   assert.equal(ttlFor('announcement'), 720);

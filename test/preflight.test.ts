@@ -40,6 +40,26 @@ test('directive language is blocked rather than patched', () => {
   }
 });
 
+/** Whether the gate read this text as a price target, as opposed to blocking it for some other reason. */
+const asPriceTarget = (t: string): boolean => {
+  const r = preFlight({ ...base, text: t });
+  return !r.ok && (r as { reason: string }).reason.includes('价格目标');
+};
+
+test('a price level is still caught in the phrasings that actually show up', () => {
+  for (const t of ['$BTC 看到 120000。', '$BTC 上看3万。', '$BTC 下看 95000 美元。', '$BTC 目标位 0.83。', '$BTC 第一目标 0.83。']) {
+    assert.ok(asPriceTarget(t), `should read as a price target: ${t}`);
+  }
+});
+
+test('a count after a looking-verb is not mistaken for a price target', () => {
+  // `看到\d+` blocked all of these. A compliance gate that fires on clean copy teaches the
+  // operator to stop reading its verdicts, which costs more than the phrasing it was added for.
+  for (const t of ['$BTC 费率 -1.250%，可以看到2个信号。', '$BTC 费率 -1.250%，上看3条线索。', '$BTC 费率 -1.250%，看到10%的回落。', '$BTC 费率 -1.250%，看到2小时内的放量。']) {
+    assert.ok(!asPriceTarget(t), `should not read as a price target: ${t}`);
+  }
+});
+
 test('a number that appeared after drafting is blocked', () => {
   // This is the whole reason the check runs at the last mile: the ledger was clean when the
   // draft was written, and something between then and sending introduced a figure.

@@ -7,7 +7,7 @@
  * system is allowed to form an opinion about reach.
  */
 
-export type Metric = 'views24h' | 'growth1h' | 'lateShare' | 'surfacedRate' | 'engagementPer1k' | 'rebatePer1k';
+export type Metric = 'views24h' | 'growth1h' | 'engagementPer1k' | 'rebatePer1k';
 
 export interface Hypothesis {
   id: string;
@@ -82,7 +82,7 @@ export const HYPOTHESES: Hypothesis[] = [
     metric: 'views24h',
     minSamples: 5,
     how: '按与上一条同币同类帖子的间隔分带，比较本条的浏览量。',
-    risk: '观察。冷却时长就是从这里定的，不是拍脑袋定的。',
+    risk: '观察。冷却时长就是从这里定的，不是拍脑袋定的 —— 但为了让短间隔这一臂拿得到样本，有 5% 的帖子会故意绕过冷却，这部分可能确实更差。',
   },
   {
     id: 'h_surfacing_shape',

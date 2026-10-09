@@ -91,18 +91,23 @@ export function distributionRows(store: Store, days = 30): (Distribution & {
   template_id: string | null; symbol: string | null; chars: number; has_chart: number; published_at: number; text: string;
   /** Apportioned from the operator's daily entry — a guess weighted by views, not a bill. */
   rebate_usd: number | null; click_credit: number | null;
+  material_score: number | null;
+  /** Latest counters for the post; null until the stats sweep has read it once. */
+  likes: number | null; comments: number | null; shares: number | null;
 })[] {
   return store.db
     .prepare(
       `SELECT d.*, p.account_id, p.published_at, p.text, LENGTH(p.text) AS chars,
               m.score AS material_score,
               cv.rebate_usd AS rebate_usd, cv.clicks AS click_credit,
+              s.likes AS likes, s.comments AS comments, s.shares AS shares,
               CASE WHEN p.images_json IS NOT NULL AND p.images_json NOT IN ('', '[]') THEN 1 ELSE 0 END AS has_chart,
               m.category, m.sub_type, t.style, t.id AS template_id, m.symbol
        FROM post_distribution d JOIN posts p ON p.id = d.post_id
        LEFT JOIN materials m ON m.id = p.material_id
        LEFT JOIN templates t ON t.id = p.template_id
        LEFT JOIN post_conversion cv ON cv.post_id = d.post_id
+       LEFT JOIN post_stats s ON s.post_id = d.post_id
        WHERE p.status = 'published' AND p.published_at >= ?
        ORDER BY p.published_at DESC`,
     )

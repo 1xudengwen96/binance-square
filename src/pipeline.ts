@@ -12,6 +12,7 @@ import { announcements } from './collectors/announce.ts';
 import { newsflashes } from './collectors/flash.ts';
 import { hyperliquid } from './collectors/hyperliquid.ts';
 import { nextSlot, nextSlotFor, settingsForAccount, settingsFrom } from './schedule.ts';
+import { expiresAt, ttlFor } from './lifecycle.ts';
 import { refreshPool, pool, dossier, type PoolEntry } from './hot/pool.ts';
 import {
   CROSS_ACCOUNT_THRESHOLD, accountBlockedTemplates, accountStyles, allocate, collidesWithMatrix, materialAllowedForAccount, personaSeed,
@@ -31,7 +32,7 @@ import type { Fact } from './engine/types.ts';
 import type { Material } from './material/types.ts';
 import type { Settings } from './config.ts';
 import { matrixEligibleAccounts } from './studio/lock.ts';
-import { planArms, recordArms } from './rank/experiments.ts';
+import { exploreRepeat, planArms, recordArms } from './rank/experiments.ts';
 import { playbook } from './rank/playbook.ts';
 import { scoreAll } from './rank/score.ts';
 import { writingNotes } from './brain/author.ts';
@@ -270,13 +271,13 @@ export function llmConfigFor(store: Store, settings: Settings): LlmConfig | null
 /** Run the rewrite pass and keep a record of why it was rejected, if it was. */
 async function applyPolish(
   store: Store, settings: Settings, text: string, facts: Fact[], persona = '',
-  ctx: { category?: string; subType?: string | null; symbol?: string | null } = {},
+  ctx: { category?: string; subType?: string | null; symbol?: string | null; verdicts?: Verdict[] } = {},
 ): Promise<{ text: string; note?: string }> {
   const cfg = llmConfigFor(store, settings);
   if (!cfg || !cfg.apiKey || !cfg.model) return { text };
   // The writer reads its own memory before drafting. Cheap when the ledger is empty, which is
   // what it should be — an unfounded belief must not outrank a measured one.
-  const notes = writingNotes(store, { category: ctx.category, subType: ctx.subType ?? null, symbol: ctx.symbol ?? null });
+  const notes = writingNotes(store, { category: ctx.category, subType: ctx.subType ?? null, symbol: ctx.symbol ?? null, verdicts: ctx.verdicts });
   const r = await polish(cfg, text, facts, persona, notes);
   return r.changed ? { text: r.text, note: 'ai_polished' } : { text, note: `ai_rejected: ${r.reason}` };
 }
@@ -323,6 +324,7 @@ export async function generate(
     .map(p => p.template_id)
     .filter((x): x is string => Boolean(x));
 
+  let pastShelfLife = 0;
   for (const m of pool) {
     if (report.created.length >= want) break;
     const when = Date.now() + report.created.length * nominalGap(eff);
@@ -335,8 +337,19 @@ export async function generate(
       report.skipped.push('今天的发帖时段已经排满，再写就只能排到明天 —— 停在这里，不写过期的草稿');
       break;
     }
+    // The slot has to land while the material is still true. A draft reserved past its own shelf
+    // life is not a queued post, it is work the sweeper will delete — and since the ceiling above
+    // counts pending drafts, deleting it reopens the ceiling and the next tick writes more.
+    if (!opts.dryRun && slot.at >= expiresAt(m.category, m.at)) {
+      pastShelfLife++;
+      continue;
+    }
     const seed = personaSeed(m.id, account?.id ?? 0, slot.at);
-    if (!opts.dryRun && m.symbol && store.recentCoinSignal(account?.id ?? null, m.symbol, m.category, Date.now() - eff.coinSignalCooldownMinutes * 60_000)) {
+    // A small deterministic share is let through on purpose. `h_repeat_interval` measures
+    // whether a quick repeat suppresses itself, and the cooldown below is the knob that answer
+    // should set — but the cooldown also guarantees the short-interval arm never sees a row.
+    const repeatProbe = exploreRepeat(String(seed));
+    if (!opts.dryRun && m.symbol && !repeatProbe && store.recentCoinSignal(account?.id ?? null, m.symbol, m.category, Date.now() - eff.coinSignalCooldownMinutes * 60_000)) {
       report.skipped.push(`${m.title}: 这个币的「${m.category}」类内容 ${Math.round(eff.coinSignalCooldownMinutes / 60)} 小时内已经发过`);
       continue;
     }
@@ -369,7 +382,9 @@ export async function generate(
     if (eff.appendDisclaimer && !carriesDisclaimer(text)) {
       text = `${text}\n${wordBank['disclaimer.default']}`;
     }
-    const polished = await applyPolish(store, eff, text, c.result.facts, account?.persona_note ?? '', m);
+    const polished = await applyPolish(store, eff, text, c.result.facts, account?.persona_note ?? '', {
+      category: m.category, subType: m.subType, symbol: m.symbol, verdicts: rankVerdicts,
+    });
     text = polished.text;
     // Tagged after polish: a model must never get the chance to reword a hashtag.
     if (eff.appendHashtags) text = withHashtags(text, m, pb.hashtagTotal);
@@ -425,6 +440,10 @@ export async function generate(
     recent.unshift(text);
     recentlyUsed.push(c.templateId);
     report.created.push({ id, material: m.title, template: c.templateName, text, scheduledAt: slot.at });
+  }
+
+  if (pastShelfLife) {
+    report.skipped.push(`${pastShelfLife} 条素材的下一个可用时段已超出它的保质期 —— 与其写成注定作废的草稿，不如等下一个信号`);
   }
 
   store.log('generate', { created: report.created.map(c => c.id), skipped: report.skipped });
@@ -660,7 +679,9 @@ export async function reroll(
   if (settings.appendDisclaimer && !carriesDisclaimer(text)) {
     text = `${text}\n${wordBank['disclaimer.default']}`;
   }
-  const polished = await applyPolish(store, settings, text, c.result.facts);
+  const polished = await applyPolish(store, settings, text, c.result.facts, '', {
+    category: material.category, subType: material.subType, symbol: material.symbol,
+  });
   let finalText = polished.text;
   if (settings.appendHashtags) finalText = withHashtags(finalText, material);
 
@@ -753,8 +774,15 @@ export async function generateFromPool(
       report.skipped.push({ symbol: e.symbol, why: '今天的发帖时段已排满，再写就只能排到明天' });
       break;
     }
+    // This material is minted fresh, so its clock starts now — but the slot may be hours out, and
+    // a热度跟进 posted after the热度 has moved on is worse than not posting it.
+    if (slot.at >= expiresAt('attention', Date.now())) {
+      report.skipped.push({ symbol: e.symbol, why: `下一个可用时段已超出热度保质期（${Math.round(ttlFor('attention') / 60)} 小时），不写注定作废的草稿` });
+      continue;
+    }
     const facts = dossier(e);
-    if (store.recentCoinSignal(acct?.id ?? null, e.symbol, 'attention', Date.now() - eff.coinSignalCooldownMinutes * 60_000)) {
+    const repeatProbe = exploreRepeat(`attention:${e.symbol}:${acct?.id ?? 0}:${slot.at}`);
+    if (!repeatProbe && store.recentCoinSignal(acct?.id ?? null, e.symbol, 'attention', Date.now() - eff.coinSignalCooldownMinutes * 60_000)) {
       report.skipped.push({ symbol: e.symbol, why: `这个币的热度内容 ${Math.round(eff.coinSignalCooldownMinutes / 60)} 小时内已经发过` });
       continue;
     }
@@ -792,7 +820,9 @@ export async function generateFromPool(
     if (eff.appendDisclaimer && !carriesDisclaimer(text)) {
       text = `${text}\n${wordBank['disclaimer.default']}`;
     }
-    const polished = await applyPolish(store, eff, text, c.result.facts, acct?.persona_note ?? '', material);
+    const polished = await applyPolish(store, eff, text, c.result.facts, acct?.persona_note ?? '', {
+      category: material.category, subType: material.subType, symbol: material.symbol, verdicts: rankVerdicts,
+    });
     text = polished.text;
     if (eff.appendHashtags) text = withHashtags(text, material, pb.hashtagTotal);
     const thin = tooThin(c.result.facts, text);

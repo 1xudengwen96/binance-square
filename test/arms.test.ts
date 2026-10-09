@@ -7,6 +7,7 @@ import { Store } from '../src/db/index.ts';
 import { DEFAULT_SETTINGS } from '../src/config.ts';
 import { generate } from '../src/pipeline.ts';
 import { HYPOTHESES } from '../src/rank/hypotheses.ts';
+import { exploreRepeat, REPEAT_EXPLORE_SHARE } from '../src/rank/experiments.ts';
 import { makeMaterial } from '../src/material/types.ts';
 
 /** Exactly the fact set `collectors/detectors.ts` puts on a funding material, plus the enriched fields. */
@@ -78,4 +79,21 @@ test('every recorded arm is one of the arms the hypothesis declares', async () =
     store.close();
     rmSync(dir, { recursive: true, force: true });
   }
+});
+
+test('the repeat-interval probe is deterministic and spends the share it declares', () => {
+  // `h_repeat_interval` asks whether re-posting a coin quickly suppresses itself, and the coin
+  // cooldown is the knob that answer should set. With no deliberate bypass the short-interval arm
+  // can never receive a row, so the cooldown was being defended by a measurement that could not
+  // exist. The bypass has to be reproducible, or a post that skipped the cooldown looks like a bug
+  // rather than a decision anyone can audit.
+  const seed = 'm:BTC:1:1700000000000';
+  assert.equal(exploreRepeat(seed), exploreRepeat(seed), 'same seed must give the same answer');
+
+  const N = 20_000;
+  let hits = 0;
+  for (let i = 0; i < N; i++) if (exploreRepeat(`seed:${i}`)) hits++;
+  const rate = hits / N;
+  assert.ok(hits > 0, 'the short-interval arm must be reachable at all');
+  assert.ok(Math.abs(rate - REPEAT_EXPLORE_SHARE) < 0.01, `expected about ${(REPEAT_EXPLORE_SHARE * 100).toFixed(0)}%, got ${(rate * 100).toFixed(2)}%`);
 });

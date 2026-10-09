@@ -37,6 +37,18 @@ export function ttlFor(category: string): number {
   return TTL_MINUTES[category] ?? DEFAULT_TTL_MINUTES;
 }
 
+/**
+ * The instant a material stops being publishable.
+ *
+ * The generation side needs this *before* it writes a draft. A draft whose reserved minute lands
+ * past this line is guaranteed waste — and because the queue ceiling counts pending drafts, that
+ * waste reopens the ceiling, so the next tick writes another batch of drafts destined for the
+ * sweeper. On 2026-10-08 that loop produced 100 voided drafts against 9 published posts.
+ */
+export function expiresAt(category: string, occurredAt: number): number {
+  return occurredAt + ttlFor(category) * 60_000;
+}
+
 export interface RetireReport {
   discarded: number;
   staleDrafts: number;

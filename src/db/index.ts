@@ -3,6 +3,7 @@ import { mkdirSync } from 'node:fs';
 import { dirname, resolve } from 'node:path';
 import type { Material } from '../material/types.ts';
 import type { TemplateDef } from '../engine/types.ts';
+import { DEFAULT_TTL_MINUTES, TTL_MINUTES } from '../lifecycle.ts';
 
 const SCHEMA = `
 CREATE TABLE IF NOT EXISTS materials (
@@ -471,15 +472,26 @@ export class Store {
   }
 
   /** Materials that have never been turned into a post yet, best first. */
-  unusedMaterials(limit = 20): Material[] {
+  /**
+   * Materials still worth writing about.
+   *
+   * Each category is filtered by its own shelf life rather than one flat lookback. A six-hour
+   * window happily returned funding and market_move signals that had already expired, and every
+   * one of those took a pool slot away from a material that could still be posted — the drafting
+   * pass then skipped it, so the slot was spent on nothing.
+   */
+  unusedMaterials(limit = 20, now = Date.now()): Material[] {
+    const cats = Object.keys(TTL_MINUTES);
+    const branches = cats.map(() => 'WHEN m.category = ? THEN m.occurred_at >= ?').join(' ');
+    const params = cats.flatMap(c => [c, now - TTL_MINUTES[c]! * 60_000]);
     const rows = this.db
       .prepare(
         `SELECT * FROM materials m
          WHERE m.discarded = 0 AND m.used_count = 0
-           AND m.occurred_at >= ?
+           AND CASE ${branches} ELSE m.occurred_at >= ? END
          ORDER BY m.score DESC, m.occurred_at DESC LIMIT ?`,
       )
-      .all(Date.now() - 6 * 3600_000, limit) as MaterialRow[];
+      .all(...params, now - DEFAULT_TTL_MINUTES * 60_000, limit) as MaterialRow[];
     return rows.map(rowToMaterial);
   }
 

@@ -21,7 +21,7 @@ function tempStore(): { store: Store; close: () => void } {
 
 /** A published post with a full checkpoint curve, which is the only way the engine can be probed. */
 let seq = 0;
-function post(store: Store, opts: { views: (number | null)[]; arms?: Record<string, string>; at: number; chart?: boolean; text?: string; heat?: number; category?: string }): number {
+function post(store: Store, opts: { views: (number | null)[]; arms?: Record<string, string>; at: number; chart?: boolean; text?: string; heat?: number; category?: string; eng?: { likes: number; comments: number; shares: number } }): number {
   // Each fixture material must be unique: `insertMaterial` dedupes by fingerprint, and a
   // collision would silently attach the post to some other row's category and heat band.
   const symbol = `TOK${seq++}`;
@@ -35,12 +35,13 @@ function post(store: Store, opts: { views: (number | null)[]; arms?: Record<stri
     status: 'published', scheduledAt: null, images: opts.chart === false ? [] : ['data/charts/x.png'],
   });
   store.db.prepare('UPDATE posts SET published_at = ?, square_post_id = ? WHERE id = ?').run(opts.at, `c${id}`, id);
+  const e = opts.eng ?? { likes: 0, comments: 0, shares: 0 };
   opts.views.forEach((v, i) => {
     if (v == null) return;
     store.db.prepare('INSERT OR REPLACE INTO post_stat_checks (post_id, checkpoint, at, views, likes, comments, shares, reactions) VALUES (?,?,?,?,?,?,?,?)')
-      .run(id, i, opts.at + i * 3600_000, v, 0, 0, 0, 0);
+      .run(id, i, opts.at + i * 3600_000, v, e.likes, e.comments, e.shares, 0);
     store.db.prepare('INSERT OR REPLACE INTO post_stats (post_id, checked_at, views, likes, comments, shares, reactions) VALUES (?,?,?,?,?,?,?)')
-      .run(id, opts.at + i * 3600_000, v, 0, 0, 0, 0);
+      .run(id, opts.at + i * 3600_000, v, e.likes, e.comments, e.shares, 0);
   });
   if (opts.arms) recordArms(store, id, opts.arms);
   return id;
@@ -298,6 +299,83 @@ test('posts younger than the maturity floor cannot vote in any comparison', () =
     const v = scoreAll(store, { writeMemory: false }).find(x => x.id === 'h_hashtag_count')!;
     assert.equal(v.status, 'observing', 'a set of 20-minute readings is not evidence about anything');
     assert.equal(v.arms.reduce((s, a) => s + a.n, 0), 0);
+  } finally {
+    close();
+  }
+});
+
+test('reflection does not overwrite the rule scoreAll just wrote with a dumber sentence', async () => {
+  // reflect() used to restate every rule/flat verdict into the same key, superseding the entry
+  // that carried the stratification and replication detail. Since the daemon now reflects daily,
+  // that would have degraded the ledger once a day, every day, from the richest sentence to the
+  // shortest one.
+  const { store, close } = tempStore();
+  try {
+    const now = Date.now();
+    const n = HYPOTHESES.find(h => h.id === 'h_hashtag_count')!.minSamples;
+    for (let i = 0; i < n * 2; i++) {
+      const arm = i % 2 ? 'two' : 'one';
+      post(store, {
+        views: arm === 'two' ? [500, 800, 1000] : [50, 80, 100],
+        at: now - 10 * 3600_000 - i * 1000,
+        arms: { h_hashtag_count: arm },
+        heat: i % 4 < 2 ? 92 : 60,
+      });
+    }
+    observeDistribution(store);
+    const r = await reflect(store, null, {});
+    assert.ok(r.stored.includes('h_hashtag_count'), 'the verdict it acted on is still reported');
+    const rules = store.activeMemory('rank-rule');
+    assert.equal(rules.length, 1);
+    assert.match(rules[0]!.text, /层内复现/, 'the entry must keep the evidence that earned it');
+    const hist = store.db.prepare("SELECT COUNT(*) AS n FROM brain_memory WHERE key = 'rank:h_hashtag_count'").get() as { n: number };
+    assert.equal(hist.n, 1, 'reflect must not supersede the row scoreAll just wrote');
+  } finally {
+    close();
+  }
+});
+
+test('the engagement metric reads real counters, not columns that were never selected', () => {
+  // h_opening is judged on engagement per thousand views. If the query behind the scorer forgets
+  // to join the counters, every arm reads a median of zero and the hypothesis is retired as
+  // "差别不大" — a false negative that quietly teaches the writer to stop asking questions.
+  const { store, close } = tempStore();
+  try {
+    const now = Date.now();
+    const n = HYPOTHESES.find(h => h.id === 'h_opening')!.minSamples;
+    for (let i = 0; i < n * 2; i++) {
+      const arm = i % 2 ? 'question' : 'statement';
+      post(store, {
+        views: [500, 800, 1000],
+        at: now - 10 * 3600_000 - i * 1000,
+        arms: { h_opening: arm },
+        heat: i % 4 < 2 ? 92 : 60,
+        eng: arm === 'question' ? { likes: 30, comments: 20, shares: 0 } : { likes: 2, comments: 0, shares: 0 },
+      });
+    }
+    observeDistribution(store);
+    const v = scoreAll(store, { writeMemory: false }).find(x => x.id === 'h_opening')!;
+    assert.equal(v.metric, 'engagementPer1k');
+    const q = v.arms.find(a => a.arm === 'question')!;
+    const s = v.arms.find(a => a.arm === 'statement')!;
+    assert.equal(q.n, n, 'the rows are eligible, so a zero median would mean the counters were missing');
+    assert.ok((q.median ?? 0) > 40, `question arm should carry its 50 responses per 1k views, got ${q.median}`);
+    assert.ok((s.median ?? 0) > 0 && (s.median ?? 0) < 5, `statement arm should read its 2 likes, got ${s.median}`);
+    assert.equal(v.stratified.winner, 'question');
+  } finally {
+    close();
+  }
+});
+
+test('a post the stats sweep has not read yet does not vote as zero engagement', () => {
+  const { store, close } = tempStore();
+  try {
+    const now = Date.now();
+    post(store, { views: [500, 800, 1000], at: now - 10 * 3600_000, arms: { h_opening: 'question' } });
+    store.db.prepare('DELETE FROM post_stats').run();
+    observeDistribution(store);
+    const v = scoreAll(store, { writeMemory: false }).find(x => x.id === 'h_opening')!;
+    assert.equal(v.arms.find(a => a.arm === 'question')!.n, 0, 'no counters means no measurement, not a bad one');
   } finally {
     close();
   }

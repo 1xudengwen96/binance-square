@@ -22,10 +22,13 @@ export interface AuthorBrief {
 
 export function brief(
   store: Store,
-  ctx: { category?: string | null; subType?: string | null; symbol?: string | null; style?: string | null },
+  ctx: { category?: string | null; subType?: string | null; symbol?: string | null; style?: string | null; verdicts?: Verdict[] | null },
 ): AuthorBrief {
   const about = [signalLabel(ctx.category ?? null, ctx.subType ?? null), ctx.symbol, ctx.style].filter(Boolean).join(' ');
-  const verdicts = scoreAll(store, { writeMemory: false });
+  // Callers that already scored this pass hand the verdicts in. Scoring is a 30-day table scan
+  // across every hypothesis, and the writer runs once per post — recomputing it there means a
+  // batch of eight drafts does the same scan nine times to reach the same answer.
+  const verdicts = ctx.verdicts ?? scoreAll(store, { writeMemory: false });
   const { text, rows } = recallBrief(store, { about, limit: 6, max: 5 });
   return { memory: rows, text, verdicts };
 }
@@ -43,18 +46,10 @@ export async function reflect(store: Store, brain: Brain | null, opts: { days?: 
   const stored: string[] = [];
   const notes: string[] = [];
 
-  for (const v of verdicts.filter(x => x.status === 'rule' || x.status === 'flat')) {
-    const detail = v.arms.map(a => `${a.arm} ${a.median == null ? '—' : Math.round(a.median)}（${a.n} 条）`).join('，');
-    remember(store, {
-      kind: 'rank-rule',
-      key: `rank:${v.id}`,
-      text: v.status === 'rule' ? `${v.claim} —— 成立：${detail}。` : `${v.claim} —— 测过了，差别不大：${detail}。`,
-      confidence: v.confidence,
-      evidenceN: v.arms.reduce((s, a) => s + a.n, 0),
-      source: 'rank-score',
-    });
-    stored.push(v.id);
-  }
+  // scoreAll already wrote these into the ledger, with the stratification and replication detail
+  // in the sentence. Restating them here used to supersede that entry with a shorter one, so
+  // every reflection quietly downgraded the rule it was supposed to be reflecting on.
+  for (const v of verdicts.filter(x => x.status === 'rule' || x.status === 'flat')) stored.push(v.id);
 
   const stuck = verdicts.filter(v => v.status === 'observing' && v.mode === 'experiment');
   if (!brain) {

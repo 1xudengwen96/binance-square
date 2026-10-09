@@ -25,7 +25,12 @@ const DISCLAIMER_RE = /不构成[^。\n]{0,10}建议|仅为信息整理|不构�
  */
 const DIRECTIVE: { pattern: RegExp; why: string }[] = [
   { pattern: /建议(大家|各位)?(立即|马上)?(买入|卖出|加仓|减仓|做多|做空|建仓|清仓|上车|抄底)/, why: '给出了买卖指令' },
-  { pattern: /目标价|目标位|第一目标|看到\d+|上看\d+/, why: '给出了价格目标' },
+  // A price level, not merely a digit after a looking-verb. The bare `看到\d+` also caught
+  // 「看到2个信号」and「上看3条」— ordinary copy about counts. A gate that cries wolf on clean
+  // text gets its verdicts ignored, which is worse than the phrasing it was added to stop.
+  // `(?![\d,.])` matters: without it the engine gives digits back one at a time, so 「看到10%」
+  // matches on 「看到1」 and the counter-word check never sees the percent sign.
+  { pattern: /目标价|目标位|第一目标|(?:看到|上看|下看|看向)\s*\d[\d,.]*(?![\d,.])(?!\s*(?:条|篇|个|次|位|名|天|小时|分钟|秒|倍|%|％|点|档|轮))/, why: '给出了价格目标' },
   { pattern: /(必涨|必跌|稳赚|包赚|无风险|保底收益|躺赚)/, why: '承诺了收益或无风险' },
   { pattern: /(带单|跟单|一起操作|跟我做|私我|加我微信|扫码)/, why: '拉人跟单或引流' },
 ];

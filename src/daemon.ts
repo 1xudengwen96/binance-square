@@ -6,6 +6,8 @@ import { backfillStats, tuneTemplateWeights } from './stats/backfill.ts';
 import { observeDistribution } from './rank/observations.ts';
 import { scoreAll } from './rank/score.ts';
 import { expireMemories } from './brain/memory.ts';
+import { reflect } from './brain/author.ts';
+import { brainFor } from './brain/brain.ts';
 import { attributeConversions } from './money/conversion.ts';
 import { sampleSquareBoards } from './stats/benchmarks.ts';
 import { retire } from './lifecycle.ts';
@@ -45,6 +47,8 @@ export interface TickResult {
   conversionAttributed: number;
   testing: number;
   expired: number;
+  /** Verdicts the daily reflection acted on — rules and flat results carried into the ledger. */
+  reflected: number;
   accountsRun: number;
   notes: string[];
 }
@@ -53,7 +57,7 @@ export async function tick(store: Store, opts: { live?: boolean; statsEveryTicks
   const settings = settingsFrom(store);
   const res: TickResult = {
     at: Date.now(), collected: 0, poolCreated: 0, eventCreated: 0, published: 0, uncertain: 0, deferred: 0,
-    failed: 0, statsUpdated: 0, benchmarked: 0, studioDrafted: 0, studioPublished: 0, tuned: 0, observed: 0, rules: 0, testing: 0, conversionAttributed: 0, expired: 0, accountsRun: 0, notes: [],
+    failed: 0, statsUpdated: 0, benchmarked: 0, studioDrafted: 0, studioPublished: 0, tuned: 0, observed: 0, rules: 0, testing: 0, conversionAttributed: 0, expired: 0, reflected: 0, accountsRun: 0, notes: [],
   };
 
   const pause = pauseState(store);
@@ -202,6 +206,25 @@ export async function tick(store: Store, opts: { live?: boolean; statsEveryTicks
     }
   }
 
+  // Reflection is the step that turns measurement into "what to try next", and it is the only
+  // part of the loop that can spend money on a model call — so it runs on a daily gate rather
+  // than every tick. The evidence it reads (24h and 72h checkpoints) does not move minute to
+  // minute. With no brain configured it still runs: that path is deterministic and free, and it
+  // is what keeps the ledger honest when the operator has not wired a model up.
+  try {
+    const REFLECT_EVERY_MS = 20 * 3600_000;
+    const lastReflect = store.getSetting<number>('lastReflectAt', 0);
+    if (Date.now() - lastReflect >= REFLECT_EVERY_MS) {
+      const r = await reflect(store, brainFor(store, settings), {});
+      store.setSetting('lastReflectAt', Date.now());
+      res.reflected = r.stored.length;
+      for (const n of r.notes) res.notes.push(n);
+      store.log('rank_reflect', { stored: r.stored, notes: r.notes, by: 'daemon' });
+    }
+  } catch (err) {
+    res.notes.push(`反思失败：${String(err).slice(0, 100)}`);
+  }
+
   // Once a day, on the first tick that finds it due. Everything the robot has learned lives in
   // one SQLite file, and the last time this mattered the audit had already shipped four posts.
   try {
@@ -227,6 +250,7 @@ export function line(r: TickResult): string {
     `${r.statsUpdated ? ` 回抓${r.statsUpdated}` : ''}${r.tuned ? ` 调权${r.tuned}` : ''}` +
     `${r.studioDrafted || r.studioPublished ? ` 文章${r.studioPublished}稿${r.studioDrafted}` : ''}` +
     `${r.observed ? ` 分发${r.observed}条${r.rules ? ` 规则${r.rules}` : ''}` : ''}` +
+    `${r.reflected ? ` 反思${r.reflected}` : ''}` +
     `${r.notes.length ? `  (${r.notes.join('; ')})` : ''}`
   );
 }

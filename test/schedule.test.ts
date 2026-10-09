@@ -7,6 +7,8 @@ import { Store } from '../src/db/index.ts';
 import { DEFAULT_SETTINGS } from '../src/config.ts';
 import { beijingDayStart, nextSlot } from '../src/schedule.ts';
 import { generate } from '../src/pipeline.ts';
+import { makeMaterial } from '../src/material/types.ts';
+import { ttlFor } from '../src/lifecycle.ts';
 
 const GAP = DEFAULT_SETTINGS.minIntervalMinutes * 60_000;
 
@@ -74,6 +76,42 @@ test('generation stops once the queue already covers the day', async () => {
     const r = await generate(store, s, 3);
     assert.equal(r.created.length, 0, 'a full queue must not add more drafts');
     assert.match(r.skipped.join(' '), /待发布/);
+  } finally {
+    close();
+  }
+});
+
+test('a draft is not written when its slot lands after the material expires', async () => {
+  // The waste this stops: on 2026-10-08 the robot wrote 100 drafts and published 9. The queue
+  // ceiling counts pending drafts, so every batch the sweeper voided reopened the ceiling and the
+  // next tick wrote another. Bounding the reservation by shelf life turns that loop into
+  // backpressure — and a fresh signal in the same run must still go through, or the guard is
+  // just a stop button.
+  const { store, close } = tempStore();
+  try {
+    const s = { ...DEFAULT_SETTINGS, autoPublish: true, dailyCap: 30, postsPerDay: 20, activeStartHour: 0, activeEndHour: 24 };
+    const funding = (symbol: string, occurredAt: number) => store.insertMaterial(makeMaterial({
+      category: 'funding', subType: 'funding_extreme', title: `${symbol} 资金费率极端`, symbol,
+      source: 'test', at: occurredAt, sentiment: 'bear', score: 80,
+      facts: {
+        cashtag: `$${symbol}`, funding: -0.0125, annualized: -70.2, payer: '空头', intervalHours: 8, price: 1.234,
+        longRatio: 0.83, shortRatio: 1.2, chg24h: -3.42, chg1h: -0.41, volMultiple: 2.1, oiChangePct: -8.8,
+      },
+    }));
+    // One approved post at `now` pushes the next reserved minute out by the nominal gap.
+    approve(store, Date.now(), 0);
+    const ttl = ttlFor('funding') * 60_000;
+    assert.ok(GAP > 0 && ttl > GAP, 'the test needs a shelf life longer than one gap but a slot past it');
+    funding('STALE', Date.now() - ttl + 10 * 60_000); // dies ten minutes from now, slot is a gap away
+
+    const r = await generate(store, s, 3);
+    assert.equal(r.created.length, 0, `expected no drafts, got: ${r.skipped.join(' | ')}`);
+    assert.match(r.skipped.join(' '), /保质期/);
+
+    funding('FRESH', Date.now());
+    const r2 = await generate(store, s, 3);
+    assert.equal(r2.created.length, 1, `the fresh signal must still be written: ${r2.skipped.join(' | ')}`);
+    assert.match(r2.created[0]!.material, /FRESH/);
   } finally {
     close();
   }
