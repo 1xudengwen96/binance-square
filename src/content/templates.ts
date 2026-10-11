@@ -730,8 +730,7 @@ export const templates: TemplateDef[] = [
     style: 'any',
     requires: [{ path: 'cashtag' }, { path: 'chg' }, { path: 'price' }, { path: 'tf' }],
     body: `{{@hook.label}}👀
-{{cashtag}} {{tf}} {{chg|spct}}，现价 {{price|price}}{{#if volMultiple}}，量能 {{volMultiple|fixed:1}} 倍{{/if}}。{{@cta.short}}
-{{#maybe 35}}{{@cta.follow}}{{/maybe}}`,
+{{cashtag}} {{tf}} {{chg|spct}}，现价 {{price|price}}{{#if volMultiple}}，量能 {{volMultiple|fixed:1}} 倍{{/if}}。{{@cta.short}}`,
   },
   {
     id: 'short.ratio',
@@ -744,8 +743,7 @@ export const templates: TemplateDef[] = [
     // attached is what every other tool can print; the movement is the part only we have.
     requires: [{ path: 'cashtag' }, { path: 'ratio' }, { path: 'prevRatio' }, { path: 'ratioDiff' }],
     body: `持仓速报👀
-{{cashtag}} {{scope}}多空比 {{ratio|fixed:2}}，上期 {{prevRatio|fixed:2}}（{{#if ratioDiff >= 0}}+{{/if}}{{ratioDiff|fixed:2}}），{{#if ratio > 2}}多头很集中{{#elif ratio > 1.3}}多头明显占优{{#elif ratio > 0.9}}两边差不多{{#else}}空头占优{{/if}}。{{@cta.short}}
-{{#maybe 35}}{{@cta.follow}}{{/maybe}}`,
+{{cashtag}} {{scope}}多空比 {{ratio|fixed:2}}，上期 {{prevRatio|fixed:2}}（{{#if ratioDiff >= 0}}+{{/if}}{{ratioDiff|fixed:2}}），{{#if ratio > 2}}多头很集中{{#elif ratio > 1.3}}多头明显占优{{#elif ratio > 0.9}}两边差不多{{#else}}空头占优{{/if}}。{{@cta.short}}`,
   },
   {
     id: 'short.funding',
@@ -758,8 +756,7 @@ export const templates: TemplateDef[] = [
     // unread ones. A 速报 can still be short — it just cannot be one fact plus an opinion.
     requires: [{ path: 'cashtag' }, { path: 'funding' }, { path: 'payer' }, { path: 'intervalHours' }, { path: 'price' }],
     body: `费率速报👀
-{{cashtag}} 当期 {{funding|rate}}，每 {{intervalHours|fixed:0}} 小时结算，{{#if payer == '多头'}}多头{{#else}}空头{{/if}}在付费；现价 {{price|money}}。{{@cta.short}}
-{{#maybe 35}}{{@cta.follow}}{{/maybe}}`,
+{{cashtag}} 当期 {{funding|rate}}，每 {{intervalHours|fixed:0}} 小时结算，{{#if payer == '多头'}}多头{{#else}}空头{{/if}}在付费；现价 {{price|money}}。{{@cta.short}}`,
   },
   {
     id: 'short.board',
@@ -767,8 +764,7 @@ export const templates: TemplateDef[] = [
     category: 'leaderboard',
     style: 'data',
     requires: [{ path: 'scope' }, { path: 'board' }, { path: 'topChg' }],
-    body: `{{scope}}榜首：{{#each board as row max=1}}{{row.symbol|cash}} {{row.chg|spct}}{{/each}}。{{@take.leaderboard}}。{{@cta.short}}
-{{#maybe 35}}{{@cta.follow}}{{/maybe}}`,
+    body: `{{scope}}榜首：{{#each board as row max=1}}{{row.symbol|cash}} {{row.chg|spct}}{{/each}}。{{@take.leaderboard}}。{{@cta.short}}`,
   },
   {
     id: 'short.flash',
@@ -778,7 +774,7 @@ export const templates: TemplateDef[] = [
     requires: [{ path: 'title' }],
     body: `{{@hook.label}}：
 {{title}}
-{{#if cashtag}}{{cashtag}} {{@word.watch}}。{{/if}}{{#maybe 40}}{{@cta.follow}}{{/maybe}}`,
+{{#if cashtag}}{{cashtag}} {{@word.watch}}。{{/if}}`,
   },
   {
     id: 'short.sentiment',
@@ -788,8 +784,7 @@ export const templates: TemplateDef[] = [
     style: 'any',
     requires: [{ path: 'value' }, { path: 'label' }],
     body: `{{#if value >= 70}}🤑 {{#elif value <= 30}}😨 {{#else}}😐 {{/if}}恐惧贪婪指数 {{value}}（{{label}}），昨日 {{prev}}。
-{{@take.sentiment}}。{{@cta.short}}
-{{#maybe 35}}{{@cta.follow}}{{/maybe}}`,
+{{@take.sentiment}}。{{@cta.short}}`,
   },
 
   /* ------------------------------------------------------ 持仓量异动（OI）---

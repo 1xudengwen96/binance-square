@@ -5,6 +5,10 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { Store } from '../src/db/index.ts';
 import { DEFAULT_SETTINGS } from '../src/config.ts';
+
+// publishDue defers anything outside the account's active window (08:00-24:00 Beijing),
+// which made these tests depend on the wall clock rather than on the code under review.
+const ALWAYS_OPEN = { ...DEFAULT_SETTINGS, activeStartHour: 0, activeEndHour: 24 };
 import { publishDue } from '../src/pipeline.ts';
 import { beijingDayStart } from '../src/schedule.ts';
 
@@ -23,7 +27,7 @@ test('a drill reports what it would send but commits nothing', async () => {
   const store = Store.open(join(dir, 't.db'));
   try {
     const id = approvedPost(store);
-    const r = await publishDue(store, { ...DEFAULT_SETTINGS }, { live: false });
+    const r = await publishDue(store, { ...ALWAYS_OPEN }, { live: false });
 
     assert.equal(r.published.length, 1, 'the drill should still walk the queue');
     const post = store.postById(id)!;
@@ -53,7 +57,7 @@ test('a batch sharing one scheduled minute publishes once, not five times', asyn
         )
         .run(`$TOK 多空比 ${2 + i}.10，多头占 6${i}.9%。测试正文，不构成投资建议。`, slot, slot);
     }
-    const r = await publishDue(store, { ...DEFAULT_SETTINGS }, { live: false });
+    const r = await publishDue(store, { ...ALWAYS_OPEN }, { live: false });
     assert.equal(r.attempted, 1, `one tick must release at most one post, attempted ${r.attempted}`);
     assert.ok(r.failed.some(f => /未到发布时刻/.test(f.label)), 'the rest must be explicitly deferred, not silently dropped');
   } finally {
@@ -70,7 +74,7 @@ test('a single due post is not blocked by its own queue entry', async () => {
   const store = Store.open(join(dir, 't.db'));
   try {
     approvedPost(store);
-    const r = await publishDue(store, { ...DEFAULT_SETTINGS }, { live: false });
+    const r = await publishDue(store, { ...ALWAYS_OPEN }, { live: false });
     assert.equal(r.attempted, 1, 'one due post with no history must be attempted');
   } finally {
     store.close();
@@ -83,7 +87,7 @@ test('the dedup source stays clean after a drill', async () => {
   const store = Store.open(join(dir, 't.db'));
   try {
     const id = approvedPost(store);
-    await publishDue(store, { ...DEFAULT_SETTINGS }, { live: false });
+    await publishDue(store, { ...ALWAYS_OPEN }, { live: false });
     // recentPostTexts(['published','uncertain']) is what blocks near-duplicates at the
     // real publish gate — a drilled text appearing there would suppress the real one.
     assert.deepEqual(store.recentPostTexts(30, ['published', 'uncertain']), []);

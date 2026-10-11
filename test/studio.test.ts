@@ -14,7 +14,11 @@ import { ARTICLE_LIBRARY, specFor } from '../src/studio/library.ts';
 import { wordBank } from '../src/content/wordbank.ts';
 import { toContext } from '../src/material/types.ts';
 import type { Material } from '../src/material/types.ts';
-import { nextArticleSlot } from '../src/studio/runner.ts';
+import { nextArticleSlot, polishArticleDraft } from '../src/studio/runner.ts';
+import { createServer } from 'node:http';
+import { setSecret } from '../src/secrets.ts';
+import { DEFAULT_SETTINGS } from '../src/config.ts';
+import { remember } from '../src/brain/memory.ts';
 
 const TRACK = 'trading_literacy';
 const ALL_CONCEPT_IDS = CONCEPTS.filter(c => c.trackId === TRACK).map(c => c.id);
@@ -418,6 +422,62 @@ test('two articles drafted in one tick are a track-gap apart, not in the same mi
     assert.equal(second - first, track.cadence.minGapHours * 3_600_000);
     assert.equal(nextArticleSlot(store, makeAccount(store), track, now), now, 'the gap belongs to the account, not to the track');
   } finally {
+    close();
+  }
+});
+
+/* ------------------------------------------------------------- 润色接线 --- */
+
+test('the long-form polish actually receives the persona and the ledger', async () => {
+  // A missing argument throws nothing and fails nothing: the article was simply polished against
+  // a bare system prompt while every short post got the persona and the learned notes. The only
+  // way to catch that class of bug is to read what leaves the process, so this serves a local
+  // stub and asserts on the system prompt it was actually sent.
+  const { store, close } = tempStore();
+  const seen: string[] = [];
+  const server = createServer((req, res) => {
+    let raw = '';
+    req.on('data', c => { raw += c; });
+    req.on('end', () => {
+      try {
+        const body = JSON.parse(raw) as { messages: { role: string; content: string }[] };
+        seen.push(body.messages.filter(m => m.role === 'system').map(m => m.content).join('\n'));
+        const user = body.messages.find(m => m.role === 'user')?.content ?? '';
+        res.writeHead(200, { 'content-type': 'application/json' });
+        // Echoing the input back is the one reply guaranteed to pass the drift check, so the
+        // assertion below is about what was sent, not about whether the model behaved.
+        res.end(JSON.stringify({ choices: [{ message: { content: user } }] }));
+      } catch {
+        res.writeHead(500, { 'content-type': 'application/json' });
+        res.end('{}');
+      }
+    });
+  });
+  await new Promise<void>(r => server.listen(0, '127.0.0.1', r));
+  const port = (server.address() as { port: number }).port;
+  try {
+    const acct = makeAccount(store, '长文号');
+    store.db.prepare('INSERT INTO studio_accounts (account_id, track_id, bound_at) VALUES (?,?,?)').run(acct, TRACK, Date.now());
+    store.db.prepare('UPDATE accounts SET persona_note = ? WHERE id = ?').run('像带新人那样，先把机制讲清楚再谈数据', acct);
+    const concept = CONCEPTS.find(c => c.trackId === TRACK)!;
+    const bodyText = '$BTC 的资金费率是负的，说明空头正在向多头付费。这不构成投资建议。';
+    const id = store.addArticle({
+      trackId: TRACK, conceptId: concept.id, accountId: acct, symbol: 'BTC',
+      title: '负费率在替谁说话', body: bodyText, facts: [{ field: 'cashtag', kind: 'symbol', surface: '$BTC', value: null }],
+    });
+    remember(store, { kind: 'rank-rule', key: 'rank:h_chart', text: '带自绘图的帖子分发更好', source: 'rank-score', confidence: 0.8, evidenceN: 12 });
+
+    const s = { ...DEFAULT_SETTINGS, llmEnabled: true, llmProvider: 'openai' as const, llmBaseUrl: `http://127.0.0.1:${port}/v1`, llmModel: 'stub' };
+    setSecret(store, 'openaiApiKey', 'stub-key');
+    const r = await polishArticleDraft(store, s, id);
+    assert.ok(r.ok, `润色应当跑通：${r.reason}`);
+    assert.equal(seen.length, 1);
+    assert.match(seen[0]!, /本账号语气/, 'the persona must reach the article polisher');
+    assert.match(seen[0]!, /像带新人那样/);
+    assert.match(seen[0]!, /带自绘图的帖子分发更好/, 'and so must the ledger it learned from data');
+    assert.match(seen[0]!, /不得放宽/, 'both stay subordinate to the hard rules, never above them');
+  } finally {
+    server.close();
     close();
   }
 });

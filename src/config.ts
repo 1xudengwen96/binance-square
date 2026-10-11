@@ -35,6 +35,16 @@ export interface Settings {
    * and read as one person shouting about one number.
    */
   coinSignalCooldownMinutes: number;
+  /**
+   * How many posts about one coin a single account may put out per day, across every category.
+   *
+   * `coinSignalCooldownMinutes` only compares like with like, so funding → onchain → leaderboard
+   * about the same symbol slipped straight through it: the live log shows one account queueing
+   * eight STRK posts in an evening under three different headings. Binance's creator guidance
+   * names exactly this — 「一味蹭热门币会影响账号健康度」— so the cap has to be on the coin, not
+   * on the coin-and-category. Three still lets a story develop over a day; it stops the pile-up.
+   */
+  symbolDailyCap: number;
   /** Rows older than this are deleted outright; expiry is separate and much shorter. */
   dataRetentionDays: number;
   /** Chart PNGs are regenerable, so unreferenced ones go after this long. */
@@ -134,6 +144,7 @@ export const DEFAULT_SETTINGS: Settings = {
   crossAccountGapMinutes: 14,
   crossAccountCoinExclusionMinutes: 360,
   coinSignalCooldownMinutes: 720,
+  symbolDailyCap: 3,
   dataRetentionDays: 14,
   chartRetentionHours: 72,
   autoRun: true,

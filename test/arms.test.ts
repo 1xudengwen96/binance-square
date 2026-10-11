@@ -5,6 +5,11 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { Store } from '../src/db/index.ts';
 import { DEFAULT_SETTINGS } from '../src/config.ts';
+
+// The account window is 08:00-24:00 Beijing, and generation refuses to reserve a slot that
+// rolls past today. Run these after midnight and every draft is skipped as out-of-window, so
+// the assertions below were failing on the clock rather than on the arms they mean to test.
+const ALWAYS_OPEN = { ...DEFAULT_SETTINGS, activeStartHour: 0, activeEndHour: 24 };
 import { generate } from '../src/pipeline.ts';
 import { HYPOTHESES } from '../src/rank/hypotheses.ts';
 import { exploreRepeat, REPEAT_EXPLORE_SHARE } from '../src/rank/experiments.ts';
@@ -30,7 +35,7 @@ test('a generated draft carries the arms it was written under', async () => {
   const dir = mkdtempSync(join(tmpdir(), 'sf-arms-'));
   const store = Store.open(join(dir, 't.db'));
   try {
-    const s = { ...DEFAULT_SETTINGS, autoPublish: true, dailyCap: 30, postsPerDay: 20 };
+    const s = { ...ALWAYS_OPEN, autoPublish: true, dailyCap: 30, postsPerDay: 20 };
     for (const [i, sym] of SYMBOLS.entries()) fundingMaterial(store, sym, Date.now() - i * 1000);
     const r = await generate(store, s, 4);
     assert.ok(r.created.length > 0, `expected drafts, skipped: ${r.skipped.join(' | ')}`);
@@ -66,7 +71,7 @@ test('every recorded arm is one of the arms the hypothesis declares', async () =
   const store = Store.open(join(dir, 't.db'));
   try {
     for (const [i, sym] of SYMBOLS.entries()) fundingMaterial(store, sym, Date.now() - i * 1000);
-    const r = await generate(store, { ...DEFAULT_SETTINGS, autoPublish: true }, 4);
+    const r = await generate(store, { ...ALWAYS_OPEN, autoPublish: true }, 4);
     assert.ok(r.created.length > 0);
     const rows = store.db.prepare('SELECT experiment, arm FROM post_arms').all() as { experiment: string; arm: string }[];
     assert.ok(rows.length > 0);

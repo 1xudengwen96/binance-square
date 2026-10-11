@@ -366,6 +366,62 @@ CREATE TABLE IF NOT EXISTS post_conversion (
   clicks      REAL NOT NULL DEFAULT 0,
   attributed_at INTEGER NOT NULL
 );
+
+/*
+ * The hypothesis registry, as data.
+ *
+ * Keeping it in source meant the system could test hypotheses but could never originate or
+ * retire one — the single largest gap in an otherwise closed learning loop, and the reason the
+ * AI brain's daily "what should we try next" had nowhere to write its answer. Rows here are
+ * validated on the way in against DIMENSIONS (see src/rank/registry.ts): the arms must be a
+ * known dimension's arms, and an experiment may only be registered on a dimension the writer
+ * can actually be told to change. Without that gate a proposal would record arms, consume
+ * exploration traffic, and measure nothing at all.
+ */
+CREATE TABLE IF NOT EXISTS hypotheses (
+  id            TEXT PRIMARY KEY,
+  claim         TEXT NOT NULL,
+  mode          TEXT NOT NULL,             -- experiment | observed
+  dimension     TEXT NOT NULL,
+  metric        TEXT NOT NULL,
+  min_samples   INTEGER NOT NULL,
+  how           TEXT NOT NULL,
+  risk          TEXT NOT NULL,
+  origin        TEXT NOT NULL,             -- brain | operator
+  status        TEXT NOT NULL DEFAULT 'active',   -- active | retired
+  proposed_from TEXT,                      -- the brain_memory key it came from, for audit
+  created_at    INTEGER NOT NULL,
+  retired_at    INTEGER,
+  retire_reason TEXT
+);
+CREATE INDEX IF NOT EXISTS hypotheses_status ON hypotheses(status);
+
+/*
+ * A parameter the system proposed changing about itself.
+ *
+ * The dangerous half of self-optimisation, so it is shaped like a scientific protocol rather
+ * than a setting write: one change in flight at a time (two concurrent changes cannot be
+ * attributed to either), a bounded step, a pre-declared metric and evaluation window, and an
+ * automatic rollback. Rejected and rolled-back rows are kept, because "we tried X and it did
+ * not help" is the only record that stops the same idea being proposed again next month.
+ */
+CREATE TABLE IF NOT EXISTS param_changes (
+  id            INTEGER PRIMARY KEY AUTOINCREMENT,
+  key           TEXT NOT NULL,             -- whitelisted settings key
+  from_value    REAL NOT NULL,
+  to_value      REAL NOT NULL,
+  reason        TEXT NOT NULL,
+  metric        TEXT NOT NULL,             -- which measurement decides it
+  status        TEXT NOT NULL DEFAULT 'pending',  -- pending|applied|improved|no_effect|rolled_back|rejected
+  reject_reason TEXT,
+  created_at    INTEGER NOT NULL,
+  applied_at    INTEGER,
+  evaluate_at   INTEGER,
+  resolved_at   INTEGER,
+  before_median REAL,
+  after_median  REAL
+);
+CREATE INDEX IF NOT EXISTS param_changes_status ON param_changes(status);
 `;
 
 export class Store {
@@ -1435,6 +1491,26 @@ export class Store {
    * reading as one person shouting about one number. The cooldown is per (coin, category)
    * because a coin's funding rate and its listing news are genuinely different subjects.
    */
+  /**
+   * Posts about this coin from this account since the given instant, **any category**.
+   *
+   * `recentCoinSignal` scopes to one category, which is why a coin could be posted about eight
+   * times a day as long as each post filed itself under a different heading. This is the query
+   * that can actually see a pile-up.
+   */
+  coinPostsSince(accountId: number | null, symbol: string, sinceMs: number): number {
+    const scope = accountId === null ? 'p.account_id IS NULL' : 'p.account_id = @a';
+    return (
+      this.db
+        .prepare(
+          `SELECT COUNT(*) AS n FROM posts p JOIN materials m ON m.id = p.material_id
+           WHERE ${scope} AND m.symbol = @s
+             AND p.status IN ('draft','approved','published') AND COALESCE(p.published_at, p.created_at) >= @t`,
+        )
+        .get({ a: accountId, s: symbol, t: sinceMs }) as { n: number }
+    ).n;
+  }
+
   recentCoinSignal(accountId: number | null, symbol: string, category: string, sinceMs: number): number {
     const scope = accountId === null ? 'p.account_id IS NULL' : 'p.account_id = @a';
     return (

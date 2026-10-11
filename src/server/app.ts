@@ -19,6 +19,9 @@ import { scoreAll } from '../rank/score.ts';
 import { distributionRows } from '../rank/observations.ts';
 import { armsOf } from '../rank/experiments.ts';
 import { playbook } from '../rank/playbook.ts';
+import { DIMENSION_NAMES, DIMENSIONS } from '../rank/hypotheses.ts';
+import { propose, proposals, registry, resolveProposal, retire } from '../rank/registry.ts';
+import { changeLedger, currentKnob, KNOBS, proposeChange } from '../rank/params.ts';
 import { brainFor } from '../brain/brain.ts';
 import { reflect } from '../brain/author.ts';
 import { TRACKS, UNIMPLEMENTED_TRACKS, trackById } from '../studio/tracks.ts';
@@ -330,6 +333,14 @@ app.get('/api/rank', (req, reply) => {
     arms,
     playbook: { hashtagTotal: pb.hashtagTotal, attachChart: pb.attachChart, opening: pb.opening, acting: pb.acting },
     memory: store.memoryLedger(),
+    // The two places the system is allowed to change itself. Both are shown whether or not they
+    // did anything: an empty registry and an empty change ledger are the answer the operator
+    // needs to see most often, and hiding them makes a stalled loop look like a working one.
+    registry: registry(store).map(h => ({ id: h.id, claim: h.claim, mode: h.mode, dimension: h.dimension, metric: h.metric, minSamples: h.minSamples })),
+    proposals: proposals(store),
+    dimensions: DIMENSION_NAMES.map(d => ({ id: d, ...DIMENSIONS[d] })),
+    knobs: KNOBS.map(k => ({ ...k, current: currentKnob(store, k.key) })),
+    paramChanges: changeLedger(store, 20),
     target,
     conversion: {
       days: store.conversions(14),
@@ -347,6 +358,53 @@ app.post('/api/rank/reflect', async (_req, reply) => {
   const r = await reflect(store, brain, {});
   store.log('rank_reflect', { stored: r.stored, notes: r.notes });
   return reply.send({ ...r, brain: brain ? { provider: brain.provider, model: brain.model } : null });
+});
+
+/**
+ * Register a comparison the system should start measuring.
+ *
+ * An operator may register an experiment directly; the validation that decides whether a proposal
+ * can be measured at all lives in `propose()`, not here, so the panel cannot bypass it either.
+ */
+app.post('/api/hypotheses/propose', (req, reply) => {
+  const b = (req.body ?? {}) as { claim?: string; mode?: string; dimension?: string; metric?: string; minSamples?: number; how?: string; risk?: string };
+  const r = propose(store, {
+    claim: b.claim ?? '', mode: b.mode ?? 'observed', dimension: b.dimension ?? '', metric: b.metric ?? 'views24h',
+    minSamples: Number(b.minSamples) > 0 ? Number(b.minSamples) : undefined,
+    how: b.how, risk: b.risk, origin: 'operator',
+  });
+  if (!r.ok) return reply.code(400).send({ error: r.reason });
+  store.log('hypothesis_propose', { ...b, id: r.id, status: r.status, by: 'operator' });
+  return reply.send(r);
+});
+
+/** Approve or refuse a brain-proposed experiment, which is the one class of idea that takes real traffic. */
+app.post('/api/hypotheses/resolve', (req, reply) => {
+  const b = (req.body ?? {}) as { id?: string; approve?: boolean; reason?: string };
+  if (!b.id) return reply.code(400).send({ error: '缺少 id' });
+  const changed = resolveProposal(store, b.id, Boolean(b.approve), b.reason ?? '');
+  if (!changed) return reply.code(409).send({ error: '这条提议不存在或已经被处理过了' });
+  store.log('hypothesis_resolve', { id: b.id, approve: Boolean(b.approve), reason: b.reason ?? '' });
+  return reply.send({ ok: true });
+});
+
+app.post('/api/hypotheses/retire', (req, reply) => {
+  const b = (req.body ?? {}) as { id?: string; reason?: string };
+  if (!b.id) return reply.code(400).send({ error: '缺少 id' });
+  if (!retire(store, b.id, `操作者手动退休：${b.reason ?? ''}`)) return reply.code(409).send({ error: '这条假设不在活跃列表里' });
+  store.log('hypothesis_retire', { id: b.id, reason: b.reason ?? '' });
+  return reply.send({ ok: true });
+});
+
+/** Queue a bounded change to one of the whitelisted knobs. The bounds are enforced in params.ts. */
+app.post('/api/params/propose', (req, reply) => {
+  const b = (req.body ?? {}) as { key?: string; to?: number; reason?: string };
+  const to = Number(b.to);
+  if (!b.key || !Number.isFinite(to)) return reply.code(400).send({ error: '缺少 key 或目标值不是数字' });
+  const r = proposeChange(store, { key: b.key, to, reason: b.reason ?? '', origin: 'operator' });
+  if (!r.ok) return reply.code(400).send({ error: r.reason });
+  store.log('param_propose', { ...b, id: r.id, by: 'operator' });
+  return reply.send({ ...r, note: '下一轮调度开始时应用，并在一个评估窗口后自动判断是否保留' });
 });
 
 app.post('/api/memory/forget', (req, reply) => {

@@ -1,7 +1,10 @@
 import type { Store, MemoryRow } from '../db/index.ts';
 import { recallBrief, remember } from './memory.ts';
 import { BRAIN_RULES, type Brain } from './brain.ts';
-import { scoreAll, type Verdict } from '../rank/score.ts';
+import { revokeStaleRules, scoreAll, type Verdict } from '../rank/score.ts';
+import { DIMENSION_NAMES, DIMENSIONS } from '../rank/hypotheses.ts';
+import { propose, registry } from '../rank/registry.ts';
+import { KNOBS, proposeChange } from '../rank/params.ts';
 import { signalLabel } from '../stats/insight.ts';
 
 /**
@@ -50,6 +53,8 @@ export async function reflect(store: Store, brain: Brain | null, opts: { days?: 
   // in the sentence. Restating them here used to supersede that entry with a shorter one, so
   // every reflection quietly downgraded the rule it was supposed to be reflecting on.
   for (const v of verdicts.filter(x => x.status === 'rule' || x.status === 'flat')) stored.push(v.id);
+  const revoked = revokeStaleRules(store, verdicts);
+  if (revoked.length) notes.push(`撤销 ${revoked.length} 条已不被测量支持的规则：${revoked.join('、')}。`);
 
   const stuck = verdicts.filter(v => v.status === 'observing' && v.mode === 'experiment');
   if (!brain) {
@@ -58,14 +63,39 @@ export async function reflect(store: Store, brain: Brain | null, opts: { days?: 
     return { stored, notes };
   }
 
+  const registered = registry(store);
   const evidence = verdicts
     .map(v => `${v.id} [${v.status}] ${v.claim}｜${v.arms.map(a => `${a.arm}=${a.median == null ? '—' : Math.round(a.median)}/${a.n}`).join(' ')}`)
     .join('\n');
+  const vocabulary = DIMENSION_NAMES
+    .map(d => `${d}（${DIMENSIONS[d].label}，臂 ${DIMENSIONS[d].arms.join('/')}，${DIMENSIONS[d].kind === 'knob' ? '可随机分配' : '只能观察'}）`)
+    .join('；');
+  const knobs = KNOBS.map(k => `${k.key}（${k.label}，现在 ${k.judge} 判定）`).join('；');
+  // The measured failure this format is designed against: with a free-form prompt the model spent
+  // its daily suggestion restating h_chart, h_hashtag_count and h_opening. Asking for a line in a
+  // closed vocabulary makes a restatement impossible to submit — `propose()` rejects it — and
+  // makes a real idea actionable, which is the only difference between advising and optimising.
   const r = await brain.ask({
     purpose: 'reflect',
-    system: `${BRAIN_RULES}\n\n你的任务：读完后给出 1–3 条「下一步该试什么」，每条一句话，必须可被现有指标验证。不要复述数据，不要给投资判断。`,
-    context: `最近 30 天各假设的测量结果（median/样本数）：\n${evidence}\n\n还没结论的实验：${stuck.map(v => `${v.id}(还需 ${v.missing} 条)`).join('、') || '无'}`,
-    maxTokens: 500,
+    system: `${BRAIN_RULES}
+
+你的任务：读完后给出最多 3 行，每行只能是下面三种之一。
+
+1) 一条新的、还没有被登记过的比较：
+   TEST|维度代号|指标代号|experiment或observed|一句话主张
+   可用维度：${vocabulary}
+   可用指标：views24h / growth1h / engagementPer1k / rebatePer1k
+   只有「可随机分配」的维度才允许写 experiment。
+
+2) 一次有界的参数调整建议（最多一行，且必须有理由）：
+   PARAM|旋钮代号|目标值|一句话理由
+   可调旋钮：${knobs}
+
+3) 一句你注意到但这些格式表达不了的观察，直接写中文，不要加前缀。
+
+**已经登记在测的比较见下面，复述它们会被系统拒绝。如果你觉得答案就是"继续攒样本"，那就只输出第 3 类或者什么都不输出。**`,
+    context: `最近 30 天各假设的测量结果（median/样本数）：\n${evidence}\n\n已经在测的主张：\n${registered.map(h => `- ${h.id}: ${h.claim}`).join('\n')}\n\n还没结论的实验：${stuck.map(v => `${v.id}(还需 ${v.missing} 条)`).join('、') || '无'}`,
+    maxTokens: 700,
   });
   if (!r.ok) {
     notes.push(`大脑反思失败：${r.error.slice(0, 90)}`);
@@ -74,11 +104,58 @@ export async function reflect(store: Store, brain: Brain | null, opts: { days?: 
   const lines = r.text
     .split('\n')
     .map(l => l.replace(/^[-·\d.、\s]+/, '').trim())
-    .filter(l => l.length >= 8);
-  for (const [i, line] of lines.slice(0, 3).entries()) {
+    .filter(l => l.length >= 6);
+
+  let proposalsIn = 0;
+  let paramsIn = 0;
+  let prose = 0;
+  for (const line of lines) {
+    if (line.toUpperCase().startsWith('TEST|')) {
+      const [, dimension, metric, mode, ...rest] = line.split('|');
+      const res = propose(store, {
+        claim: rest.join('|').trim(),
+        mode: (mode ?? 'observed').trim().toLowerCase(),
+        dimension: (dimension ?? '').trim(),
+        metric: (metric ?? '').trim(),
+        origin: 'brain',
+      });
+      if (res.ok) {
+        proposalsIn++;
+        notes.push(res.status === 'active'
+          ? `大脑登记的观察假设已上线：${rest.join('|').trim()}`
+          : `大脑提议的实验等审批（会占用真实流量）：${rest.join('|').trim()}`);
+      } else {
+        // Kept in the ledger on purpose: the next reflection reads it, so a rejected idea is not
+        // proposed again with the same confidence next week.
+        remember(store, {
+          kind: 'engine-model', key: `brain:rejected:test:${proposalsIn + prose}`, text: `你提的测试被拒了：${res.reason}`,
+          source: 'registry', confidence: 0.4, ttlMinutes: 3 * 24 * 60,
+        });
+        notes.push(`大脑的测试提议被拒：${res.reason}`);
+      }
+      continue;
+    }
+    if (line.toUpperCase().startsWith('PARAM|')) {
+      const [, key, to, ...rest] = line.split('|');
+      const value = Number((to ?? '').trim());
+      const res = Number.isFinite(value)
+        ? proposeChange(store, { key: (key ?? '').trim(), to: value, reason: rest.join('|').trim(), origin: 'brain' })
+        : ({ ok: false, reason: `目标值「${to}」不是数字` } as const);
+      if (res.ok) {
+        paramsIn++;
+        notes.push(`参数改动已排队，下一轮开始验证（${key} → ${to}）`);
+      } else {
+        remember(store, {
+          kind: 'engine-model', key: `brain:rejected:param:${proposalsIn + prose}`, text: `你提的参数改动被拒了：${res.reason}`,
+          source: 'param-loop', confidence: 0.4, ttlMinutes: 3 * 24 * 60,
+        });
+        notes.push(`参数提议被拒：${res.reason}`);
+      }
+      continue;
+    }
     remember(store, {
       kind: 'engine-model',
-      key: `brain:next:${i}`,
+      key: `brain:next:${prose}`,
       text: line,
       // A suggestion from the model is the least trusted thing in the ledger until measured.
       confidence: 0.35,
@@ -86,9 +163,11 @@ export async function reflect(store: Store, brain: Brain | null, opts: { days?: 
       source: 'brain',
       ttlMinutes: 7 * 24 * 60,
     });
-    stored.push(`brain:${i}`);
+    stored.push(`brain:${prose}`);
+    prose++;
   }
-  notes.push(`大脑给出 ${lines.slice(0, 3).length} 条下一步建议，已作为待验证假设写入记忆（不是事实）。`);
+  if (!proposalsIn && !paramsIn && !prose) notes.push('大脑这轮没有给出可用输出（按规则，"还不知道"也是合法答案）。');
+  else notes.push(`大脑本轮：${proposalsIn} 条新假设、${paramsIn} 条参数改动、${prose} 条备注。`);
   return { stored, notes };
 }
 

@@ -4,7 +4,9 @@ import { collect, generate, generateForMatrix, generateFromPool, publishDue, pau
 import { settingsFrom } from './schedule.ts';
 import { backfillStats, tuneTemplateWeights } from './stats/backfill.ts';
 import { observeDistribution } from './rank/observations.ts';
-import { scoreAll } from './rank/score.ts';
+import { revokeStaleRules, scoreAll } from './rank/score.ts';
+import { retireStalled } from './rank/registry.ts';
+import { applyPendingChanges, evaluateChanges } from './rank/params.ts';
 import { expireMemories } from './brain/memory.ts';
 import { reflect } from './brain/author.ts';
 import { brainFor } from './brain/brain.ts';
@@ -49,6 +51,8 @@ export interface TickResult {
   expired: number;
   /** Verdicts the daily reflection acted on — rules and flat results carried into the ledger. */
   reflected: number;
+  /** Parameter changes the system was allowed to make to itself and start verifying this tick. */
+  paramsApplied: number;
   accountsRun: number;
   notes: string[];
 }
@@ -57,7 +61,7 @@ export async function tick(store: Store, opts: { live?: boolean; statsEveryTicks
   const settings = settingsFrom(store);
   const res: TickResult = {
     at: Date.now(), collected: 0, poolCreated: 0, eventCreated: 0, published: 0, uncertain: 0, deferred: 0,
-    failed: 0, statsUpdated: 0, benchmarked: 0, studioDrafted: 0, studioPublished: 0, tuned: 0, observed: 0, rules: 0, testing: 0, conversionAttributed: 0, expired: 0, reflected: 0, accountsRun: 0, notes: [],
+    failed: 0, statsUpdated: 0, benchmarked: 0, studioDrafted: 0, studioPublished: 0, tuned: 0, observed: 0, rules: 0, testing: 0, conversionAttributed: 0, expired: 0, reflected: 0, paramsApplied: 0, accountsRun: 0, notes: [],
   };
 
   const pause = pauseState(store);
@@ -199,6 +203,25 @@ export async function tick(store: Store, opts: { live?: boolean; statsEveryTicks
       const verdicts = scoreAll(store, { writeMemory: true, target: settings.targetMetric });
       res.rules = verdicts.filter(v => v.status === 'rule').length;
       res.testing = verdicts.filter(v => v.status === 'observing').length;
+      // Learning has two directions. Writing what earned belief is the easy half; retiring what
+      // the latest measurement no longer supports is the half that stops the ledger filling with
+      // folklore about a comparison that has since stopped holding.
+      const revoked = revokeStaleRules(store, verdicts);
+      if (revoked.length) res.notes.push(`撤销了 ${revoked.length} 条不再被测量支持的规则：${revoked.join('、')}`);
+      // The registry and the parameter loop are the two places the system is allowed to change
+      // itself. Both are run here so the daily cadence is the same as the measurement cadence:
+      // cull what cannot be sampled, settle what is past its evaluation window, then apply what
+      // has been waiting — in that order, so a rolled-back change never competes with its own
+      // successor inside one tick.
+      const culled = retireStalled(store, verdicts);
+      if (culled.length) res.notes.push(`退休了 ${culled.length} 条攒不到样本的假设：${culled.join('、')}`);
+      const decided = evaluateChanges(store);
+      if (decided.improved.length) res.notes.push(`参数改动见效，保留：${decided.improved.join('、')}`);
+      if (decided.rolledBack.length) res.notes.push(`参数改动没有改善，已自动回滚：${decided.rolledBack.join('、')}`);
+      if (decided.deferred.length) res.notes.push(`参数改动样本还不够，继续观察：${decided.deferred.join('、')}`);
+      const applied = applyPendingChanges(store);
+      res.paramsApplied = applied.length;
+      if (applied.length) res.notes.push(`开始验证参数：${applied.map(a => `${a.label} ${a.from}→${a.to}`).join('，')}`);
       const exp = expireMemories(store);
       if (exp) res.notes.push(`长期记忆里 ${exp} 条已过期的判断被撤下`);
     } catch (err) {
@@ -251,6 +274,7 @@ export function line(r: TickResult): string {
     `${r.studioDrafted || r.studioPublished ? ` 文章${r.studioPublished}稿${r.studioDrafted}` : ''}` +
     `${r.observed ? ` 分发${r.observed}条${r.rules ? ` 规则${r.rules}` : ''}` : ''}` +
     `${r.reflected ? ` 反思${r.reflected}` : ''}` +
+    `${r.paramsApplied ? ` 调参${r.paramsApplied}` : ''}` +
     `${r.notes.length ? `  (${r.notes.join('; ')})` : ''}`
   );
 }

@@ -35,6 +35,30 @@ const DIRECTIVE: { pattern: RegExp; why: string }[] = [
   { pattern: /(带单|跟单|一起操作|跟我做|私我|加我微信|扫码)/, why: '拉人跟单或引流' },
 ];
 
+/**
+ * Claims that the author holds, held, or acted.
+ *
+ * The account behind this system does not trade. The platform's creator guidance lists
+ * "持仓和晒单不匹配", "秒开秒平" and fake screenshots among the things that damage account
+ * weight, and it says plainly that it verifies them — so a sentence like 我刚建了多单 is not
+ * flavour text, it is a fabricated trade claim on a channel that checks. Adding interpretation to
+ * the copy (the whole point of `content/voice.ts`) makes this gate necessary rather than
+ * precautionary: the moment a post is allowed to have a viewpoint, "I'm in this position" starts
+ * looking like a valid way to express one.
+ *
+ * It is a hard block at the publish boundary rather than a prompt instruction because the polish
+ * layer and a human editor can both introduce it after generation has passed.
+ */
+const FABRICATED_POSITION: { pattern: RegExp; why: string }[] = [
+  // Proximity, not a verb list: 「我刚建了多单」contains no 建仓, and 「我这个空单赚了」no 持仓.
+  // `我(?!们)` keeps 我们 — which the copy uses to mean "readers and I" — from matching as a
+  // first-person trading claim.
+  { pattern: /(?:本人|本人?自己|我(?!们))[^。！？]{0,14}(建仓|建了|建过|开仓|开了仓|平仓|买入|买进|卖出|做多|做空|加杠杆|上车|抄底|追了|接了|进了|出了|多单|空单|仓位|持仓|单子|头寸)/, why: '声称了作者自己的交易动作或持仓' },
+  { pattern: /我的(仓位|多单|空单|持仓|单子|头寸|本金|杠杆)/, why: '声称了作者的持仓' },
+  { pattern: /(晒|秀|亮|公开)(一下|个)?(我的|本人的)?(持仓|仓位|收益|战绩|交易记录|交易截图)/, why: '声称在展示真实交易记录' },
+  { pattern: /(跟着我|照着我|学着我)(一起)?(做|买|买进入场|操作)|我这个(单|仓)(赚|亏)/, why: '以个人交易结果作号召' },
+];
+
 export type PreFlightResult = { ok: true; text: string; note?: string } | { ok: false; reason: string };
 
 export function preFlight(opts: {
@@ -51,6 +75,9 @@ export function preFlight(opts: {
 
   const hit = DIRECTIVE.find(d => d.pattern.test(text));
   if (hit) return { ok: false, reason: `${hit.why}，已拦下不发送` };
+
+  const fake = FABRICATED_POSITION.find(d => d.pattern.test(text));
+  if (fake) return { ok: false, reason: `${fake.why}，而这个账号不做真实交易，已拦下不发送` };
 
   const word = opts.sensitiveWords.find(w => w && text.includes(w));
   if (word) return { ok: false, reason: `命中敏感词「${word}」` };

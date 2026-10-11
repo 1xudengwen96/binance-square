@@ -15,6 +15,7 @@ import type { Fact } from '../engine/types.ts';
 import { getAccountSecret } from '../secrets.ts';
 import { wordBank } from '../content/wordbank.ts';
 import { nextCheckDue, readPost } from '../stats/backfill.ts';
+import { writingNotes } from '../brain/author.ts';
 /**
  * When may this account's next long post go out?
  *
@@ -33,7 +34,7 @@ interface MaterialRow {
   sentiment: NonNullable<Material["sentiment"]> | null; score: number; source: string; occurred_at: number; facts_json: string;
 }
 
-import { CONCEPTS } from './concepts.ts';
+import { CONCEPTS, conceptById } from './concepts.ts';
 import { composeArticle } from './compose.ts';
 import { checkClaims, nextTopics } from './evidence.ts';
 import { specFor } from './library.ts';
@@ -347,7 +348,19 @@ export async function polishArticleDraft(store: Store, settings: Settings, artic
       return [];
     }
   })();
-  const res = await polish(cfg, a.body, facts as never);
+  // Long form used to be the one path with no memory and no persona: this call passed three
+  // arguments while the short-post path passed five, so the article polisher ran against a bare
+  // system prompt. Long form is where the ledger has the most to say — structure, what to
+  // prioritise, what the account is supposed to sound like — and it was the only place hearing none of it.
+  const concept = conceptById(a.concept_id);
+  const persona = a.account_id ? store.accountById(a.account_id)?.persona_note ?? '' : '';
+  const notes = writingNotes(store, {
+    category: concept?.sourceCategory ?? null,
+    subType: null,
+    symbol: a.symbol,
+    style: `${track.label}${concept ? ` ${concept.title}` : ''}`,
+  });
+  const res = await polish(cfg, a.body, facts as never, persona, notes);
   if (!res.changed) return { ok: false, changed: false, reason: res.reason };
   const gate = assertTextOnTrack(track, `${a.title}\n${res.text}`, 'polish');
   if (!gate.ok) return { ok: false, changed: false, reason: `润色后越出赛道边界：${gate.reasons.join('；')}` };

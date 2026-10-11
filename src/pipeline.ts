@@ -28,12 +28,13 @@ import { preFlight } from './engine/preflight.ts';
 import { polish } from './llm/polish.ts';
 import { getAccountSecret, getSecret } from './secrets.ts';
 import type { LlmConfig } from './llm/providers.ts';
-import type { Fact } from './engine/types.ts';
+import type { Context, Fact } from './engine/types.ts';
 import type { Material } from './material/types.ts';
 import type { Settings } from './config.ts';
 import { matrixEligibleAccounts } from './studio/lock.ts';
 import { exploreRepeat, planArms, recordArms } from './rank/experiments.ts';
-import { playbook } from './rank/playbook.ts';
+import { playbook, type Playbook } from './rank/playbook.ts';
+import { followCta, stanceLine, tensionLine } from './content/voice.ts';
 import { scoreAll } from './rank/score.ts';
 import { writingNotes } from './brain/author.ts';
 import type { Verdict } from './rank/score.ts';
@@ -44,6 +45,51 @@ function pickBank(key: string, seed: string | number): string {
   const opts = raw.startsWith('{') ? raw.slice(1, -1).split('|') : [raw];
   const h = typeof seed === 'number' ? seed : hashString(seed);
   return opts[Math.abs(h) % opts.length]!;
+}
+
+/**
+ * Apply the voice knobs the engine assigned to this post.
+ *
+ * Runs for previews too, because a preview that shows a different post from the one that will be
+ * sent is not a preview. `withHashtags` and the disclaimer already behaved this way; the closing
+ * question used to be gated on `!dryRun`, which made review lie about the ending.
+ *
+ * Order is fixed: hook first, then the body, then interpretation, then the reader's turn, then the
+ * follower ask, then the compliance line. Each added sentence is drawn from facts already in the
+ * ledger, so no digit enters the text and no claim about the author's own trading is possible —
+ * the account does not trade, and `preFlight` blocks that language independently at the boundary.
+ */
+export function applyVoice(text: string, facts: Context, pb: Playbook, seed: string | number): string {
+  const lead = pb.hook === 'tension' ? tensionLine(facts, `${seed}:hook`, text) : null;
+  const trail: string[] = [];
+  if (pb.stance === 'read') {
+    const line = stanceLine(facts, `${seed}:stance`, text);
+    if (line && !text.includes(line)) trail.push(line);
+  }
+  if (pb.opening === 'question' && !/[？?]/.test(text)) trail.push(pickBank('closing.question', seed));
+  if (pb.cta === 'follow') {
+    const line = followCta(`${seed}:cta`);
+    if (line && !/关注我|点关注|关注一下/.test(text)) trail.push(line);
+  }
+
+  let out = lead && !text.startsWith(lead) ? `${lead}\n${text}` : text;
+  if (!trail.length) return out;
+
+  // The compliance line stays last.
+  //
+  // Six of these voice lines used to be appended to the end of the text, and templates that carry
+  // their own 「不构成建议」in the middle would then have a reader-facing question and a 求关注
+  // sitting *after* the legal line — which is the property `withHashtags` is written to preserve.
+  // Anything added after drafting belongs above the disclaimer, not below it.
+  const lines = out.split('\n');
+  let at = -1;
+  for (let i = lines.length - 1; i >= 0; i--) {
+    if (DISCLAIMER_RE.test(lines[i]!)) { at = i; break; }
+  }
+  out = at < 0
+    ? `${out}\n${trail.join('\n')}`
+    : [...lines.slice(0, at), ...trail, ...lines.slice(at)].join('\n');
+  return out;
 }
 
 const DISCLAIMER_BANK = /^(phrase\.notAdvice|disclaimer\.)/;
@@ -353,6 +399,17 @@ export async function generate(
       report.skipped.push(`${m.title}: 这个币的「${m.category}」类内容 ${Math.round(eff.coinSignalCooldownMinutes / 60)} 小时内已经发过`);
       continue;
     }
+    // The cross-category coin cap. The cooldown above only compares like with like, so the same
+    // coin could be posted eight times a day under three different headings — which is precisely
+    // what Binance's guidance names as hurting account health. Measured on a rolling 24h rather
+    // than the calendar day so the limit cannot be reset by straddling midnight.
+    if (!opts.dryRun && m.symbol && eff.symbolDailyCap > 0) {
+      const recent = store.coinPostsSince(account?.id ?? null, m.symbol, Date.now() - 86_400_000);
+      if (recent >= eff.symbolDailyCap) {
+        report.skipped.push(`${m.title}: ${m.symbol} 近 24 小时已发 ${recent} 篇（各类合计），上限 ${eff.symbolDailyCap} —— 一味蹭热门币会被判账号不健康`);
+        continue;
+      }
+    }
     const candidates = eligible(m, defs, settings, recentlyUsed);
     if (!candidates.length) {
       report.skipped.push(`${m.title}: 所有匹配模版都在冷却中`);
@@ -375,9 +432,7 @@ export async function generate(
     // chose the winner afterwards.
     const arms = planArms({ seed: hashString(`${seed}:arms`), verdicts: rankVerdicts });
     const pb = playbook(store, { verdicts: rankVerdicts, arms });
-    if (pb.opening === 'question' && !/[？?]/.test(text) && !opts.dryRun) {
-      text = `${text}\n${pickBank('closing.question', seed)}`;
-    }
+    text = applyVoice(text, m.facts, pb, seed);
     // Only append a disclaimer the copy did not already carry.
     if (eff.appendDisclaimer && !carriesDisclaimer(text)) {
       text = `${text}\n${wordBank['disclaimer.default']}`;
@@ -782,6 +837,10 @@ export async function generateFromPool(
     }
     const facts = dossier(e);
     const repeatProbe = exploreRepeat(`attention:${e.symbol}:${acct?.id ?? 0}:${slot.at}`);
+    if (!repeatProbe && eff.symbolDailyCap > 0 && store.coinPostsSince(acct?.id ?? null, e.symbol, Date.now() - 86_400_000) >= eff.symbolDailyCap) {
+      report.skipped.push({ symbol: e.symbol, why: `这个币近 24 小时已发满 ${eff.symbolDailyCap} 篇（各类合计），一味蹭热门币伤账号健康度` });
+      continue;
+    }
     if (!repeatProbe && store.recentCoinSignal(acct?.id ?? null, e.symbol, 'attention', Date.now() - eff.coinSignalCooldownMinutes * 60_000)) {
       report.skipped.push({ symbol: e.symbol, why: `这个币的热度内容 ${Math.round(eff.coinSignalCooldownMinutes / 60)} 小时内已经发过` });
       continue;
@@ -814,9 +873,7 @@ export async function generateFromPool(
     let text = c.text;
     const arms = planArms({ seed: hashString(`${material.id}:arms`), verdicts: rankVerdicts });
     const pb = playbook(store, { verdicts: rankVerdicts, arms });
-    if (pb.opening === 'question' && !/[？?]/.test(text)) {
-      text = `${text}\n${pickBank('closing.question', material.id)}`;
-    }
+    text = applyVoice(text, material.facts, pb, material.id);
     if (eff.appendDisclaimer && !carriesDisclaimer(text)) {
       text = `${text}\n${wordBank['disclaimer.default']}`;
     }

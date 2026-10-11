@@ -15,13 +15,22 @@ export interface Playbook {
   hashtagTotal: number;
   attachChart: boolean;
   opening: 'statement' | 'question';
+  /** Whether the post leads with a one-line restatement of the direction instead of the number. */
+  hook: 'data' | 'tension';
+  /** Whether the post adds one interpretive sentence. Never a directive; see content/voice.ts. */
+  stance: 'none' | 'read';
+  /** Whether the post ends with the follower ask the platform explicitly permits. */
+  cta: 'none' | 'follow';
   /** Rules that are currently acting on this post, for the audit trail and the panel. */
   acting: { source: 'rule' | 'experiment'; text: string }[];
   verdicts: Verdict[];
 }
 
 /** Coin tag plus one topic tag — the shape the panel shipped before any of this was measured. */
-const DEFAULTS = { hashtagTotal: 2, attachChart: true, opening: 'statement' as const };
+const DEFAULTS = {
+  hashtagTotal: 2, attachChart: true, opening: 'statement' as const,
+  hook: 'data' as const, stance: 'none' as const, cta: 'none' as const,
+};
 
 export function playbook(store: Store, opts: { verdicts?: Verdict[]; arms?: ArmPlan } = {}): Playbook {
   const verdicts = opts.verdicts ?? scoreAll(store, { writeMemory: false });
@@ -60,6 +69,24 @@ export function playbook(store: Store, opts: { verdicts?: Verdict[]; arms?: ArmP
     pb.attachChart = chartArm === 'chart';
     acting.push({ source: 'experiment', text: `本篇配图按实验臂：${chartArm}` });
   }
+
+  /**
+   * Resolve a two-arm knob: this post's assigned arm wins, then a rule that earned it, then the
+   * default. Factored out because the three voice knobs below behave identically and a divergence
+   * between them would be a silent confound in the comparison they exist to run.
+   */
+  const twoArm = <V extends string>(hypId: string, label: string, on: V, off: V, current: V, describe: (v: V) => string): V => {
+    const arm = opts.arms?.[hypId];
+    const rule = decided(hypId)?.winner;
+    const value = (arm ?? rule ?? undefined) as V | undefined;
+    if (!value) return current;
+    acting.push({ source: arm ? 'experiment' : 'rule', text: `${label}：${describe(value)}` });
+    return value;
+  };
+
+  pb.hook = twoArm('h_hook_form', '首句', 'tension' as const, 'data' as const, pb.hook, v => (v === 'tension' ? '先给一句方向' : '直接给数据'));
+  pb.stance = twoArm('h_stance', '观点句', 'read' as const, 'none' as const, pb.stance, v => (v === 'read' ? '加一句解读' : '不加'));
+  pb.cta = twoArm('h_follow_cta', '求关注', 'follow' as const, 'none' as const, pb.cta, v => (v === 'follow' ? '结尾求一次' : '不求'));
 
   return pb;
 }

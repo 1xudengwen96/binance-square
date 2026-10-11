@@ -1316,6 +1316,39 @@ async function rankView() {
       <td><button class="btn sm danger" onclick="forgetMemory('${esc(m.key)}')">撤销</button></td>
     </tr>`).join('') : '<tr><td colspan="6"><div class="empty"><b>还没有形成任何长期判断</b><span>当某条假设的样本与差距同时够了，结论会写进这里，并在之后每次写作时被读到。</span></div></td></tr>';
 
+  const knobLabel = Object.fromEntries((d.knobs ?? []).map(k => [k.key, k.label]));
+  const PARAM_STATUS = {
+    pending: ['plain', '待应用'], applied: ['warn', '验证中'], improved: ['on', '见效，已保留'],
+    rolled_back: ['bad', '没改善，已自动回滚'], no_effect: ['bad', '没有变化'], rejected: ['plain', '被拒绝'],
+  };
+  const proposed = (d.proposals ?? []).length ? d.proposals.map(p => `<tr>
+      <td>${esc(p.claim)}<span class="sub">${p.source_text ? `AI 大脑原话：「${esc(p.source_text)}」` : 'AI 大脑提议'}</span></td>
+      <td><span class="pill plain">${esc(p.dimension_label)}</span><span class="sub">${esc(p.metric)} · 每臂要 ${p.min_samples} 条</span></td>
+      <td class="muted">${esc(p.risk)}</td>
+      <td style="white-space:nowrap"><button class="btn sm primary" onclick="resolveHypothesis('${esc(p.id)}',true)">批准</button> <button class="btn sm" onclick="resolveHypothesis('${esc(p.id)}',false)">不要</button></td>
+    </tr>`).join('') : '<tr><td colspan="4"><div class="empty"><b>没有在等待审批的提议</b><span>AI 大脑提的随机实验会落到这里 —— 它要占真实发帖流量，所以由你点头，不由它自己决定。</span></div></td></tr>';
+
+  const paramRows = (d.paramChanges ?? []).length ? d.paramChanges.map(c => {
+    const [cls, label] = PARAM_STATUS[c.status] ?? ['', c.status];
+    return `<tr>
+      <td>${esc(knobLabel[c.key] ?? c.key)}<span class="sub">${esc(c.reason)}</span></td>
+      <td class="num">${c.from_value} → ${c.to_value}</td>
+      <td><span class="pill ${cls}">${label}</span>${c.reject_reason ? `<span class="sub">${esc(c.reject_reason)}</span>` : ''}</td>
+      <td class="num"${tip('怎么判定留不留', [['判定指标', c.metric], ['改动前中位', c.before_median == null ? '—' : c.before_median], ['改动后中位', c.after_median == null ? '还没到评估点' : c.after_median], ['应用时刻', c.applied_at ? fmtTs(c.applied_at) : '—'], ['评估时刻', c.evaluate_at ? fmtTs(c.evaluate_at) : '—'], ['规则', '没改善就回滚；窗口跑完仍凑不够样本，也按未知回滚']])}>${c.before_median == null ? '—' : c.before_median}${c.after_median != null ? ` → ${c.after_median}` : ''}</td>
+    </tr>`;
+  }).join('') : '<tr><td colspan="4"><div class="empty"><b>系统还没有改动过任何参数</b><span>它有权动的只有下面几个旋钮，单次最多 ±25%，且同时只允许一个在验证。</span></div></td></tr>';
+
+  const knobList = (d.knobs ?? []).map(k => `<span class="tag"${tip(k.key, [['当前值', k.current], ['合法区间', `${k.min} – ${k.max}`], ['判定指标', k.judge], ['为什么是它', k.purpose]])}>${esc(k.label)} ${k.current}</span>`).join(' ');
+
+  const selfCard = `<div class="card" style="margin-top:14px">
+    <div class="card-hd"><h3>系统能改自己的两个地方</h3><span class="sub">假设登记表 · 参数旋钮 —— 发帖量、时段、间隔、日额度不在其中</span></div>
+    <div class="hint" style="margin-top:0">除了模版权重，这套系统只有这两处被允许修改自己。两处都带闸门：假设必须用<b>已有维度 × 已有指标</b>才登记得进来（表达不出来的不是假设，是感想）；参数改动必须<b>有界、单个在途、到期自动判定</b>，没改善或判不出来都自动回滚。<b>只记成功不记失败的系统不是在优化，是在积累偏见</b> —— 所以被拒和回滚的记录也留在这儿。</div>
+    <div class="tw" style="margin-top:12px"><table><thead><tr><th>等审批的新假设</th><th>维度 / 指标</th><th>代价</th><th></th></tr></thead><tbody>${proposed}</tbody></table></div>
+    <div class="sub" style="margin:12px 0 4px">可自动调整的旋钮（鼠标放上去看合法区间和判定指标）：</div>
+    <div>${knobList}</div>
+    <div class="tw" style="margin-top:12px"><table><thead><tr><th>参数改动</th><th class="num">变化</th><th>状态</th><th class="num">判定指标中位数</th></tr></thead><tbody>${paramRows}</tbody></table></div>
+  </div>`;
+
   const acting = d.playbook?.acting?.length
     ? `<div class="alert"><svg viewBox="0 0 24 24"><path d="M12 16v-4M12 8h.01"/><circle cx="12" cy="12" r="9"/></svg>
        <div>这一轮正在生效：${d.playbook.acting.map(a => esc(a.text)).join('； ')}。主题标签 ${d.playbook.hashtagTopics} 个 · ${d.playbook.attachChart ? '带图' : '不带图'} · 收尾${d.playbook.opening === 'question' ? '提问' : '陈述'}</div></div>`
@@ -1333,6 +1366,7 @@ async function rankView() {
     <div style="margin-top:12px">${kpis}</div>
   </div>
   ${convCard}
+  ${selfCard}
   ${cards}
   <div class="card" style="margin-top:14px">
     <div class="card-hd"><h3>每条帖子的分发形状</h3><span class="sub">绝对浏览量混着币本身的热度，曲线形状才是引擎的决定</span></div>
@@ -1351,9 +1385,19 @@ async function rankReflect() {
   toast('归纳中…');
   try {
     const r = await api('/api/rank/reflect', { method: 'POST' });
-    toast(`写入 ${r.stored.length} 条判断${r.notes.length ? ' · ' + r.notes[0] : ''}`);
+    // The rejections are the interesting half: a proposal that was refused tells you what the
+    // model tried and why it could not be measured, which is how it stops repeating the same idea.
+    toast(`写入 ${r.stored.length} 条判断${r.notes.length ? ' · ' + r.notes.slice(0, 2).join(' · ') : ''}`);
     await render();
   } catch (e) { toast('归纳失败：' + e.message, true); }
+}
+
+async function resolveHypothesis(id, approve) {
+  if (!approve && !confirm('拒绝这条提议？它会作为「已拒绝」留下，避免下周又被提一次。')) return;
+  const r = await api('/api/hypotheses/resolve', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ id, approve }) });
+  if (r.error) return toast(r.error, true);
+  toast(approve ? '已批准，下一轮发帖开始分配这个臂' : '已拒绝');
+  await render();
 }
 
 async function forgetMemory(key) {

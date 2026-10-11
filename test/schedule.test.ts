@@ -11,6 +11,13 @@ import { makeMaterial } from '../src/material/types.ts';
 import { ttlFor } from '../src/lifecycle.ts';
 
 const GAP = DEFAULT_SETTINGS.minIntervalMinutes * 60_000;
+/**
+ * Production posts only between 08:00 and 24:00 Beijing, so a test that asks "when is the next
+ * slot?" answers differently at 00:03 than at 15:00 — it rolled into tomorrow and the assertion
+ * about "now" failed for no reason connected to the code under test. Nothing here is about the
+ * window, so it is opened for the whole day. The rollover itself is covered by its own test.
+ */
+const ALWAYS_OPEN = { ...DEFAULT_SETTINGS, activeStartHour: 0, activeEndHour: 24 };
 
 function tempStore(): { store: Store; close: () => void } {
   const dir = mkdtempSync(join(tmpdir(), 'sf-sched-'));
@@ -37,7 +44,7 @@ test('drafts reserved one at a time never share a minute', () => {
   try {
     const taken: number[] = [];
     for (let i = 0; i < 3; i++) {
-      const slot = nextSlot(store, DEFAULT_SETTINGS, Date.now(), null, true);
+      const slot = nextSlot(store, ALWAYS_OPEN, Date.now(), null, true);
       assert.ok(slot.allowed, slot.reason);
       taken.push(slot.at);
       approve(store, slot.at, i);
@@ -58,7 +65,7 @@ test('the publish gate still ignores drafts scheduled for later', () => {
     const due = Date.now() - 60_000;
     approve(store, due, 0);
     for (let i = 1; i < 4; i++) approve(store, due + i * GAP, i);
-    const gate = nextSlot(store, DEFAULT_SETTINGS, Date.now(), { id: 1, at: due }, false);
+    const gate = nextSlot(store, ALWAYS_OPEN, Date.now(), { id: 1, at: due }, false);
     assert.ok(gate.allowed, gate.reason);
     assert.ok(gate.at <= Date.now(), 'a due post with history must not be pushed behind its own queue');
   } finally {

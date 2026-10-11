@@ -5,7 +5,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { Store } from '../src/db/index.ts';
 import { observeDistribution } from '../src/rank/observations.ts';
-import { scoreAll } from '../src/rank/score.ts';
+import { scoreAll, revokeStaleRules } from '../src/rank/score.ts';
 import { planArms, recordArms } from '../src/rank/experiments.ts';
 import { playbook } from '../src/rank/playbook.ts';
 import { HYPOTHESES } from '../src/rank/hypotheses.ts';
@@ -215,6 +215,47 @@ test('a reversed measurement retires the old rule instead of deleting it', () =>
     assert.equal(history.length, 2);
     assert.equal(history[0]!.status, 'superseded');
     assert.ok(history[0]!.text.includes('成立'));
+  } finally {
+    close();
+  }
+});
+
+test('a rule the latest measurement no longer supports is revoked, not left on the shelf', () => {
+  // The path the test above does not cover: rule -> flat *writes* a new sentence, so the old
+  // belief is superseded for free. rule -> leaning/observing writes nothing at all, which used to
+  // leave "always do X" active in the ledger forever after the comparison stopped holding. An
+  // account that only records what it learned and never retires it is accumulating bias, not
+  // optimising.
+  const { store, close } = tempStore();
+  try {
+    const now = Date.now();
+    const n = HYPOTHESES.find(h => h.id === 'h_hashtag_count')!.minSamples;
+    for (let i = 0; i < n * 2; i++) {
+      const arm = i % 2 ? 'two' : 'one';
+      post(store, {
+        views: arm === 'two' ? [500, 800, 1000] : [50, 80, 100],
+        at: now - 10 * 3600_000 - i * 1000,
+        arms: { h_hashtag_count: arm },
+        heat: i % 4 < 2 ? 92 : 60,
+      });
+    }
+    observeDistribution(store);
+    scoreAll(store, { writeMemory: true });
+    assert.equal(store.activeMemory('rank-rule').length, 1, 'the rule is on the shelf');
+
+    // Shrink the window until nothing is eligible: this is exactly what a stalled experiment looks
+    // like to the scorer, and the rule earned from the wider window must not survive it silently.
+    const stalled = scoreAll(store, { writeMemory: false, days: 0.0001 });
+    assert.equal(stalled.find(v => v.id === 'h_hashtag_count')!.status, 'observing');
+    assert.deepEqual(revokeStaleRules(store, stalled), ['h_hashtag_count']);
+    assert.equal(store.activeMemory('rank-rule').length, 0, 'the writer is no longer told it');
+
+    const gone = store.db.prepare("SELECT status, text FROM brain_memory WHERE key = 'rank:h_hashtag_count' AND status = 'rejected'").get() as { status: string; text: string };
+    assert.equal(gone.status, 'rejected');
+    assert.match(gone.text, /不再支持/, 'and the reason survives, so the same mistake is not re-learned');
+
+    // Revoking twice must be a no-op, not a second rejection appended to a dead row.
+    assert.deepEqual(revokeStaleRules(store, stalled), []);
   } finally {
     close();
   }

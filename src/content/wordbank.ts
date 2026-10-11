@@ -9,6 +9,39 @@ export const wordBank: Record<string, string> = {
   'hook.story': '{说实话|讲真|刚刷到|正好看到}，',
   'hook.alert': '{🚨|⚠️|👀|📌} ',
   'hook.data': '{📊|🔢|📈|🧮} ',
+
+  /* ------------------------------------------------- 首句张力（3 秒定律）--- */
+  // Each line restates a direction that is already in the fact ledger. No digits, no position
+  // claim, no forecast: the platform's own guidance says the opening must hold a reader, and the
+  // honest way to do that here is to lead with the *meaning* of a number rather than the number.
+  // Variants must not assert a transition. A `funding` material carries no previous rate, so a
+  // line like 「付费的方向翻过来了」would invent a change the ledger cannot support.
+  'hook.tension.payerShort': '{空头在给多头付钱。|现在付费的是空头。}',
+  'hook.tension.payerLong': '{多头在给空头付钱。|现在付费的是多头。}',
+  'hook.tension.skewLong': '{多空明显倒向多头。|仓位压在一边。}',
+  'hook.tension.skewShort': '{多空明显倒向空头。|仓位压在一边。}',
+  'hook.tension.volUp': '{放量在上行。|量能跟着价格起来了。}',
+  'hook.tension.volDown': '{放量在下跌。|量能跟着价格下来了。}',
+  'hook.tension.oiWithPrice': '{持仓和价格朝同一个方向。}',
+  'hook.tension.oiVsPrice': '{持仓和价格走反了。}',
+  'hook.tension.upHard': '{这一下拉得很急。}',
+  'hook.tension.downHard': '{这一下掉得很急。}',
+
+  /* ------------------------------------------------- 观点句（解读，非建议）--- */
+  // A reading of the shape, tied to the specific pattern that produced it. Deliberately free of
+  // 建议/目标价/仓位声称 — those are blocked at the publish gate anyway, and a stance that had to
+  // break one of those rules to sound confident is not a stance worth publishing.
+  'stance.fundingExtreme': '{这种极值一般撑不了太久。|付得起这个成本的仓位，方向上多半是被推着走的。}',
+  'stance.skewExtreme': '{一边倒的仓位，对波动会更敏感。|都押在一头，走反的时候踩踏会比平时快。}',
+  'stance.volConfirm': '{有量配合的上行，比缩量拉升可信一些。}',
+  'stance.volGap': '{量没跟上，这种拉升我更愿意多看一眼。}',
+  'stance.sellPressure': '{放量下跌，更像是被动在出而不是主动在接。}',
+  'stance.oiBuild': '{仓位在快速堆积，这批钱短期不容易散。}',
+
+  // 求关注 lives in `cta.follow` further down. Six templates used to sprinkle it at
+  // `{{#maybe 35}}` on their own, which would have put a follow line into the control arm of
+  // h_follow_cta a third of the time; the knob in `rank/playbook.ts` is now the only thing that
+  // decides it, so the two arms actually differ.
   'emoji.bull': '{📈|💰|🟢}',
   'emoji.bear': '{📉|🔴|🩸}',
 

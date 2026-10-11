@@ -1,6 +1,7 @@
 import type { Store } from '../db/index.ts';
 import { distributionRows, type Distribution } from './observations.ts';
-import { CONFIDENCE_TO_ACT, HYPOTHESES, type Hypothesis, type Metric } from './hypotheses.ts';
+import { CONFIDENCE_TO_ACT, type Hypothesis, type Metric } from './hypotheses.ts';
+import { registry } from './registry.ts';
 import { remember } from '../brain/memory.ts';
 
 const median = (xs: number[]): number | null => {
@@ -53,18 +54,21 @@ function outcome(row: Row, metric: Metric): number | null {
 
 function armOf(row: Row, h: Hypothesis): string | null {
   if (h.mode === 'experiment') return row.arms?.[h.id] ?? null;
-  switch (h.id) {
-    case 'h_length_band':
+  // Dispatching on the dimension rather than the hypothesis id is what makes the registry
+  // extensible: a newly registered observed hypothesis sorts itself with no code change, and one
+  // that names a knob dimension falls through to null instead of silently measuring nothing.
+  switch (h.dimension) {
+    case 'length_band':
       return row.chars < 120 ? 'short' : row.chars <= 220 ? 'mid' : 'long';
-    case 'h_hour_band': {
+    case 'hour_band': {
       const hour = new Date(row.published_at + 8 * 3600_000).getUTCHours();
       return hour < 8 ? 'late' : hour < 11 ? 'morning' : hour < 15 ? 'midday' : hour < 19 ? 'afternoon' : hour < 23 ? 'evening' : 'late';
     }
-    case 'h_repeat_interval': {
+    case 'repeat_interval': {
       if (row.repeatGapHours == null) return null;
       return row.repeatGapHours < 6 ? 'within6h' : row.repeatGapHours < 24 ? '6to24h' : 'over24h';
     }
-    case 'h_surfacing_shape':
+    case 'surfacing_shape':
       return row.surfaced ? 'surfaced' : 'unsurfaced';
     default:
       return null;
@@ -117,10 +121,11 @@ function fmt(metric: Metric, v: number | null): string {
  * a rule only exists once the sample and the gap both clear their floor. Anything else is a
  * machine inventing folklore about an algorithm it cannot read.
  */
-export function scoreAll(store: Store, opts: { days?: number; writeMemory?: boolean; now?: number; target?: 'views' | 'money' } = {}): Verdict[] {
+export function scoreAll(store: Store, opts: { days?: number; writeMemory?: boolean; now?: number; target?: 'views' | 'money'; hypotheses?: Hypothesis[] } = {}): Verdict[] {
   const days = opts.days ?? 30;
   const now = opts.now ?? Date.now();
   const rows = distributionRows(store, days) as Row[];
+  const list = opts.hypotheses ?? registry(store);
   // Pointing the system at money is a real switch, but it only becomes real once the operator
   // has entered a figure. Until then the verdicts stay on views and say so.
   const moneyReady = opts.target === 'money' && rows.some(r => r.rebate_usd != null);
@@ -142,7 +147,7 @@ export function scoreAll(store: Store, opts: { days?: number; writeMemory?: bool
   const eligible = rows.filter(r => now - r.published_at >= MATURITY_FLOOR_MS);
   const out: Verdict[] = [];
 
-  for (const h of HYPOTHESES) {
+  for (const h of list) {
     // Money replaces views as the target only for the arms we randomise; an observed comparison
     // would just be a smaller version of the same confounding.
     const metric: Metric = moneyReady && h.mode === 'experiment' ? 'rebatePer1k' : h.metric;
@@ -240,6 +245,36 @@ export function scoreAll(store: Store, opts: { days?: number; writeMemory?: bool
 }
 
 /**
+ * A belief the data no longer supports must stop being believed.
+ *
+ * `scoreAll` writes memory on `rule` and `flat`, which means a hypothesis that *falls out* of
+ * rule — because a new stratum contradicted it, or the sample no longer replicates across the
+ * two halves — left its `rank-rule` row active forever. The writer kept being told "always do X"
+ * about a comparison the latest measurement had downgraded to a hunch. Revoking on downgrade is
+ * the other half of learning: without it the ledger only ever accumulates.
+ */
+const STATUS_CN: Record<Verdict['status'], string> = {
+  rule: '规则', flat: '没差别', leaning: '线索', observing: '样本不足',
+};
+
+export function revokeStaleRules(store: Store, verdicts: Verdict[], now = Date.now()): string[] {
+  const active = new Set(
+    (store.db
+      .prepare("SELECT key FROM brain_memory WHERE kind = 'rank-rule' AND status = 'active'")
+      .all() as { key: string }[]).map(r => r.key),
+  );
+  const revoked: string[] = [];
+  for (const v of verdicts) {
+    if (v.status === 'rule' || v.status === 'flat') continue;
+    const key = `rank:${v.id}`;
+    if (!active.has(key)) continue;
+    store.forgetMemory(key, `最新的测量不再支持这个结论（现在是「${STATUS_CN[v.status]}」）：${v.note ?? '分层或复现条件变了'}（${new Date(now).toISOString().slice(0, 10)}）`);
+    revoked.push(v.id);
+  }
+  return revoked;
+}
+
+/**
  * Which comparison a post belongs in.
  *
  * The single largest driver of a post's view count is which coin it was about and how hot that
@@ -313,6 +348,26 @@ function halves(rows: Row[]): [Row[], Row[]] {
   const mid = Math.ceil(byTime.length / 2);
   return [byTime.slice(0, mid), byTime.slice(mid)];
 }
+/**
+ * The same reading the scorer uses, over a window.
+ *
+ * Exposed for the parameter loop, which has to judge a change by exactly the number an
+ * experiment would be judged by. Two definitions of "did it help" is how a self-tuning system
+ * ends up crediting itself for a change that moved nothing.
+ */
+export function medianOutcome(store: Store, metric: Metric, from: number, to: number, now = Date.now()): number | null {
+  const rows = distributionRows(store, 60) as Row[];
+  const vs: number[] = [];
+  for (const r of rows) {
+    if (r.published_at < from || r.published_at >= to) continue;
+    if (now - r.published_at < MATURITY_FLOOR_MS) continue;
+    const v = outcome(r, metric);
+    if (v != null) vs.push(v);
+  }
+  return median(vs);
+}
+
+/** How many registered hypotheses are starved is answered by the panel from the verdict list. */
 export function scoreSummary(verdicts: Verdict[]): { rules: number; leaning: number; observing: number; flat: number } {
   return {
     rules: verdicts.filter(v => v.status === 'rule').length,
