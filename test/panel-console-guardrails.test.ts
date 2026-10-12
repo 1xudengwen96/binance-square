@@ -42,3 +42,32 @@ test('hand-entered conversion lives in a collapsed observation block labelled ap
   assert.ok(!/<h3>今天从币安后台抄三个数/.test(appJs), 'the hand-fill nudge is still a page heading');
   assert.ok(!/按返佣优化|按互动质量优化|按浏览量优化/.test(appJs), 'a metric-switch button is still rendered');
 });
+
+/**
+ * The class of bug this file is about: deleting a handler and leaving its
+ * `window.x = x;` export or an inline onclick behind, which throws on render.
+ */
+test('every onclick target in the panel actually exists', () => {
+  const defined = new Set<string>();
+  const names = (src: string, re: RegExp, at: 1 | 2): string[] =>
+    [...src.matchAll(re)].map(m => m[at]).filter((s): s is string => Boolean(s));
+  for (const { src } of PANEL) {
+    for (const n of names(src, /(?:async\s+)?function\s+([A-Za-z_$][\w$]*)/g, 1)) defined.add(n);
+    for (const n of names(src, /(?:const|let|var)\s+([A-Za-z_$][\w$]*)\s*=/g, 1)) defined.add(n);
+    for (const n of names(src, /^window\.([A-Za-z_$][\w$]*)\s*=/gm, 1)) defined.add(n);
+  }
+  const builtins = new Set(['confirm', 'alert', 'location']);
+  const missing: string[] = [];
+  for (const { name, src } of PANEL) {
+    for (const fn of names(src, /onclick="([A-Za-z_$][\w$]*)\(/g, 1)) {
+      if (!defined.has(fn) && !builtins.has(fn)) missing.push(`${name}: ${fn}`);
+    }
+    for (const m of src.matchAll(/^window\.([A-Za-z_$][\w$]*)\s*=\s*([A-Za-z_$][\w$]*);$/gm)) {
+      const exported = m[1] ?? '';
+      const target = m[2] ?? '';
+      if (defined.has(target)) continue;
+      missing.push(`${name}: window.${exported} = ${target} (export of an identifier that no longer exists)`);
+    }
+  }
+  assert.deepEqual(missing, [], `dangling panel handlers: ${missing.join(', ')}`);
+});

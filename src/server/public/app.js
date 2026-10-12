@@ -1685,6 +1685,20 @@ async function reroll(id, useAlt) {
   } catch (e) { toast('重写失败：' + e.message, true); }
 }
 
+/**
+ * 发帖记录卡上的 通过 / 驳回 / 撤回审核。
+ * 这四个调用点原本指向一个不存在的函数（postAct 在全仓没有定义），所以队列里每一条草稿的
+ * 审批按钮点了都没有反应 —— 服务端 /api/posts/:id/:action 一直是好的，坏的是界面。
+ * approve 命中结构重复时服务端返回 409 与原因，这里如实弹出来，不静默。
+ */
+async function postAct(id, action) {
+  try {
+    await api(`/api/posts/${id}/${action}`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: '{}' });
+    toast(action === 'approve' ? '已通过，等下一轮发布' : action === 'unapprove' ? '已撤回审核，回到草稿' : '已驳回');
+    await render();
+  } catch (e) { toast(e.message, true); }
+}
+
 async function templatesView() {
   const rows = await api('/api/templates');
   const byCat = {};
