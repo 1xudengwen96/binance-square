@@ -110,6 +110,50 @@ async function makeCover(symbol: string, chg24h: number, outDir: string): Promis
   return built?.path ?? null;
 }
 
+/**
+ * Map Square's subscribeCount without inventing a zero. "The column is not being filled"
+ * and "measured zero new subscriptions" must stay distinguishable in the database —
+ * the short-post line proved a public VO can carry a whole always-zero column.
+ */
+export function subscribeSample(vo: { subscribeCount?: unknown }): { value: number | null; reason: string | null } {
+  if (vo.subscribeCount === undefined || vo.subscribeCount === null) return { value: null, reason: 'field_missing' };
+  const n = Number(vo.subscribeCount);
+  return Number.isFinite(n) ? { value: n, reason: null } : { value: null, reason: 'parse_fail' };
+}
+
+export interface CollectMiss { misses: number; firstAt: number; lastAt: number; alerted: string | null }
+export type CollectMissLedger = Record<string, CollectMiss>;
+
+/**
+ * Track consecutive failed reads of an article's stats checkpoint. Two misses in a row open a
+ * warning; the escalation reuses the group-wide 12h / 24h tiers instead of new thresholds.
+ * A successful read closes the streak and reports whether an alert had been raised.
+ */
+export function noteCollectMiss(ledger: CollectMissLedger, articleId: number, ok: boolean, now = Date.now()):
+  { changed: boolean; events: { severity: string; miss: CollectMiss }[]; cleared?: CollectMiss } {
+  const key = String(articleId);
+  const cur = ledger[key];
+  if (ok) {
+    if (!cur) return { changed: false, events: [] };
+    delete ledger[key];
+    return { changed: true, events: [], cleared: cur.misses >= 2 ? cur : undefined };
+  }
+  const miss: CollectMiss = cur
+    ? { misses: cur.misses + 1, firstAt: cur.firstAt, lastAt: now, alerted: cur.alerted }
+    : { misses: 1, firstAt: now, lastAt: now, alerted: null };
+  ledger[key] = miss;
+  const events: { severity: string; miss: CollectMiss }[] = [];
+  if (miss.misses >= 2) {
+    const ageH = (now - miss.firstAt) / 3600e3;
+    const severity = ageH >= 24 ? 'breach' : ageH >= 12 ? 'fault' : 'warning';
+    if (severity !== miss.alerted) {
+      miss.alerted = severity;
+      events.push({ severity, miss: { ...miss } });
+    }
+  }
+  return { changed: true, events };
+}
+
 export async function runStudio(
   store: Store,
   settings: Settings,
@@ -290,22 +334,43 @@ export async function runStudio(
   }
 
   /* ------------------------------------------------------------------ stats --- */
+  // P0-1: two readings of the same number must never look identical in the database.
+  // ①a a missing subscribeCount lands as NULL + a reason, not as a real zero;
+  // ①b an article whose read fails on two consecutive checkpoints gets a collect_gap alert —
+  //    silently skipping left holes the panel read as "the article just is not growing".
+  const missLedger = store.getSetting<CollectMissLedger>('studioCollectMiss', {});
+  let ledgerDirty = false;
   for (const a of store.studioArticles(['published']).filter(x => /^\d{6,}$/.test(x.square_post_id ?? ''))) {
     const dueIdx = nextCheckDue(a.published_at ?? a.created_at, store.studioObservations(a.id).map(o => o.checkpoint));
     if (dueIdx < 0) continue;
+    let vo: Awaited<ReturnType<typeof readPost>> = null;
     try {
-      const vo = await readPost(a.square_post_id!);
-      if (!vo) continue;
-      store.recordStudioObservation(a.id, dueIdx, {
-        views: Number(vo.viewCount ?? 0), likes: Number(vo.likeCount ?? 0), comments: Number(vo.commentCount ?? 0),
-        shares: Number(vo.shareCount ?? 0), reactions: Number(vo.totalReactionCount ?? 0), subscribers: Number(vo.subscribeCount ?? 0),
-        onBoard: false,
-      });
-      report.statsUpdated++;
+      vo = await readPost(a.square_post_id!);
     } catch (err) {
       report.errors.push(`studio stats ${a.id}: ${String(err).slice(0, 80)}`);
     }
+    const miss = noteCollectMiss(missLedger, a.id, vo !== null);
+    if (miss.changed) ledgerDirty = true;
+    for (const ev of miss.events) {
+      store.log('collect_gap', {
+        articleId: a.id, squarePostId: a.square_post_id, severity: ev.severity,
+        misses: ev.miss.misses, firstAt: ev.miss.firstAt, lastAt: ev.miss.lastAt,
+        ageHours: Math.round(((ev.miss.lastAt - ev.miss.firstAt) / 3600e3) * 10) / 10,
+      });
+      report.errors.push(`collect_gap ${a.id}: ${ev.severity} x${ev.miss.misses}`);
+    }
+    if (miss.cleared) store.log('collect_gap_clear', { articleId: a.id, squarePostId: a.square_post_id, misses: miss.cleared.misses, firstAt: miss.cleared.firstAt });
+    if (!vo) continue;
+    const sub = subscribeSample(vo);
+    store.recordStudioObservation(a.id, dueIdx, {
+      views: Number(vo.viewCount ?? 0), likes: Number(vo.likeCount ?? 0), comments: Number(vo.commentCount ?? 0),
+      shares: Number(vo.shareCount ?? 0), reactions: Number(vo.totalReactionCount ?? 0),
+      subscribers: sub.value, subscribersReason: sub.reason,
+      onBoard: false,
+    });
+    report.statsUpdated++;
   }
+  if (ledgerDirty) store.setSetting('studioCollectMiss', missLedger);
 
   /* ---------------------------------------------------------- self-correction --- */
   try {

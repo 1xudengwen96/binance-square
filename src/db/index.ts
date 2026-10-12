@@ -569,6 +569,14 @@ export class Store {
     ] as const) {
       if (!has('studio_articles', col)) this.db.exec(`ALTER TABLE studio_articles ADD COLUMN ${col} ${decl}`);
     }
+
+    // P0-1 (R5 前置): a missing subscribeCount must land as NULL *with the reason*, never as a
+    // real zero. Without this the panel cannot tell "the column is not being filled" apart from
+    // "measured zero new subscriptions" — the exact ambiguity that made the short-post subscribe
+    // line unreadable for two weeks.
+    if (!has('studio_observations', 'subscribers_reason')) {
+      this.db.exec('ALTER TABLE studio_observations ADD COLUMN subscribers_reason TEXT');
+    }
   }
 
   close(): void {
@@ -1244,19 +1252,20 @@ export class Store {
   recordStudioObservation(articleId: number, checkpoint: number, s: StudioStatSample & { onBoard?: boolean }): void {
     this.db
       .prepare(
-        `INSERT INTO studio_observations (article_id, checkpoint, at, views, likes, comments, shares, reactions, subscribers, on_board)
-         VALUES (?,?,?,?,?,?,?,?,?,?)
+        `INSERT INTO studio_observations (article_id, checkpoint, at, views, likes, comments, shares, reactions, subscribers, subscribers_reason, on_board)
+         VALUES (?,?,?,?,?,?,?,?,?,?,?)
          ON CONFLICT(article_id, checkpoint) DO UPDATE SET
            at = excluded.at, views = excluded.views, likes = excluded.likes, comments = excluded.comments,
            shares = excluded.shares, reactions = excluded.reactions, subscribers = excluded.subscribers,
-           on_board = excluded.on_board`,
+           subscribers_reason = excluded.subscribers_reason, on_board = excluded.on_board`,
       )
-      .run(articleId, checkpoint, Date.now(), s.views ?? null, s.likes ?? null, s.comments ?? null, s.shares ?? null, s.reactions ?? null, s.subscribers ?? null, s.onBoard ? 1 : 0);
+      .run(articleId, checkpoint, Date.now(), s.views ?? null, s.likes ?? null, s.comments ?? null, s.shares ?? null, s.reactions ?? null,
+        s.subscribers ?? null, s.subscribers == null ? (s.subscribersReason ?? 'field_missing') : null, s.onBoard ? 1 : 0);
   }
 
   studioObservations(articleId: number): (StudioStatSample & { checkpoint: number; at: number; on_board: number })[] {
     return this.db
-      .prepare('SELECT checkpoint, at, views, likes, comments, shares, reactions, subscribers, on_board FROM studio_observations WHERE article_id = ? ORDER BY checkpoint')
+      .prepare('SELECT checkpoint, at, views, likes, comments, shares, reactions, subscribers, subscribers_reason AS subscribersReason, on_board FROM studio_observations WHERE article_id = ? ORDER BY checkpoint')
       .all(articleId) as (StudioStatSample & { checkpoint: number; at: number; on_board: number })[];
   }
 
@@ -1881,6 +1890,8 @@ export interface StudioStatSample {
   shares: number | null;
   reactions: number | null;
   subscribers: number | null;
+  /** Why subscribers is NULL: 'field_missing' | 'parse_fail'. Null when the value was read. */
+  subscribersReason?: string | null;
 }
 
 /** What the list view adds on top of a post row: attribution and the latest reading. */
