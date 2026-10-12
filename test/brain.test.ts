@@ -446,6 +446,10 @@ test('only the active experiments get arms, and a hypothesis keeps its arm when 
     assert.deepEqual(Object.keys(some).sort(), ['h_chart', 'h_column']);
     assert.equal(some.h_chart, all.h_chart, 'narrowing the set must not reshuffle who gets which arm');
     assert.deepEqual(Object.keys(planArms({ seed: 777, verdicts, exclude: ['h_column'] })).includes('h_column'), false);
-    assert.deepEqual(settingsFrom(store).activeExperiments, ['h_column', 'h_chart', 'h_hour_band']);
+    // The default must name only hypotheses the sampler can draw, in a lane that draws them:
+    // `h_hour_band` sat here for a while and produced no arm, because it is registered `observed`,
+    // and `h_column_polish` is drawn by `column.ts` but excluded by both pipeline lanes. The
+    // invariant test in rank.test.ts is what stops the list and the registry drifting apart.
+    assert.deepEqual(settingsFrom(store).activeExperiments, ['h_column', 'h_column_polish', 'h_chart']);
   } finally { close(); }
 });

@@ -4,8 +4,10 @@ import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { Store } from '../src/db/index.ts';
+import { DEFAULT_SETTINGS } from '../src/config.ts';
 import { observeDistribution } from '../src/rank/observations.ts';
 import { scoreAll, revokeStaleRules } from '../src/rank/score.ts';
+import { registry } from '../src/rank/registry.ts';
 import { planArms, recordArms } from '../src/rank/experiments.ts';
 import { playbook } from '../src/rank/playbook.ts';
 import { HYPOTHESES } from '../src/rank/hypotheses.ts';
@@ -385,7 +387,7 @@ test('reflection does not overwrite the rule scoreAll just wrote with a dumber s
   }
 });
 
-test('a target metric that is zero everywhere falls back to views instead of declaring «no difference»', () => {
+test('the panel target cannot rewrite what a hypothesis is judged by', () => {
   const { store, close } = tempStore();
   try {
     const now = Date.now();
@@ -394,22 +396,50 @@ test('a target metric that is zero everywhere falls back to views instead of dec
       post(store, { views: [100, 100, 100, 100, 100], at: now - 30 * 3600_000 - i * 1000, arms: { h_chart: i % 2 ? 'chart' : 'text' }, heat: i % 4 < 2 ? 92 : 60, category: i % 8 < 4 ? 'funding' : 'onchain' });
     }
     observeDistribution(store);
-    const v = scoreAll(store, { writeMemory: true, target: 'engagement' }).find(x => x.id === 'h_chart')!;
-    assert.equal(v.metric, 'views24h', 'no likes or comments anywhere: quality cannot rank, views can');
-    assert.match(v.note ?? '', /都是 0/);
+    // h_chart is registered on views24h. Switching the target to «engagement» used to rewrite the
+    // metric of every randomised arm under it and judge the comparison on zeros; now the metric is a
+    // property of the hypothesis and changing it means registering a new one.
+    const chart = scoreAll(store, { writeMemory: false, target: 'engagement' }).find(x => x.id === 'h_chart')!;
+    assert.equal(chart.metric, 'views24h', 'the metric is bound to the hypothesis, not to the target');
+    assert.equal(chart.arms.find(a => a.arm === 'chart')!.median, 100);
+
+    // A count metric that has never moved is «not started», not «tested and equal». It must not be
+    // silently re-judged on views either — that was how a wrong lesson got written with a right-
+    // looking number on it.
+    const m = HYPOTHESES.find(h => h.id === 'h_follow_cta')!.minSamples;
+    for (let i = 0; i < m * 2; i++) {
+      post(store, { views: [100, 100, 100, 100, 100], at: now - 30 * 3600_000 - i * 1000, arms: { h_follow_cta: i % 2 ? 'follow' : 'none' }, heat: i % 4 < 2 ? 92 : 60, category: i % 8 < 4 ? 'funding' : 'onchain' });
+    }
+    observeDistribution(store);
+    const cta = scoreAll(store, { writeMemory: true, target: 'engagement' }).find(x => x.id === 'h_follow_cta')!;
+    assert.equal(cta.metric, 'engagementPer1k');
+    assert.equal(cta.status, 'observing', 'a metric that has not moved cannot be called flat');
+    assert.match(cta.note ?? '', /指标还没启动/);
+    // h_chart is judged on views and has 22 real readings behind it, so its lesson is legitimate
+    // evidence and lands in memory; the one thing that must never land is the unmoved metric.
+    assert.deepEqual(store.activeMemory('rank-rule').map(x => x.key).filter(k => k.endsWith('h_follow_cta')), [],
+      'no lesson may be written from an unmoved metric');
   } finally {
     close();
   }
 });
 
-test('flat lessons written from all-zero arms are revoked', () => {
+test('flat lessons written from arms that barely moved are revoked', () => {
   const { store, close } = tempStore();
   try {
     remember(store, { kind: 'rank-rule', key: 'rank:h_follow_cta', text: '结尾求关注 —— 测过了，差别不大：none 0.00（11 条），follow 0.00（11 条）。不值得为它改写法。', source: 'rank-score', confidence: 0.6, evidenceN: 22 });
     remember(store, { kind: 'rank-rule', key: 'rank:h_real', text: '某假设 —— 测过了，差别不大：a 96（10 条），b 101（10 条）。不值得为它改写法。', source: 'rank-score', confidence: 0.6, evidenceN: 20 });
+    // The production shape that defeated the old all-zero check: one like on one post, every other
+    // arm a genuine zero. A share floor catches it; a boolean could not.
+    remember(store, { kind: 'rank-rule', key: 'rank:h_chart', text: '带自绘 K 线图的帖子比纯文字拿到更多分发 —— 测过了，差别不大：chart 34.48（1 条），text 0.00（13 条）。不值得为它改写法。', source: 'rank-score', confidence: 0.6, evidenceN: 14 });
     const revoked = revokeStaleRules(store, []);
-    assert.deepEqual(revoked, ['h_follow_cta']);
+    assert.deepEqual(revoked.sort(), ['h_chart', 'h_follow_cta']);
     assert.deepEqual(store.activeMemory('rank-rule').map(m => m.key), ['rank:h_real']);
+    // One voice for «not started»: the reason written to the ledger is the same sentence the verdict
+    // ladder shows, and it counts rows, not arms — one post that moved out of fourteen is 7%, which
+    // is below the floor even though half the arms are non-zero.
+    const why = store.db.prepare("SELECT text FROM brain_memory WHERE kind='rank-rule' AND status='rejected' AND key='rank:h_chart'").get() as { text: string };
+    assert.match(why.text, /指标还没启动：14 个读数里只有 1 个非零，低于 20% 地板/);
   } finally {
     close();
   }
@@ -478,44 +508,76 @@ test('a post the stats sweep has not read yet does not vote as zero engagement',
   }
 });
 
-test('the engagement target ranks by what readers spent, not by how many saw it', () => {
-  // Same reach in both arms; one arm earns comments and shares. A views target cannot tell them
-  // apart, which is exactly why it cannot answer «do people want to follow this account».
+test('what a comparison is judged by is decided by the hypothesis, not by the target switch', () => {
+  // Same reach in both arms; one arm earns comments and shares. The arm that readers actually spent
+  // something on can only be told apart by a hypothesis registered on an engagement metric — and
+  // flipping the panel target may no longer retro-fit that metric onto some other comparison.
   const { store, close } = tempStore();
   try {
     const now = Date.now();
     const day = 24 * 3600_000;
     for (let i = 0; i < 14; i++) {
       const at = now - (3 + i) * day / 2;
+      post(store, { views: [60, 150, 200, 250, 300], at, arms: { h_opening: 'statement' }, eng: { likes: 1, comments: 0, shares: 0 } });
+      post(store, { views: [60, 150, 200, 250, 300], at, arms: { h_opening: 'question' }, eng: { likes: 1, comments: 2, shares: 1 } });
       post(store, { views: [60, 150, 200, 250, 300], at, arms: { h_stance: 'none' }, eng: { likes: 1, comments: 0, shares: 0 } });
       post(store, { views: [60, 150, 200, 250, 300], at, arms: { h_stance: 'read' }, eng: { likes: 1, comments: 2, shares: 1 } });
     }
     observeDistribution(store);
-    const stance = (target: 'views' | 'engagement') => scoreAll(store, { writeMemory: false, target }).find(v => v.id === 'h_stance')!;
 
-    const byViews = stance('views');
-    assert.equal(byViews.arms.find(a => a.arm === 'read')!.median, byViews.arms.find(a => a.arm === 'none')!.median, 'identical reach');
+    // h_opening is registered on engagementPer1k: it separates the arms, whichever target is set.
+    const opener = (target: 'views' | 'engagement') => scoreAll(store, { writeMemory: false, target }).find(v => v.id === 'h_opening')!;
+    for (const target of ['views', 'engagement'] as const) {
+      const v = opener(target);
+      assert.equal(v.metric, 'engagementPer1k', `target=${target} must not rewrite the registered metric`);
+      // At the 24h reading (300 views): (1+2+1)/300*1000 = 13.3  vs  1/300*1000 = 3.3
+      assert.equal(Math.round(v.arms.find(a => a.arm === 'question')!.median!), 13);
+      assert.equal(Math.round(v.arms.find(a => a.arm === 'statement')!.median!), 3);
+    }
+    assert.equal(opener('engagement').winner, opener('views').winner, 'same winner, because same metric');
 
-    const byQuality = stance('engagement');
-    assert.equal(byQuality.metric, 'qualityPer1k');
-    const read = byQuality.arms.find(a => a.arm === 'read')!.median!;
-    const none = byQuality.arms.find(a => a.arm === 'none')!.median!;
-    // Read at the 24h checkpoint (300 views): (1 + 3*2 + 4*1) / 300 * 1000 = 36.7  vs  1 / 300 * 1000 = 3.3
-    assert.equal(Math.round(read), 37);
-    assert.equal(Math.round(none), 3);
-    assert.equal(byQuality.winner, 'read');
+    // h_stance stays on views24h, where both arms have identical reach and nothing is claimed.
+    const stance = scoreAll(store, { writeMemory: false, target: 'engagement' }).find(v => v.id === 'h_stance')!;
+    assert.equal(stance.metric, 'views24h');
+    assert.equal(stance.arms.find(a => a.arm === 'read')!.median, stance.arms.find(a => a.arm === 'none')!.median, 'identical reach');
   } finally { close(); }
 });
 
-test('the quality metric treats an unread counter as unknown, never as zero', () => {
+test('a count metric treats an unread counter as unknown, never as zero', () => {
   const { store, close } = tempStore();
   try {
     const now = Date.now();
-    const id = post(store, { views: [60, 150, 200, 250, 300], at: now - 2 * 24 * 3600_000, arms: { h_stance: 'read' } });
+    // h_opening is judged on engagementPer1k, a metric whose honest reading before the sweep really is
+    // «nothing known». A post with views but NULL counters must be excluded, not scored as 0 per 1k.
+    const id = post(store, { views: [60, 150, 200, 250, 300], at: now - 2 * 24 * 3600_000, arms: { h_opening: 'question' } });
     store.db.prepare('UPDATE post_stat_checks SET likes = NULL, comments = NULL, shares = NULL WHERE post_id = ?').run(id);
     store.db.prepare('UPDATE post_stats SET likes = NULL, comments = NULL, shares = NULL WHERE post_id = ?').run(id);
     observeDistribution(store);
-    const v = scoreAll(store, { writeMemory: false, target: 'engagement' }).find(x => x.id === 'h_stance')!;
-    assert.equal(v.arms.find(a => a.arm === 'read')!.n, 0);
+    const v = scoreAll(store, { writeMemory: false }).find(x => x.id === 'h_opening')!;
+    assert.equal(v.metric, 'engagementPer1k');
+    assert.equal(v.arms.find(a => a.arm === 'question')!.n, 0);
+  } finally { close(); }
+});
+
+test('every name in activeExperiments is an experiment the registry can actually draw', () => {
+  // The panel reads this list to say which comparisons are spending real posts. An id in it that
+  // the registry does not hold as a drawable experiment is not inert: it makes the panel claim
+  // coverage that does not exist, and the named hypothesis accumulates nothing forever. This is the
+  // invariant that `h_hour_band` (registered `observed`, so never drawn) broke in the baseline.
+  const { store, close } = tempStore();
+  try {
+    const list = registry(store);
+    const known = new Map(list.map(h => [h.id, h]));
+    const active = DEFAULT_SETTINGS.activeExperiments!;
+    assert.ok(active.length > 0, 'the default must run something');
+    for (const id of active) {
+      const h = known.get(id);
+      assert.ok(h, `${id} is named in activeExperiments but is not in the registry`);
+      assert.equal(h!.mode, 'experiment', `${id} is ${h!.mode}: planArms skips it, so it can never draw an arm`);
+    }
+    // Named and drawable are the same claim, so a draw with no lane exclusions must reach every one.
+    const verdicts = scoreAll(store, { writeMemory: false });
+    const plan = planArms({ seed: 4242, verdicts, only: active });
+    assert.deepEqual(Object.keys(plan).sort(), [...active].sort(), 'a name in the list that draws no arm is a lie on the panel');
   } finally { close(); }
 });

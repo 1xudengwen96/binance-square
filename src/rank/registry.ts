@@ -43,12 +43,38 @@ const toHypothesis = (r: HypoRow): Hypothesis => ({
   metric: r.metric, minSamples: r.min_samples, how: r.how, risk: r.risk,
 });
 
-/** Everything the engine is currently willing to test. */
+/**
+ * Seed the curated list into the registry table the first time it is read.
+ *
+ * Before this the built-ins lived in source and the proposals lived in the table, so «what are we
+ * testing, judged by what» had two answers: one that needed a code deploy to change and one that
+ * didn't. A verdict written against one copy and audited against the other is exactly the class of
+ * bug this round produced twice. Seeding happens once, when the table is empty.
+ */
+export function seedRegistry(store: Store, now = Date.now()): number {
+  const existing = (store.db.prepare('SELECT COUNT(*) AS n FROM hypotheses').get() as { n: number }).n;
+  if (existing > 0) return 0;
+  const ins = store.db.prepare(
+    `INSERT INTO hypotheses (id, claim, mode, dimension, metric, min_samples, how, risk, origin, status, created_at)
+     VALUES (?,?,?,?,?,?,?,?,?,?,?)
+     ON CONFLICT(id) DO NOTHING`,
+  );
+  for (const h of HYPOTHESES) {
+    ins.run(h.id, h.claim, h.mode, h.dimension, h.metric, h.minSamples, h.how, h.risk, 'builtin', 'active', now);
+  }
+  return HYPOTHESES.length;
+}
+
+/** Everything the engine is currently willing to test — the registry table is the only source. */
 export function registry(store: Store): Hypothesis[] {
+  seedRegistry(store);
+  // `rowid` is the insertion order: the curated list is seeded in source order, and anything
+  // registered later lands after it. Sorting by id would alphabetise the registry and reorder it
+  // under whoever is reading it.
   const rows = store.db
-    .prepare("SELECT * FROM hypotheses WHERE status = 'active' ORDER BY created_at, id")
+    .prepare("SELECT * FROM hypotheses WHERE status = 'active' ORDER BY created_at, rowid")
     .all() as HypoRow[];
-  return [...HYPOTHESES, ...rows.map(toHypothesis)];
+  return rows.map(toHypothesis);
 }
 
 /** Proposal rows, for the panel, with the sentence that would run if approved. */
@@ -165,15 +191,14 @@ export function retire(store: Store, id: string, reason: string, now = Date.now(
  * Retire a registered comparison that cannot get off the ground.
  *
  * A stalled hypothesis is not neutral: it keeps its share of the exploration budget, so the
- * hypotheses that *could* be measured get sampled more slowly. Every row in this table is a
- * candidate regardless of who proposed it — starving is the criterion, and it applies the same
- * way either way. The curated built-ins are protected by not living in this table at all, and the
- * count is still reported, because a registry where four of seven rows are starved is information
- * about the registry.
+ * hypotheses that *could* be measured get sampled more slowly. The curated built-ins are protected
+ * from auto-retirement — they now live in this table too, so the protection has to be explicit — and
+ * the count is still reported, because a registry where four of seven rows are starved is information
+ * about the registry. A built-in is retired only by an operator decision (`retire`), never by a clock.
  */
 export function retireStalled(store: Store, verdicts: Verdict[], now = Date.now()): string[] {
   const rows = store.db
-    .prepare("SELECT id, claim, created_at FROM hypotheses WHERE status = 'active'")
+    .prepare("SELECT id, claim, created_at FROM hypotheses WHERE status = 'active' AND origin <> 'builtin'")
     .all() as { id: string; claim: string; created_at: number }[];
   const retired: string[] = [];
   for (const r of rows) {

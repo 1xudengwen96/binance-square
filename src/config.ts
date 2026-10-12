@@ -134,6 +134,13 @@ export interface Settings {
    * else stays registered and is still read off what happened, but gets no traffic: at this
    * volume ten parallel experiments each had a handful of posts and could conclude nothing.
    * null means «all registered», which is the behaviour before this setting existed.
+   *
+   * Every name here must be a row in the `hypotheses` table with `mode='experiment'` and
+   * `status='active'` — the registry is the only truth about what can be sampled. `planArms` skips
+   * anything that is not an experiment, so a list that names one (as this default did, with
+   * `h_hour_band`) is not inert-but-harmless: the panel reads this list to say «正在分配流量的实验»,
+   * and an id in it that cannot draw is a lie on the panel and a hypothesis that quietly never
+   * accumulates. The invariant is asserted in `test/rank.test.ts` so the two cannot drift apart.
    */
   activeExperiments: string[] | null;
   /**
@@ -239,6 +246,10 @@ export const DEFAULT_SETTINGS: Settings = {
   brainTemperature: 0.2,
   brainWakeCapPerDay: 2,
   breakerEnabled: true,
-  activeExperiments: ['h_column', 'h_column_polish', 'h_chart', 'h_hour_band'],
+  // Three, in the lanes that can actually run them: the column shape and its AI-polish arm are
+  // drawn by `column.ts`; `h_chart` is drawn everywhere except the column lane. `h_hour_band` used
+  // to sit here and drew nothing — it is an `observed` hypothesis, so its arms come out of the clock,
+  // not out of a random draw, and no post can ever be assigned to it.
+  activeExperiments: ['h_column', 'h_column_polish', 'h_chart'],
   alertWebhook: '',
 };
