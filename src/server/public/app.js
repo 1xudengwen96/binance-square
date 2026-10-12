@@ -34,6 +34,7 @@ const ICON = {
   materials: '<path d="M4 6h16M4 12h16M4 18h10"/>',
   templates: '<path d="M4 4h7v7H4zM13 4h7v4h-7zM13 11h7v9h-7zM4 14h7v6H4z"/>',
   queue: '<path d="M4 6h16M4 12h16M4 18h16M20 6H8M20 12H9M20 18H8"/>',
+  ops: '<path d="M12 3a9 9 0 109 9"/><path d="M12 8v4l3 2"/><path d="M19 3v5h5"/>',
   accounts: '<path d="M16 20v-1a4 4 0 00-4-4H7a4 4 0 00-4 4v1M9.5 11a3.5 3.5 0 100-7 3.5 3.5 0 000 7zM21 20v-1a4 4 0 00-3-3.9M16 4.1a4 4 0 010 7.8"/>',
   studio: '<path d="M4 19.5V6a2 2 0 012-2h12v16H6a2 2 0 00-2 2 2 2 0 002-2h12"/>',
   settings: '<path d="M4 6h16M4 12h16M4 18h16M9 4v4M15 10v4M7 16v4"/>',
@@ -49,6 +50,7 @@ const ICON = {
 const NAV = [
   ['总览', [
     ['overview', '概览', '现在的状态、今天发了什么、下一步会发生什么', ICON.overview],
+    ['ops', '运行台', '能不能发、有没有在发、什么挡住了 —— 每条状态自带最后正常时间', ICON.ops],
     ['board', '数据板', '发帖时间、节奏、账号分工与效果的图形视图', ICON.board],
     ['rank', '流量引擎', '用实验去问币安的推荐系统要什么样的内容', ICON.rank],
     ['insights', '效果分析', '哪类内容更吸引人，需要样本量才成立', ICON.insights],
@@ -79,6 +81,7 @@ function navCount(id) {
   if (id === 'queue') return STATE.pending || 0;
   if (id === 'accounts') return (STATE.accounts || []).filter(a => a.enabled).length || 0;
   if (id === 'templates') return STATE.templateCount || 0;
+  if (id === 'ops') return OPS_LAST ? OPS_LAST.live.filter(a => sevRank(a.severity) >= 1).length : 0;
   if (id === 'overview') return s.autoRun ? 0 : 0;
   return 0;
 }
@@ -148,10 +151,12 @@ async function render() {
   captureLlmForm();
   STATE = await api('/api/status');
   renderChrome();
+  opsRefresh(STATE);
   renderNav();
   $('#pubBtn').textContent = STATE.hasKey ? '发布（需确认）' : '演练发布';
   const el = $('#main');
   if (TAB === 'overview') el.innerHTML = await overview();
+  else if (TAB === 'ops') el.innerHTML = await opsView();
   else if (TAB === 'board') el.innerHTML = await boardView();
   else if (TAB === 'rank') el.innerHTML = await rankView();
   else if (TAB === 'accounts') el.innerHTML = await accountsView();
@@ -2007,6 +2012,208 @@ async function publish() {
   } catch (e) { toast('发布失败：' + e.message, true); }
 }
 
+/* --------------------------------------------------------------- 运行台 --- */
+
+/**
+ * 状态词汇只有一套：shared/告警总线契约v1.md（后端定版）。这一层不另造等级名，也不把
+ * 「总线给的」和「面板现在自己算的」混成同一栏 —— 总线还没上线，界面必须说清每条读数的出处，
+ * 否则面板绿了而没人知道它在读什么。
+ *
+ * 面板自算的项目只覆盖 /api/status 已有的事实；要靠服务端算的（应发 vs 实发的差、回执不符、
+ * 缺图、放大被挡）在这里显式列成「还没接上」，不假装通过。
+ */
+const SEVERITY = ['info', 'warning', 'fault', 'breach'];
+const sevRank = s => { const i = SEVERITY.indexOf(s); return i < 0 ? 0 : i; };
+/** 契约 §4：带因由码的「没发」是计划内空档，没码的「没发」才是故障。 */
+const PLANNED_CODES = new Set(['no_material', 'quota_spent', 'breaker_on', 'human_pause']);
+/** 契约 §2 的 13 个 kind。不在表内的面板项进「未归类」，不冒充契约项。 */
+const CONTRACT_KINDS = new Set(['collect_gap', 'collect_gap_clear', 'publish_stall_warning', 'publish_stall_fault',
+  'publish_stall_breach', 'expected_gap', 'account_pool_empty', 'breaker_tripped', 'receipt_mismatch',
+  'degrade_declared', 'image_missing', 'font_subset_missing', 'surge_blocked']);
+const HOUR = 3600_000;
+
+const KIND_CN = {
+  collect_gap: '长文观察读不到', collect_gap_clear: '观察空洞已恢复',
+  publish_stall_warning: '停发预警（5h）', publish_stall_fault: '停发故障（12h）', publish_stall_breach: 'R2 违约（24h）',
+  expected_gap: '应发与实发有差', account_pool_empty: '可发布账号集合为空', breaker_tripped: '熔断触发',
+  receipt_mismatch: '回执与声明不符', degrade_declared: '发布前显式降级', image_missing: '广场侧无图',
+  font_subset_missing: 'CJK 子集缺失', surge_blocked: '放大未入队',
+};
+const CODE_CN = { no_material: '素材荒（供给不足）', quota_spent: '配额用尽', breaker_on: '熔断中', human_pause: '人为暂停' };
+/** 契约里靠服务端产出、面板此刻读不到的那些 —— 明写出来，别让它沉默地变成绿色。 */
+const NOT_WIRED_YET = ['publish_stall_warning', 'publish_stall_fault', 'publish_stall_breach', 'receipt_mismatch',
+  'image_missing', 'degrade_declared', 'surge_blocked', 'collect_gap', 'font_subset_missing'];
+
+const envelope = (kind, severity, key, detail, o = {}) => ({
+  kind, severity, key, detail, firstAt: null, lastAt: null, count: 1, ageHours: null,
+  reasonCode: null, samplesInWindow: null, acked: false, source: 'panel', ...o,
+});
+
+/** 契约 §3 的去重与升档：同类按 kind+key 合并，severity 单调升，acked 由总线说了算。 */
+function mergeAlerts(items) {
+  const by = new Map();
+  for (const it of items) {
+    const id = `${it.kind}|${it.key}`;
+    const prev = by.get(id);
+    if (!prev) { by.set(id, { ...it }); continue; }
+    if (sevRank(it.severity) > sevRank(prev.severity)) prev.severity = it.severity;
+    prev.count = (prev.count || 1) + (it.count || 1);
+    prev.lastAt = Math.max(prev.lastAt || 0, it.lastAt || 0) || null;
+    prev.firstAt = prev.firstAt || it.firstAt || null;
+    if (it.detail) prev.detail = it.detail;
+    if (it.reasonCode) prev.reasonCode = it.reasonCode;
+    if (it.source === 'bus') prev.source = 'bus';
+  }
+  return [...by.values()];
+}
+
+/** 把 /api/status 变成契约信封。纯函数：不碰 DOM，可单测。 */
+function opsState(state, now = Date.now()) {
+  const s = state.settings || {};
+  const accounts = state.accounts || [];
+  const enabled = accounts.filter(a => a.enabled);
+  const matrixPool = enabled.filter(a => !a.trackId);
+  const tick = state.loop && state.loop.lastTick ? state.loop.lastTick : null;
+  const out = [];
+
+  for (const a of (state.alerts || [])) out.push({ ...a, source: 'bus', acked: Boolean(a.acked) });
+
+  if (state.pause && state.pause.paused) {
+    out.push(envelope('expected_gap', 'info', 'pause', `已暂停：${state.pause.reason || '原因未记录'}`, { reasonCode: 'human_pause', firstAt: state.pause.at || null }));
+  } else if (!enabled.length) {
+    out.push(envelope('account_pool_empty', 'fault', 'enabled',
+      '一个启用中的账号都没有。面板读不到审计事件，分不清这是人为停用还是故障 —— 有因由码才算计划内，所以这里按故障记。'));
+  } else if (!matrixPool.length) {
+    out.push(envelope('account_pool_empty', 'fault', 'matrix',
+      `短帖通路没有可用账号：${enabled.length} 个启用号全被长文工作室占用。这正是上一轮「启用了号还是发不出」的形态。`));
+  }
+  if (state.hasKey === false) out.push(envelope('square_key_missing', 'warning', 'square', '没有广场 Key —— 现在只能演练，发不出去。'));
+  if (s.autoRun === false) out.push(envelope('auto_run_off', 'warning', 'loop', '自动循环关着，系统不会自己发任何东西。'));
+  if (!tick) {
+    out.push(envelope('tick_never_ran', 'warning', 'loop', '这个进程还没跑过任何一轮 tick。'));
+  } else {
+    const ageHours = tick.at ? (now - tick.at) / HOUR : null;
+    if (ageHours != null && ageHours > 2) out.push(envelope('tick_stale', 'warning', 'loop', `最后一轮 tick 是 ${ageHours.toFixed(1)} 小时前。`));
+    if (tick.failed > 0) out.push(envelope('tick_reports_failure', 'warning', 'loop', `上一轮记了 ${tick.failed} 次失败（不等于丢帖，但一定有事）。`));
+  }
+  if (state.orphanPending > 0) out.push(envelope('orphan_posts', 'warning', 'queue', `${state.orphanPending} 条草稿/已通过没有归属账号，没有号会去发它们。`));
+  if (state.unused === 0) out.push(envelope('expected_gap', 'info', 'supply', '素材池没有够格的新素材 —— 这是供给不足，不是停发。', { reasonCode: 'no_material' }));
+  if (s.dailyCap && (state.publishedToday || 0) >= s.dailyCap) {
+    out.push(envelope('expected_gap', 'info', 'quota', `今日 ${state.publishedToday}/${s.dailyCap} 已用满。`, { reasonCode: 'quota_spent' }));
+  }
+
+  const all = mergeAlerts(out);
+  const isPlanned = a => a.reasonCode && PLANNED_CODES.has(a.reasonCode);
+  const live = all.filter(a => !a.acked && !isPlanned(a));
+  const worst = live.reduce((w, a) => (sevRank(a.severity) > sevRank(w) ? a.severity : w), 'info');
+  return { all, live, planned: all.filter(isPlanned), worst };
+}
+
+/* --------------------------------------- 可达性三件套：灯 · 图标 · 系统通知 --- */
+
+const LIGHT = { breach: ['■', '#e5484d'], fault: ['■', '#e5484d'], warning: ['▲', '#f5a524'], info: ['●', '#22c55e'] };
+
+/** 浏览器标签页标题灯：不打开运行台也能从任务栏看见。 */
+function paintOpsTitle(res) {
+  const [mark] = LIGHT[res.worst] || LIGHT.info;
+  const top = res.live.slice().sort((a, b) => sevRank(b.severity) - sevRank(a.severity))[0];
+  const tail = res.worst === 'info' ? '正常' : `${KIND_CN[top.kind] || top.kind}${top.count > 1 ? ` ×${top.count}` : ''}`;
+  document.title = `${mark} ${tail} · squareforge`;
+}
+
+function paintOpsFavicon(color) {
+  const svg = `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 32 32"><circle cx="16" cy="16" r="13" fill="${color}"/>`
+    + '<circle cx="16" cy="16" r="6" fill="#0b0d12"/></svg>';
+  let link = document.querySelector('link[rel="icon"]');
+  if (!link) { link = document.createElement('link'); link.rel = 'icon'; document.head.appendChild(link); }
+  link.type = 'image/svg+xml';
+  link.href = 'data:image/svg+xml,' + encodeURIComponent(svg);
+}
+
+/**
+ * 系统通知：同类按 kind+key 计，20 小时内不重复（沿用测试线「同类警报 20h 不重复」的节流口径），
+ * 只在 fault / breach 上发 —— 预警洪水会让人关掉权限，那等于没有告警。
+ */
+function opsNotify(res, now = Date.now()) {
+  if (typeof Notification === 'undefined' || Notification.permission !== 'granted') return [];
+  const fired = [];
+  for (const a of res.live) {
+    if (sevRank(a.severity) < 2) continue;
+    const id = `sf-notify-${a.kind}-${a.key}`;
+    let last = 0;
+    try { last = Number(localStorage.getItem(id) || 0); } catch (_) { last = 0; }
+    if (now - last < 20 * HOUR) continue;
+    try { localStorage.setItem(id, String(now)); } catch (_) { /* 存不下也要通知出去 */ }
+    new Notification(`${KIND_CN[a.kind] || a.kind} · squareforge`, { body: a.detail, tag: id });
+    fired.push(a);
+  }
+  return fired;
+}
+
+function opsRefresh(state) {
+  const res = opsState(state);
+  const [, color] = LIGHT[res.worst] || LIGHT.info;
+  paintOpsTitle(res);
+  paintOpsFavicon(color);
+  opsNotify(res);
+  OPS_LAST = res;
+  return res;
+}
+let OPS_LAST = null;
+
+async function opsAskPermission() {
+  if (typeof Notification === 'undefined') return toast('这个浏览器没有 Notification API', true);
+  const r = await Notification.requestPermission();
+  toast(r === 'granted' ? '系统通知已开启：故障与违约会直接弹到桌面' : `通知权限：${r} —— 没给也不影响，标题灯和图标照常`);
+  await render();
+}
+
+async function opsView() {
+  const res = OPS_LAST || opsState(STATE);
+  const [mark, color] = LIGHT[res.worst] || LIGHT.info;
+  const sort = (a, b) => sevRank(b.severity) - sevRank(a.severity) || (b.lastAt || 0) - (a.lastAt || 0);
+  const row = a => `<tr>
+      <td><span class="pill ${a.severity === 'breach' || a.severity === 'fault' ? 'bad' : a.severity === 'warning' ? 'warn' : 'plain'}">${esc(KIND_CN[a.kind] || a.kind)}</span>${a.reasonCode ? `<span class="tag">${esc(CODE_CN[a.reasonCode] || a.reasonCode)}</span>` : ''}</td>
+      <td class="muted">${esc(a.severity)}</td>
+      <td class="muted">${a.source === 'bus' ? '总线' : '面板自算'}</td>
+      <td>${esc(a.detail || '—')}</td>
+      <td class="num">${a.count > 1 ? `×${a.count}` : ''}</td>
+      <td class="muted">${esc(a.key)}</td>
+      <td class="num">${a.firstAt ? fmtTs(a.firstAt) : '—'}</td>
+      <td class="num">${a.lastAt ? ago(a.lastAt) : '—'}</td>
+      <td class="num">${a.acked ? '已确认' : '—'}</td>
+    </tr>`;
+  const live = res.live.slice().sort(sort);
+  const ackedRows = res.all.filter(a => a.acked);
+  const planned = res.planned.slice().sort(sort);
+  let legacy = [];
+  try { const b = await api('/api/brain'); legacy = (b.alarms || []).filter(x => x.code !== 'outlier_good' && x.code !== 'gate_a_cleared'); } catch (_) { legacy = []; }
+  const notWired = NOT_WIRED_YET.map(k => `<span class="tag">${esc(KIND_CN[k])}</span>`).join(' ');
+
+  return `<div class="card">
+    <div class="card-hd"><h3>运行台</h3><span class="sub">每条状态自带出处 —— 面板自己算的，和总线给的，不混成一栏</span></div>
+    <div class="row" style="margin-top:6px">
+      <span class="pill ${res.worst === 'info' ? 'on' : sevRank(res.worst) >= 2 ? 'bad' : 'warn'}">${mark} 当前最高等级：${esc(res.worst)}</span>
+      <span class="muted">灯与图标每 20 秒刷新一次；系统通知：${typeof Notification === 'undefined' ? '浏览器不支持' : esc(Notification.permission)}</span>
+      <button class="btn sm" onclick="opsAskPermission()">${typeof Notification !== 'undefined' && Notification.permission === 'granted' ? '已开启系统通知' : '开启系统通知'}</button>
+    </div>
+    <div class="hint">这里的规则来自告警总线契约：带因由码的「没发」算计划内空档，<b>没码的「没发」本身就是故障</b>。同类告警按 kind+key 合并、等级只升不降，确认后同类 24 小时静默。</div>
+    <div class="tw" style="margin-top:12px"><table><thead><tr><th>状态</th><th>等级</th><th>出处</th><th>说明</th><th class="num">次数</th><th>键</th><th class="num">首次</th><th class="num">最近</th><th class="num">确认</th></tr></thead>
+      <tbody>${live.length ? live.map(row).join('') : '<tr><td colspan="9"><div class="empty"><b>没有未确认的故障或预警</b><span>这只说明面板能看见的那几项正常，不代表总线那几项已通过 —— 看下面那张「还没接上」的表。</span></div></td></tr>'}</tbody></table></div>
+    <div class="sub" style="margin:14px 0 4px">计划内空档（有因由码，不算故障）</div>
+    <div class="tw"><table><tbody>${planned.length ? planned.map(row).join('') : '<tr><td class="muted">现在没有任何带因由码的空档。</td></tr>'}</tbody></table></div>
+    <div class="alert" style="margin-top:14px"><svg viewBox="0 0 24 24"><path d="M12 16v-4M12 8h.01"/><circle cx="12" cy="12" r="9"/></svg>
+      <div><b>这几项还没接上，界面无法代替它们变绿：</b>${notWired}。它们要等后端的期望驱动告警总线（应发 vs 实发、回执比对、缺图、降级、放大被挡）。总线一落到 <code>/api/status.alerts</code>，这一层换源、渲染不动。</div></div>
+    ${ackedRows.length ? `<div class="sub" style="margin:14px 0 4px">已确认（同类 24 小时内静默）</div><div class="tw"><table><tbody>${ackedRows.map(row).join('')}</tbody></table></div>` : ''}
+  </div>
+  <div class="card" style="margin-top:14px">
+    <div class="card-hd"><h3>旧告警码（brain_alarms）</h3><span class="sub">总线上线前还在写的这一批，读得到就一并摆出来，不假装是新的信封</span></div>
+    <div class="tw"><table><thead><tr><th class="num">时间</th><th>码</th><th>说明</th></tr></thead>
+      <tbody>${legacy.length ? legacy.map(a => `<tr><td class="num">${esc(fmtTs(a.at))}</td><td><span class="pill ${a.code === 'breaker' ? 'bad' : 'info'}">${esc(a.code)}</span></td><td>${esc(a.detail)}</td></tr>`).join('') : '<tr><td colspan="3" class="muted">最近 20 条里没有未消化的旧告警。</td></tr>'}</tbody></table></div>
+    <div class="hint">color 灯用的是契约等级：${color === '#e5484d' ? '红 = fault/breach' : color === '#f5a524' ? '黄 = warning' : '绿 = 一切正常'}。</div>
+  </div>`;
+}
+
 document.documentElement.dataset.theme = localStorage.getItem('sf-theme') || 'dark';
 {
   const fromHash = location.hash.replace('#', '');
@@ -2014,4 +2221,10 @@ document.documentElement.dataset.theme = localStorage.getItem('sf-theme') || 'da
 }
 renderNav();
 render();
-setInterval(() => { if (TAB === 'overview' || TAB === 'board' || TAB === 'queue') render(); }, 30000);
+setInterval(() => { if (TAB === 'overview' || TAB === 'board' || TAB === 'queue' || TAB === 'ops') render(); }, 30000);
+// 标题灯与图标必须独立于页面渲染：开着别的标签页也要能看见出事。
+setInterval(async () => {
+  try { STATE = await api('/api/status'); opsRefresh(STATE); } catch (_) { /* 拉不到状态：把灯打到最亮的那一档比假装正常诚实 */
+    document.title = '■ 面板读不到状态 · squareforge'; paintOpsFavicon('#e5484d');
+  }
+}, 20000);
