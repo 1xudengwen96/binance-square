@@ -45,6 +45,14 @@ export interface Settings {
    * on the coin-and-category. Three still lets a story develop over a day; it stops the pile-up.
    */
   symbolDailyCap: number;
+  /**
+   * Accounts on the fixed column lane post only that column (see src/column.ts). Off by default so
+   * existing installs keep their behaviour; the ceiling below is a maximum, not a target.
+   */
+  columnMode: boolean;
+  columnPostsPerDay: number;
+  /** Hours before the column may name the same coin again. A tunable knob (see rank/params.ts). */
+  columnCoinCooldownHours: number;
   /** Rows older than this are deleted outright; expiry is separate and much shorter. */
   dataRetentionDays: number;
   /** Chart PNGs are regenerable, so unreferenced ones go after this long. */
@@ -85,7 +93,13 @@ export interface Settings {
    * is a proxy; `money` uses the rebate figures the operator types in once a day, apportioned
    * across posts by views. Switching to `money` does nothing until at least one day is entered.
    */
-  targetMetric: 'views' | 'money';
+  targetMetric: 'views' | 'engagement' | 'money';
+  /**
+   * 'auto': the target follows the gates (views until gate A is cleared, then engagement).
+   * 'manual': `targetMetric` is used as set. Existing installs stay on manual so nothing flips
+   * under an operator who chose a target on purpose.
+   */
+  targetMode: 'auto' | 'manual';
 
   /* --- optional AI polish layer --- */
   llmEnabled: boolean;
@@ -96,6 +110,37 @@ export interface Settings {
   llmModel: string;
   llmMaxTokens: number;
   llmTemperature: number;
+
+  /* --- the algorithm brain (docs/算法大脑总方案.md) --- */
+  /** Use the connection above to polish post wording. Independent of the brain, so each can be switched off alone. */
+  llmPolish: boolean;
+  /** Model for the brain's jobs; empty means the same model as polish. Judging usually wants a stronger one. */
+  brainModel: string;
+  /** Which jobs the brain is allowed to be woken for. The daily reflection is the existing one. */
+  brainDaily: boolean;
+  brainSentinel: boolean;
+  brainWeekly: boolean;
+  /** Per-job output budgets (tokens) and sampling temperature; judging jobs want a low one. */
+  brainMaxTokensDaily: number;
+  brainMaxTokensSentinel: number;
+  brainMaxTokensWeekly: number;
+  brainTemperature: number;
+  /** Most times per day the sentinel may wake the brain, however many alarms fire. */
+  brainWakeCapPerDay: number;
+  /** Stop publishing when the last N posts' median views fall under the floor. */
+  breakerEnabled: boolean;
+  /**
+   * Hypotheses allowed to draw random arms, i.e. to spend real posts on a comparison. Everything
+   * else stays registered and is still read off what happened, but gets no traffic: at this
+   * volume ten parallel experiments each had a handful of posts and could conclude nothing.
+   * null means «all registered», which is the behaviour before this setting existed.
+   */
+  activeExperiments: string[] | null;
+  /**
+   * Optional https URL that receives every new sentinel alarm as JSON
+   * ({ text, code, detail, at }) — a Feishu/DingTalk/Slack-style robot. Empty means panel only.
+   */
+  alertWebhook: string;
 }
 
 export const ALL_CATEGORIES = [
@@ -129,6 +174,7 @@ export const STYLE_LABELS: Record<string, string> = {
 
 export const DEFAULT_SETTINGS: Settings = {
   targetMetric: 'views',
+  targetMode: 'manual',
   dailyCap: 12,
   postsPerDay: 8,
   minIntervalMinutes: 45,
@@ -145,6 +191,9 @@ export const DEFAULT_SETTINGS: Settings = {
   crossAccountCoinExclusionMinutes: 360,
   coinSignalCooldownMinutes: 720,
   symbolDailyCap: 3,
+  columnMode: false,
+  columnPostsPerDay: 4,
+  columnCoinCooldownHours: 24,
   dataRetentionDays: 14,
   chartRetentionHours: 72,
   autoRun: true,
@@ -179,4 +228,17 @@ export const DEFAULT_SETTINGS: Settings = {
   llmModel: '',
   llmMaxTokens: 1024,
   llmTemperature: 0.7,
+  llmPolish: true,
+  brainModel: '',
+  brainDaily: true,
+  brainSentinel: true,
+  brainWeekly: true,
+  brainMaxTokensDaily: 700,
+  brainMaxTokensSentinel: 1200,
+  brainMaxTokensWeekly: 2500,
+  brainTemperature: 0.2,
+  brainWakeCapPerDay: 2,
+  breakerEnabled: true,
+  activeExperiments: ['h_column', 'h_column_polish', 'h_chart', 'h_hour_band'],
+  alertWebhook: '',
 };

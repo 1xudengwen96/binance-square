@@ -26,6 +26,8 @@ export interface BuiltChart {
   changePct: number;
 }
 
+const BARS = 72;
+
 export type Interval = '1h' | '4h' | '1d';
 
 function signed(v: number, digits: number, suffix = '%'): string {
@@ -38,25 +40,34 @@ export async function buildChartFor(s: ChartSubject, outDir = 'data/charts', int
   if (!k || k.length < 4) k = await binance.klines(pair, interval as '1h' | '4h' | '1d', 74).catch(() => null);
   if (!k || k.length < 4) return null;
 
-  const closed = k.slice(0, -1); // drop the still-forming candle
+  // Drop the still-forming candle, then keep exactly the bars the renderer draws, so the header
+  // percentage is measured over the window the reader can see.
+  const closed = k.slice(0, -1).slice(-BARS);
   const first = Number(closed[0]![4]);
   const last = Number(closed[closed.length - 1]![4]);
   if (!first) return null;
   const changePct = ((last - first) / first) * 100;
 
+  // The header number covers the whole drawn window; the «24 小时» chip must be a real 24h figure
+  // or be left out. Falling back to the window change under a 24h label showed two different
+  // percentages for the same coin on one image.
+  const span = closed.length * (interval === '1h' ? 1 : interval === '4h' ? 4 : 24);
+  const changeLabel = span >= 48 && span % 24 === 0 ? `近${span / 24}天` : `近${span}小时`;
+
   const chips = [
-    `24h ${s.chg24h != null ? signed(s.chg24h, 2) : signed(changePct, 2)}`,
-    s.funding != null ? `Funding ${(s.funding * 100).toFixed(3)}%` : null,
-    s.oiChangePct != null ? `OI 24h ${signed(s.oiChangePct, 1)}` : null,
-    s.longRatio != null ? `L/S ${s.longRatio.toFixed(2)}` : null,
-    s.volMultiple != null ? `1h vol x${s.volMultiple.toFixed(1)}` : null,
+    s.chg24h != null ? `24 小时涨跌 ${signed(s.chg24h, 2)}` : null,
+    s.funding != null ? `资金费率 ${(s.funding * 100).toFixed(3)}%` : null,
+    s.oiChangePct != null ? `持仓量 24h ${signed(s.oiChangePct, 1)}` : null,
+    s.longRatio != null ? `多空账户比 ${s.longRatio.toFixed(2)}` : null,
+    s.volMultiple != null ? `1 小时成交 ${s.volMultiple.toFixed(1)} 倍` : null,
   ].filter(Boolean) as string[];
 
   const png = await renderKlinePng(closed, {
-    title: `${pair} Perp · ${interval.toUpperCase()}`,
-    subtitle: 'Binance Futures',
+    title: `${pair} 永续 · ${interval.toUpperCase()}`,
+    subtitle: '币安合约',
     lastPrice: last,
     changePct,
+    changeLabel,
     stats: { chips },
   });
 

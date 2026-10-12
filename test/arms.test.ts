@@ -35,7 +35,8 @@ test('a generated draft carries the arms it was written under', async () => {
   const dir = mkdtempSync(join(tmpdir(), 'sf-arms-'));
   const store = Store.open(join(dir, 't.db'));
   try {
-    const s = { ...ALWAYS_OPEN, autoPublish: true, dailyCap: 30, postsPerDay: 20 };
+    // null = every registered experiment, the behaviour before the active set existed.
+    const s = { ...ALWAYS_OPEN, autoPublish: true, dailyCap: 30, postsPerDay: 20, activeExperiments: null };
     for (const [i, sym] of SYMBOLS.entries()) fundingMaterial(store, sym, Date.now() - i * 1000);
     const r = await generate(store, s, 4);
     assert.ok(r.created.length > 0, `expected drafts, skipped: ${r.skipped.join(' | ')}`);
@@ -71,7 +72,7 @@ test('every recorded arm is one of the arms the hypothesis declares', async () =
   const store = Store.open(join(dir, 't.db'));
   try {
     for (const [i, sym] of SYMBOLS.entries()) fundingMaterial(store, sym, Date.now() - i * 1000);
-    const r = await generate(store, { ...ALWAYS_OPEN, autoPublish: true }, 4);
+    const r = await generate(store, { ...ALWAYS_OPEN, autoPublish: true, activeExperiments: null }, 4);
     assert.ok(r.created.length > 0);
     const rows = store.db.prepare('SELECT experiment, arm FROM post_arms').all() as { experiment: string; arm: string }[];
     assert.ok(rows.length > 0);
@@ -101,4 +102,19 @@ test('the repeat-interval probe is deterministic and spends the share it declare
   const rate = hits / N;
   assert.ok(hits > 0, 'the short-interval arm must be reachable at all');
   assert.ok(Math.abs(rate - REPEAT_EXPLORE_SHARE) < 0.01, `expected about ${(REPEAT_EXPLORE_SHARE * 100).toFixed(0)}%, got ${(rate * 100).toFixed(2)}%`);
+});
+
+test('only the active experiments draw arms, and a column-only hypothesis never reaches another lane', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'sf-arms3-'));
+  const store = Store.open(join(dir, 't.db'));
+  try {
+    for (const [i, sym] of SYMBOLS.entries()) fundingMaterial(store, sym, Date.now() - i * 1000);
+    const r = await generate(store, { ...ALWAYS_OPEN, autoPublish: true, dailyCap: 30, postsPerDay: 20, activeExperiments: ['h_chart', 'h_column'] }, 4);
+    assert.ok(r.created.length > 0, r.skipped.join(' | '));
+    const used = new Set((store.db.prepare('SELECT DISTINCT experiment FROM post_arms').all() as { experiment: string }[]).map(x => x.experiment));
+    assert.deepEqual([...used], ['h_chart'], 'h_hashtag_count etc. are switched off, and h_column belongs to the column lane only');
+  } finally {
+    store.close();
+    rmSync(dir, { recursive: true, force: true });
+  }
 });

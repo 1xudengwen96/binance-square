@@ -35,6 +35,8 @@ export const EVAL_WINDOW_DAYS = 7;
 export const MIN_SAMPLES_TO_JUDGE = 5;
 /** A change still undecided after twice the window is rolled back rather than left in place. */
 const HARD_DEADLINE_FACTOR = 2;
+/** Relative lift a change must show over its before-median to be kept. */
+export const IMPROVE_THRESHOLD = 0.15;
 
 interface Knob {
   key: string;
@@ -42,6 +44,11 @@ interface Knob {
   min: number;
   max: number;
   judge: Metric;
+  /**
+   * Which generation lane reads this knob. The column lane ignores the mixed lane's knobs, so
+   * offering them while columnMode is on would credit a change that touched nothing.
+   */
+  lane: 'mixed' | 'column';
   /** Why this knob is worth a machine touching, and what it is not allowed to be judged by. */
   purpose: string;
 }
@@ -58,16 +65,32 @@ export const KNOBS: Knob[] = [
     min: 120,
     max: 2880,
     judge: 'views24h',
+    lane: 'mixed',
     purpose: '隔多久再写同一个币还有观众。h_repeat_interval 测的就是它。',
   },
-  { key: 'categoryWeights:attention', label: '赛道配比 · 热度跟进', min: 0.1, max: 3, judge: 'views24h', purpose: '队列里这类素材占多少。' },
-  { key: 'categoryWeights:market_move', label: '赛道配比 · 行情异动', min: 0.1, max: 3, judge: 'views24h', purpose: '队列里这类素材占多少。' },
-  { key: 'categoryWeights:funding', label: '赛道配比 · 资金费率', min: 0.1, max: 3, judge: 'views24h', purpose: '队列里这类素材占多少。' },
-  { key: 'categoryWeights:onchain', label: '赛道配比 · 链上', min: 0.1, max: 3, judge: 'views24h', purpose: '队列里这类素材占多少。' },
-  { key: 'categoryWeights:newsflash', label: '赛道配比 · 快讯', min: 0.1, max: 3, judge: 'views24h', purpose: '队列里这类素材占多少。' },
+  {
+    key: 'columnCoinCooldownHours',
+    label: '栏目同币冷却（小时）',
+    min: 6,
+    max: 72,
+    judge: 'views24h',
+    lane: 'column',
+    purpose: '栏目隔多久可以再写同一个币。太短读者觉得重复，太长错过还在发展的行情。',
+  },
+  { key: 'categoryWeights:attention', label: '赛道配比 · 热度跟进', min: 0.1, max: 3, judge: 'views24h', lane: 'mixed', purpose: '队列里这类素材占多少。' },
+  { key: 'categoryWeights:market_move', label: '赛道配比 · 行情异动', min: 0.1, max: 3, judge: 'views24h', lane: 'mixed', purpose: '队列里这类素材占多少。' },
+  { key: 'categoryWeights:funding', label: '赛道配比 · 资金费率', min: 0.1, max: 3, judge: 'views24h', lane: 'mixed', purpose: '队列里这类素材占多少。' },
+  { key: 'categoryWeights:onchain', label: '赛道配比 · 链上', min: 0.1, max: 3, judge: 'views24h', lane: 'mixed', purpose: '队列里这类素材占多少。' },
+  { key: 'categoryWeights:newsflash', label: '赛道配比 · 快讯', min: 0.1, max: 3, judge: 'views24h', lane: 'mixed', purpose: '队列里这类素材占多少。' },
 ];
 
 export const KNOB_KEYS = KNOBS.map(k => k.key);
+
+/** The knobs the lane currently generating posts actually reads. */
+export function liveKnobs(s: Settings): Knob[] {
+  const lane = s.columnMode ? 'column' : 'mixed';
+  return KNOBS.filter(k => k.lane === lane);
+}
 
 export function knobByKey(key: string): Knob | undefined {
   return KNOBS.find(k => k.key === key);
@@ -119,6 +142,9 @@ export function proposeChange(
   if (!opts.reason.trim()) return { ok: false, reason: '没有理由的参数改动无法复盘，也无法判断该不该回滚。' };
 
   const settings = settingsFrom(store);
+  if (!liveKnobs(settings).some(k => k.key === opts.key)) {
+    return { ok: false, reason: `「${spec.label}」只在${spec.lane === 'column' ? '栏目' : '混合'}模式下生效，现在的发帖通道不读它，改了也测不出效果。可动的是：${liveKnobs(settings).map(k => k.key).join('、')}。` };
+  }
   const current = readKnob(settings, opts.key);
   if (current == null) return { ok: false, reason: `读不到「${spec.label}」当前值` };
 
@@ -238,7 +264,9 @@ export function evaluateChanges(store: Store, now = Date.now()): EvaluationResul
     }
 
     const delta = (after - r.before_median) / Math.max(Math.abs(r.before_median), 1);
-    if (delta > 0.02) {
+    // Day-to-day medians at a handful of posts swing by tens of percent on the coin alone; a 2%
+    // bar credited about half of all changes by coin flip. Keep only a lift that clears the noise.
+    if (delta > IMPROVE_THRESHOLD) {
       store.db
         .prepare("UPDATE param_changes SET status = 'improved', after_median = ?, resolved_at = ? WHERE id = ?")
         .run(round(after), now, r.id);

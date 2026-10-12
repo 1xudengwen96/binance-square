@@ -315,10 +315,11 @@ export function llmConfigFor(store: Store, settings: Settings): LlmConfig | null
 }
 
 /** Run the rewrite pass and keep a record of why it was rejected, if it was. */
-async function applyPolish(
+export async function applyPolish(
   store: Store, settings: Settings, text: string, facts: Fact[], persona = '',
   ctx: { category?: string; subType?: string | null; symbol?: string | null; verdicts?: Verdict[] } = {},
 ): Promise<{ text: string; note?: string }> {
+  if (settings.llmPolish === false) return { text };
   const cfg = llmConfigFor(store, settings);
   if (!cfg || !cfg.apiKey || !cfg.model) return { text };
   // The writer reads its own memory before drafting. Cheap when the ledger is empty, which is
@@ -430,7 +431,7 @@ export async function generate(
     let text = c.text;
     // The arm is drawn before the post exists, so an outcome can never be explained by whoever
     // chose the winner afterwards.
-    const arms = planArms({ seed: hashString(`${seed}:arms`), verdicts: rankVerdicts });
+    const arms = planArms({ seed: hashString(`${seed}:arms`), verdicts: rankVerdicts, only: settings.activeExperiments, exclude: ['h_column', 'h_column_polish'] });
     const pb = playbook(store, { verdicts: rankVerdicts, arms });
     text = applyVoice(text, m.facts, pb, seed);
     // Only append a disclaimer the copy did not already carry.
@@ -871,7 +872,7 @@ export async function generateFromPool(
     }
 
     let text = c.text;
-    const arms = planArms({ seed: hashString(`${material.id}:arms`), verdicts: rankVerdicts });
+    const arms = planArms({ seed: hashString(`${material.id}:arms`), verdicts: rankVerdicts, only: settings.activeExperiments, exclude: ['h_column', 'h_column_polish'] });
     const pb = playbook(store, { verdicts: rankVerdicts, arms });
     text = applyVoice(text, material.facts, pb, material.id);
     if (eff.appendDisclaimer && !carriesDisclaimer(text)) {

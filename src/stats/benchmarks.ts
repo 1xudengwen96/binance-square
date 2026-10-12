@@ -45,9 +45,15 @@ interface RawVo {
   coinPairList?: string[];
 }
 
+/**
+ * Both routes default to the English board. Comparing a Chinese account with it was a category
+ * error (317 of the first 319 samples were English), so the sweep asks for `lang=zh-CN`. Rows
+ * sampled before that keep their own `lang` and are shown apart, never mixed into the same median.
+ */
+const BOARD_LANG = 'zh-CN';
 const BOARDS = [
-  { name: 'trend', url: (p: number) => `${B}/v3/friendly/pgc/content/article/list?pageIndex=${p}&pageSize=20&type=1` },
-  { name: 'news', url: (p: number) => `${B}/v4/friendly/pgc/feed/news/list?pageIndex=${p}&pageSize=20` },
+  { name: 'trend', url: (p: number) => `${B}/v3/friendly/pgc/content/article/list?pageIndex=${p}&pageSize=20&type=1&lang=${BOARD_LANG}` },
+  { name: 'news', url: (p: number) => `${B}/v4/friendly/pgc/feed/news/list?pageIndex=${p}&pageSize=20&lang=${BOARD_LANG}` },
 ];
 
 export interface BenchmarkReport {
@@ -148,4 +154,57 @@ export async function sampleSquareBoards(store: Store, opts: { pages?: number } 
   report.oursOnBoard = rows.filter(r => r.is_ours === 1).length;
   if (report.stored || report.errors.length) store.log('benchmark', report);
   return report;
+}
+
+export interface BoardComposition {
+  /** Rows the shares were computed from: Chinese-language, not ours. */
+  n: number;
+  sampledAt: number | null;
+  medianViews: number | null;
+  shares: { question: number; firstPerson: number; pricePoint: number; news: number; image: number };
+  medianViewsImage: number | null;
+  medianViewsNoImage: number | null;
+  /** Per 1,000 views, pooled (sum / sum), because comments are sparse and a median is always 0. */
+  likesPer1k: number | null;
+  commentsPer1k: number | null;
+  /** The shape tests are text heuristics on a 300-character title, so they are approximate. */
+  caveat: string;
+}
+
+const QUESTION = /[?？]|吗|怎么|如何|多少|还是|会不会|能不能|是不是|你们|大家/;
+const FIRST_PERSON = /我(?!们)|本人|个人/;
+const PRICE_POINT = /$s?d|d[d,.]*s*(?:美元|刀|USDT|U|万|k|K)|(?:突破|跌破|站上|跌至|涨至|回踩)s*d/;
+
+const med = (xs: number[]): number | null => {
+  if (!xs.length) return null;
+  const a = [...xs].sort((x, y) => x - y);
+  const m = Math.floor(a.length / 2);
+  return a.length % 2 ? a[m]! : (a[m - 1]! + a[m]!) / 2;
+};
+
+/** What the Chinese boards are made of, recomputed from whatever is in the table right now. */
+export function boardComposition(store: Store): BoardComposition {
+  const rows = store.db
+    .prepare("SELECT title, board, has_image, views, likes, comments, sampled_at FROM square_board_samples WHERE is_ours = 0 AND lang LIKE 'zh%'")
+    .all() as { title: string | null; board: string; has_image: number; views: number; likes: number; comments: number; sampled_at: number }[];
+  const n = rows.length;
+  const share = (f: (r: (typeof rows)[number]) => boolean): number => (n ? Number((rows.filter(f).length / n).toFixed(3)) : 0);
+  const sumViews = rows.reduce((s, r) => s + r.views, 0);
+  return {
+    n,
+    sampledAt: n ? Math.max(...rows.map(r => r.sampled_at)) : null,
+    medianViews: med(rows.map(r => r.views)),
+    shares: {
+      question: share(r => QUESTION.test(r.title ?? '')),
+      firstPerson: share(r => FIRST_PERSON.test(r.title ?? '')),
+      pricePoint: share(r => PRICE_POINT.test(r.title ?? '')),
+      news: share(r => r.board === 'news'),
+      image: share(r => r.has_image === 1),
+    },
+    medianViewsImage: med(rows.filter(r => r.has_image === 1).map(r => r.views)),
+    medianViewsNoImage: med(rows.filter(r => r.has_image !== 1).map(r => r.views)),
+    likesPer1k: sumViews > 0 ? Number(((rows.reduce((s, r) => s + r.likes, 0) / sumViews) * 1000).toFixed(2)) : null,
+    commentsPer1k: sumViews > 0 ? Number(((rows.reduce((s, r) => s + r.comments, 0) / sumViews) * 1000).toFixed(2)) : null,
+    caveat: '形态占比是对标题前 300 字做的关键词判断，只能当近似值；榜上的帖子是已经被分发之后才采到的，不代表「这样写就会被分发」。',
+  };
 }

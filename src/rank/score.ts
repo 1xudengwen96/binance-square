@@ -26,11 +26,20 @@ type Row = Distribution & {
  * Comparing a post measured at 20 minutes against one measured at a day is not a comparison, and
  * with a handful of posts a day it is the easy mistake to make. Rows younger than the 3-hour
  * checkpoint are left out of every outcome here rather than being counted at their partial value.
+ *
+ * A verdict compares posts at one age only: the 24-hour reading. Standing a 3-hour reading in for a
+ * day-old one put a post at 104 next to its own later 390. Rows without a 24-hour reading wait.
  */
-const MATURITY_FLOOR_MS = 3 * 3600_000;
+export const MATURITY_FLOOR_MS = 24 * 3600_000;
+
+/**
+ * True when every value is zero: a metric that has never moved cannot rank anything, and judging
+ * 0 against 0 as «no difference» writes a false lesson into memory.
+ */
+export const allZero = (vs: number[]): boolean => vs.length > 0 && vs.every(v => v === 0);
 
 function outcome(row: Row, metric: Metric): number | null {
-  const views = row.v24h ?? row.v8h ?? row.v3h;
+  const views = row.v24h;
   switch (metric) {
     case 'views24h':
       return views ?? null;
@@ -41,6 +50,14 @@ function outcome(row: Row, metric: Metric): number | null {
       // Null counters mean the sweep has not read this post yet; that is not zero engagement.
       if (row.likes == null && row.comments == null && row.shares == null) return null;
       return (((row.likes ?? 0) + (row.comments ?? 0) + (row.shares ?? 0)) / views) * 1000;
+    }
+    case 'qualityPer1k': {
+      // The stand-in for «someone wants to follow this account», which Square will not tell us
+      // directly. A like costs a tap; a comment or a share means the reader spent something. Unread
+      // counters are unknown rather than zero, same as above.
+      if (!views || views <= 0) return null;
+      if (row.likes == null && row.comments == null && row.shares == null) return null;
+      return (((row.likes ?? 0) + 3 * (row.comments ?? 0) + 4 * (row.shares ?? 0)) / views) * 1000;
     }
     case 'rebatePer1k': {
       // Views are the denominator the operator's daily figure can be spread over; a post with no
@@ -121,7 +138,7 @@ function fmt(metric: Metric, v: number | null): string {
  * a rule only exists once the sample and the gap both clear their floor. Anything else is a
  * machine inventing folklore about an algorithm it cannot read.
  */
-export function scoreAll(store: Store, opts: { days?: number; writeMemory?: boolean; now?: number; target?: 'views' | 'money'; hypotheses?: Hypothesis[] } = {}): Verdict[] {
+export function scoreAll(store: Store, opts: { days?: number; writeMemory?: boolean; now?: number; target?: 'views' | 'engagement' | 'money'; hypotheses?: Hypothesis[] } = {}): Verdict[] {
   const days = opts.days ?? 30;
   const now = opts.now ?? Date.now();
   const rows = distributionRows(store, days) as Row[];
@@ -150,13 +167,30 @@ export function scoreAll(store: Store, opts: { days?: number; writeMemory?: bool
   for (const h of list) {
     // Money replaces views as the target only for the arms we randomise; an observed comparison
     // would just be a smaller version of the same confounding.
-    const metric: Metric = moneyReady && h.mode === 'experiment' ? 'rebatePer1k' : h.metric;
-    const groups = new Map<string, number[]>();
-    for (const r of eligible) {
-      const arm = armOf(r, h);
-      const v = outcome(r, metric);
-      if (!arm || v == null) continue;
-      (groups.get(arm) ?? groups.set(arm, []).get(arm)!).push(v);
+    const wanted: Metric =
+      h.mode !== 'experiment' ? h.metric
+      : moneyReady ? 'rebatePer1k'
+      : opts.target === 'engagement' ? 'qualityPer1k'
+      : h.metric;
+    const collect = (m: Metric): Map<string, number[]> => {
+      const g = new Map<string, number[]>();
+      for (const r of eligible) {
+        const arm = armOf(r, h);
+        const v = outcome(r, m);
+        if (!arm || v == null) continue;
+        (g.get(arm) ?? g.set(arm, []).get(arm)!).push(v);
+      }
+      return g;
+    };
+    // A target nobody has moved yet (no likes, no comments on any post) is not evidence; fall back
+    // to views for this verdict and say so, rather than calling every arm equal.
+    let metric = wanted;
+    let groups = collect(metric);
+    let fellBack = false;
+    if (metric !== 'views24h' && allZero([...groups.values()].flat())) {
+      metric = 'views24h';
+      groups = collect(metric);
+      fellBack = true;
     }
     const arms: ArmStat[] = h.arms.map(arm => {
       const vs = groups.get(arm) ?? [];
@@ -214,6 +248,7 @@ export function scoreAll(store: Store, opts: { days?: number; writeMemory?: bool
         note = replicated === false ? '前后两半各赢一次，赢家不一样 —— 这就是噪声，不是规则。' : confidence < CONFIDENCE_TO_ACT ? `置信 ${(confidence * 100).toFixed(0)}%，还没到 ${(CONFIDENCE_TO_ACT * 100).toFixed(0)}% 的线。` : null;
       }
     }
+    if (fellBack) note = `目标指标在所有帖子上都是 0，比不出高低，这一次按浏览量判。${note ?? ''}`;
     const missing = enough ? 0 : Math.max(0, h.minSamples - (Number.isFinite(minN) ? minN : 0));
 
     const verdict: Verdict = {
@@ -264,6 +299,20 @@ export function revokeStaleRules(store: Store, verdicts: Verdict[], now = Date.n
       .all() as { key: string }[]).map(r => r.key),
   );
   const revoked: string[] = [];
+  // «Flat» lessons written when every arm read 0.00 came from a metric nobody had moved yet; they
+  // are not evidence of anything and must not tell the writer to stop trying.
+  const zeroFlat = (store.db
+    .prepare("SELECT key, text FROM brain_memory WHERE kind = 'rank-rule' AND status = 'active' AND text LIKE '%差别不大%'")
+    .all() as { key: string; text: string }[])
+    .filter(r => {
+      const nums = [...r.text.matchAll(/(-?\d+(?:\.\d+)?)（\d+ 条）/g)].map(m => Number(m[1]));
+      return allZero(nums);
+    });
+  for (const { key } of zeroFlat) {
+    store.forgetMemory(key, `各臂都是 0，那不是「没差别」，是指标还没动过（${new Date(now).toISOString().slice(0, 10)}）`);
+    active.delete(key);
+    revoked.push(key.replace(/^rank:/, ''));
+  }
   for (const v of verdicts) {
     if (v.status === 'rule' || v.status === 'flat') continue;
     const key = `rank:${v.id}`;

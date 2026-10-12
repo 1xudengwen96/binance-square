@@ -22,6 +22,15 @@ function tempStore(): { store: Store; close: () => void } {
 /** A published post with a full checkpoint curve, which is the only way the engine can be probed. */
 let seq = 0;
 function post(store: Store, opts: { views: (number | null)[]; arms?: Record<string, string>; at: number; chart?: boolean; text?: string; heat?: number; category?: string; eng?: { likes: number; comments: number; shares: number } }): number {
+  // Verdicts only read the 24-hour checkpoint (index 4). A fixture written as a short curve on a
+  // post a few hours old stands for «this is how it ended»: carry its last reading to 24h and age
+  // it by a day, which keeps relative order. Fixtures under 3h old stay young on purpose.
+  if (opts.views.length < 5 && Date.now() - opts.at >= 3 * 3600_000) {
+    const last = [...opts.views].reverse().find(v => v != null) ?? null;
+    const views = [...opts.views];
+    while (views.length < 5) views.push(last);
+    opts = { ...opts, views, at: opts.at - 24 * 3600_000 };
+  }
   // Each fixture material must be unique: `insertMaterial` dedupes by fingerprint, and a
   // collision would silently attach the post to some other row's category and heat band.
   const symbol = `TOK${seq++}`;
@@ -376,6 +385,53 @@ test('reflection does not overwrite the rule scoreAll just wrote with a dumber s
   }
 });
 
+test('a target metric that is zero everywhere falls back to views instead of declaring «no difference»', () => {
+  const { store, close } = tempStore();
+  try {
+    const now = Date.now();
+    const n = HYPOTHESES.find(h => h.id === 'h_chart')!.minSamples;
+    for (let i = 0; i < n * 2; i++) {
+      post(store, { views: [100, 100, 100, 100, 100], at: now - 30 * 3600_000 - i * 1000, arms: { h_chart: i % 2 ? 'chart' : 'text' }, heat: i % 4 < 2 ? 92 : 60, category: i % 8 < 4 ? 'funding' : 'onchain' });
+    }
+    observeDistribution(store);
+    const v = scoreAll(store, { writeMemory: true, target: 'engagement' }).find(x => x.id === 'h_chart')!;
+    assert.equal(v.metric, 'views24h', 'no likes or comments anywhere: quality cannot rank, views can');
+    assert.match(v.note ?? '', /都是 0/);
+  } finally {
+    close();
+  }
+});
+
+test('flat lessons written from all-zero arms are revoked', () => {
+  const { store, close } = tempStore();
+  try {
+    remember(store, { kind: 'rank-rule', key: 'rank:h_follow_cta', text: '结尾求关注 —— 测过了，差别不大：none 0.00（11 条），follow 0.00（11 条）。不值得为它改写法。', source: 'rank-score', confidence: 0.6, evidenceN: 22 });
+    remember(store, { kind: 'rank-rule', key: 'rank:h_real', text: '某假设 —— 测过了，差别不大：a 96（10 条），b 101（10 条）。不值得为它改写法。', source: 'rank-score', confidence: 0.6, evidenceN: 20 });
+    const revoked = revokeStaleRules(store, []);
+    assert.deepEqual(revoked, ['h_follow_cta']);
+    assert.deepEqual(store.activeMemory('rank-rule').map(m => m.key), ['rank:h_real']);
+  } finally {
+    close();
+  }
+});
+
+test('a post only a few hours old does not enter a verdict', () => {
+  const { store, close } = tempStore();
+  try {
+    const now = Date.now();
+    // 8 hours old, full curve up to 8h but no 24h reading: it is not comparable yet.
+    for (let i = 0; i < 10; i++) {
+      const id = post(store, { views: [100, 200, 300, 400, 500], at: now - 32 * 3600_000 - i * 1000, arms: { h_chart: 'chart' } });
+      store.db.prepare('DELETE FROM post_stat_checks WHERE post_id = ? AND checkpoint = 4').run(id);
+    }
+    observeDistribution(store);
+    const v = scoreAll(store, { writeMemory: false }).find(x => x.id === 'h_chart')!;
+    assert.equal(v.arms.find(a => a.arm === 'chart')!.n, 0);
+  } finally {
+    close();
+  }
+});
+
 test('the engagement metric reads real counters, not columns that were never selected', () => {
   // h_opening is judged on engagement per thousand views. If the query behind the scorer forgets
   // to join the counters, every arm reads a median of zero and the hypothesis is retired as
@@ -420,4 +476,46 @@ test('a post the stats sweep has not read yet does not vote as zero engagement',
   } finally {
     close();
   }
+});
+
+test('the engagement target ranks by what readers spent, not by how many saw it', () => {
+  // Same reach in both arms; one arm earns comments and shares. A views target cannot tell them
+  // apart, which is exactly why it cannot answer «do people want to follow this account».
+  const { store, close } = tempStore();
+  try {
+    const now = Date.now();
+    const day = 24 * 3600_000;
+    for (let i = 0; i < 14; i++) {
+      const at = now - (3 + i) * day / 2;
+      post(store, { views: [60, 150, 200, 250, 300], at, arms: { h_stance: 'none' }, eng: { likes: 1, comments: 0, shares: 0 } });
+      post(store, { views: [60, 150, 200, 250, 300], at, arms: { h_stance: 'read' }, eng: { likes: 1, comments: 2, shares: 1 } });
+    }
+    observeDistribution(store);
+    const stance = (target: 'views' | 'engagement') => scoreAll(store, { writeMemory: false, target }).find(v => v.id === 'h_stance')!;
+
+    const byViews = stance('views');
+    assert.equal(byViews.arms.find(a => a.arm === 'read')!.median, byViews.arms.find(a => a.arm === 'none')!.median, 'identical reach');
+
+    const byQuality = stance('engagement');
+    assert.equal(byQuality.metric, 'qualityPer1k');
+    const read = byQuality.arms.find(a => a.arm === 'read')!.median!;
+    const none = byQuality.arms.find(a => a.arm === 'none')!.median!;
+    // Read at the 24h checkpoint (300 views): (1 + 3*2 + 4*1) / 300 * 1000 = 36.7  vs  1 / 300 * 1000 = 3.3
+    assert.equal(Math.round(read), 37);
+    assert.equal(Math.round(none), 3);
+    assert.equal(byQuality.winner, 'read');
+  } finally { close(); }
+});
+
+test('the quality metric treats an unread counter as unknown, never as zero', () => {
+  const { store, close } = tempStore();
+  try {
+    const now = Date.now();
+    const id = post(store, { views: [60, 150, 200, 250, 300], at: now - 2 * 24 * 3600_000, arms: { h_stance: 'read' } });
+    store.db.prepare('UPDATE post_stat_checks SET likes = NULL, comments = NULL, shares = NULL WHERE post_id = ?').run(id);
+    store.db.prepare('UPDATE post_stats SET likes = NULL, comments = NULL, shares = NULL WHERE post_id = ?').run(id);
+    observeDistribution(store);
+    const v = scoreAll(store, { writeMemory: false, target: 'engagement' }).find(x => x.id === 'h_stance')!;
+    assert.equal(v.arms.find(a => a.arm === 'read')!.n, 0);
+  } finally { close(); }
 });

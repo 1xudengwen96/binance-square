@@ -97,7 +97,7 @@ function seedMany(store: Store, category: string, views: number[], extra: Record
 function boardRow(over: Partial<BoardSample> = {}): BoardSample {
   const base = {
     content_id: '100001', board: 'trend', title: 'x', author: null, coin: null, coins_json: '[]',
-    hashtags_json: '[]', card_type: 'BUZZ_SHORT', has_image: 0, lang: 'en', chars: 100,
+    hashtags_json: '[]', card_type: 'BUZZ_SHORT', has_image: 0, lang: 'zh-CN', chars: 100,
     views: 1000, likes: 1, comments: 0, shares: 0, reactions: 1,
     posted_at: Date.now() - DAY, sampled_at: Date.now(), is_ours: 0,
   };
@@ -203,6 +203,22 @@ test('our own posts stay out of the comparison pool', () => {
     assert.ok(!pool.includes(80));
     assert.ok(store.surfacedPostIds(['555000']).has('555000'), 'appearing on the board is what 上榜 means');
     assert.ok(id > 0);
+  } finally {
+    close();
+  }
+});
+
+test('the comparison pool is the Chinese boards; English rows stay stored but out of it', () => {
+  const { store, close } = tempStore();
+  try {
+    store.upsertBoardSamples([
+      boardRow({ content_id: '610001', views: 9000 }),
+      boardRow({ content_id: '610002', views: 7000 }),
+      { ...boardRow({ content_id: '610003', views: 500000 }), lang: 'en' },
+    ]);
+    assert.deepEqual(store.boardViewPool({ lang: 'zh' }).sort((a, b) => a - b), [7000, 9000]);
+    assert.deepEqual(store.boardViewPool({ lang: 'other' }), [500000]);
+    assert.deepEqual(store.boardCountByLang(), { zh: 2, other: 1 });
   } finally {
     close();
   }

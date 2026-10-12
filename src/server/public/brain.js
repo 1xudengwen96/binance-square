@@ -1,0 +1,548 @@
+/*
+ * The AI 大脑 page.
+ *
+ * One form owns the connection (provider, base URL, key, model) and the brain's own settings; the
+ * rest of the page is read-only evidence plus the few operator-only actions (reset the breaker,
+ * approve a report). A key is typed here and never comes back: the server answers with a mask.
+ *
+ * Unsaved edits live in BRAIN_DRAFT so that pressing 「拉取模型」 or 「保存 Key」, which both
+ * re-render the page, does not throw away what was typed in the other boxes.
+ */
+
+// Wrapped so its helpers (fmtN, PURPOSE_CN, …) cannot collide with app.js: both are classic scripts
+// sharing one global scope, and a duplicate top-level name aborts the whole file.
+(() => {
+let BRAIN = null;
+let BRAIN_DRAFT = {};
+let BRAIN_MODELS = [];
+let BRAIN_OPEN_REPORT = null;
+
+const BRAIN_PRESETS = [
+  { label: 'Anthropic', provider: 'anthropic', url: 'https://api.anthropic.com/v1' },
+  { label: 'OpenAI', provider: 'openai', url: 'https://api.openai.com/v1' },
+  { label: 'OpenRouter', provider: 'openai', url: 'https://openrouter.ai/api/v1' },
+  { label: 'DeepSeek', provider: 'openai', url: 'https://api.deepseek.com/v1' },
+  { label: 'Ollama', provider: 'openai', url: 'http://localhost:11434/v1' },
+];
+
+const BRAIN_JOBS = [
+  ['brainDaily', 'brainMaxTokensDaily', '每日反思', '每 20 小时一次：读各假设的测量结果，提出新比较或一次有界的参数调整。'],
+  ['brainSentinel', 'brainMaxTokensSentinel', '异常哨兵', '代码每轮盯指标，出现新警报才唤醒大脑写一段诊断；每天唤醒次数有上限。'],
+  ['brainWeekly', 'brainMaxTokensWeekly', '周复盘', '每周日 22:00 后一次：六节结构化周报，最多一条建议，批准后才会走闸门执行。'],
+];
+
+const bdv = (k, server) => (k in BRAIN_DRAFT ? BRAIN_DRAFT[k] : server);
+const bset = (k, v) => { BRAIN_DRAFT[k] = v; };
+const bjson = body => ({ method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body) });
+const bnum = v => (v === '' || v == null ? '' : v);
+
+function brainPill(ok, yes, no) {
+  return `<span class="pill ${ok ? 'on' : 'warn'}">${esc(ok ? yes : no)}</span>`;
+}
+
+function brainDirty() {
+  if (!BRAIN) return [];
+  return Object.keys(BRAIN_DRAFT).filter(k => k !== '__key' && JSON.stringify(BRAIN_DRAFT[k]) !== JSON.stringify(BRAIN.settings[k]));
+}
+
+function brainCaptureForm() {
+  const read = (id, key, kind) => {
+    const el = document.getElementById(id);
+    if (!el) return;
+    if (kind === 'bool') BRAIN_DRAFT[key] = el.checked;
+    else if (kind === 'num') { if (el.value !== '') BRAIN_DRAFT[key] = Number(el.value); }
+    else BRAIN_DRAFT[key] = el.value;
+  };
+  read('bn-base', 'llmBaseUrl', 'text');
+  read('bn-model', 'llmModel', 'text');
+  read('bn-brainmodel', 'brainModel', 'text');
+  read('bn-enabled', 'llmEnabled', 'bool');
+  read('bn-polish', 'llmPolish', 'bool');
+  read('bn-polishtemp', 'llmTemperature', 'num');
+  read('bn-polishtok', 'llmMaxTokens', 'num');
+  read('bn-temp', 'brainTemperature', 'num');
+  read('bn-wake', 'brainWakeCapPerDay', 'num');
+  read('bn-breaker', 'breakerEnabled', 'bool');
+  read('bn-webhook', 'alertWebhook', 'text');
+  read('bn-colmode', 'columnMode', 'bool');
+  read('bn-colper', 'columnPostsPerDay', 'num');
+  for (const [on, tok] of BRAIN_JOBS) { read('bn-' + on, on, 'bool'); read('bn-' + tok, tok, 'num'); }
+  const key = document.getElementById('bn-key');
+  if (key && key.value.trim()) BRAIN_DRAFT.__key = key.value; else if (key) delete BRAIN_DRAFT.__key;
+  const notes = document.getElementById('bn-notes');
+  if (notes) BRAIN_DRAFT.__notes = notes.value;
+}
+
+const fmtN = v => (v == null ? '—' : typeof v === 'number' ? (Number.isInteger(v) ? v.toLocaleString('en-US') : String(v)) : String(v));
+
+function gateRow(label, passed, big, sub) {
+  return `<div class="tile ${passed ? 'good' : ''}"><div class="lbl">${esc(label)}</div>
+    <div class="v">${big}</div><div class="s">${sub}</div></div>`;
+}
+
+function brainGateCards(d) {
+  const g = d.gates, L = d.gateLines;
+  const modeTxt = d.settings.targetMode === 'auto' ? '自动' : '手动';
+  return `<div class="grid gkpi" style="margin-bottom:14px">
+    ${gateRow('关卡 A · 被分发', g.A.passed, `${g.A.streakDays}<small>/ ${g.A.daysNeeded} 天</small>`,
+      `每天 ≥ ${L.minPostsPerDay} 条满 24 小时的帖子，浏览中位数 ≥ ${L.viewsMedian}。近 7 天中位数 ${fmtN(g.A.median7d == null ? null : Math.round(g.A.median7d))}`)}
+    ${gateRow('关卡 B · 有人回应', g.B.passed, g.B.commentsPer1k == null ? '—' : `${g.B.commentsPer1k}<small>/ ${g.B.line}</small>`,
+      `近 ${g.B.windowDays} 天合并评论率（每千次浏览）。${g.B.comments} 条评论 / ${g.B.views} 次浏览`)}
+    ${gateRow('关卡 C · 二次分发', g.C.passed, `${g.C.secondRound}<small>/ ${g.C.needed} 条</small>`,
+      `发帖 3 小时后浏览仍翻倍的帖子。粉丝数读不到，用它代替`)}
+    <div class="tile"><div class="lbl">现在按什么判定实验</div><div class="v" style="font-size:19px">${esc({ views: '浏览量', engagement: '互动质量', money: '返佣' }[d.target] || d.target)}</div>
+      <div class="s">${modeTxt}模式 · ${esc(g.reason)}</div></div>
+  </div>`;
+}
+
+function brainBreakerCard(d) {
+  const b = d.breaker;
+  const state = !b.enabled ? ['warn', '已关闭'] : b.tripped ? ['bad', '已触发，自动发布已停'] : ['on', '正常'];
+  return `<div class="card" style="margin-bottom:14px">
+    <div class="card-hd"><h3>熔断</h3>
+      <span class="sub">连续 ${b.window} 条帖子的浏览中位数低于 ${b.floor}（账号自己基线的一半），就停掉自动发布。之后手动发的帖子回到线上、或停满 48 小时，会自动恢复；你也可以直接恢复。大脑碰不到这个按钮。</span>
+      <span class="right"><span class="pill ${state[0]}">${state[1]}</span></span></div>
+    <div class="kv" style="margin:6px 0 4px">
+      <span class="pill plain">窗口内 ${b.n} 条</span>
+      <span class="pill plain">中位数 ${b.median == null ? '样本不足' : Math.round(b.median)}</span>
+      <span class="pill plain">起算 ${esc(fmtTs(b.since))}</span>
+      ${b.trippedAt ? `<span class="pill bad">触发于 ${esc(fmtTs(b.trippedAt))}</span>` : ''}
+    </div>
+    <div class="hint">窗口从首次评估或上次恢复起算。熔断期间参数回路冻结，恢复时把在途窗口顺延同样的时长。</div>
+    <div class="row" style="margin-top:8px">
+      <label class="kv" style="cursor:pointer"><input type="checkbox" id="bn-breaker" style="width:auto" ${bdv('breakerEnabled', d.settings.breakerEnabled) ? 'checked' : ''}> <span>启用熔断</span></label>
+    </div>
+    <div class="row" style="margin-top:8px">
+      <label class="kv" for="bn-webhook"><span>报警 Webhook</span></label>
+      <input id="bn-webhook" type="url" placeholder="https://…（飞书/钉钉/Slack 机器人，留空只在本页显示）" value="${esc(bdv('alertWebhook', d.settings.alertWebhook || ''))}" style="flex:1;min-width:260px">
+    </div>
+    <div class="row" style="margin-top:8px">
+      ${b.tripped ? '<button class="btn primary" onclick="brainResetBreaker()">我看过了，恢复自动发布</button>' : ''}
+    </div>
+  </div>`;
+}
+function brainConnectionCard(d) {
+  const s = d.settings;
+  const provider = s.llmProvider;
+  const dirty = brainDirty();
+  const keyPending = BRAIN_DRAFT.__key || '';
+  const modelVal = bdv('llmModel', s.llmModel || '');
+  return `<div class="card" style="margin-bottom:14px">
+    <div class="card-hd"><h3>连接</h3>
+      <span class="sub">大脑、润色、长文润色共用这一个连接；大脑可以单独换一个更强的模型。</span>
+      <span class="right">${d.ready ? '<span class="pill on">大脑可用</span>' : `<span class="pill warn">${esc(d.readyWhy || '未就绪')}</span>`}</span></div>
+
+    <div class="field"><span class="cap">接口类型</span>
+      <div class="seg">
+        <button class="${provider === 'anthropic' ? 'on' : ''}" onclick="brainSwitch('anthropic')">Anthropic（Claude）</button>
+        <button class="${provider === 'openai' ? 'on' : ''}" onclick="brainSwitch('openai')">OpenAI 通用</button>
+      </div>
+      <div class="hint">「OpenAI 通用」覆盖 OpenRouter、DeepSeek、new-api / one-api、Ollama 等兼容网关。</div></div>
+
+    <div class="field"><span class="cap">常用地址（点击填入）</span>
+      <div class="kv">${BRAIN_PRESETS.map((g, i) => `<button class="btn" onclick="brainPreset(${i})">${esc(g.label)}</button>`).join('')}</div></div>
+
+    <div class="field"><span class="cap">Base URL（填到 /v1 为止）</span>
+      <input type="text" id="bn-base" value="${esc(bdv('llmBaseUrl', s.llmBaseUrl || ''))}" placeholder="https://api.anthropic.com/v1" autocomplete="off"></div>
+
+    <div class="field"><span class="cap">${provider === 'anthropic' ? 'Anthropic' : 'OpenAI / 兼容'} Key</span>
+      <div class="inputline">
+        <input type="password" id="bn-key" value="${esc(keyPending)}" autocomplete="off"
+          placeholder="${d.key.set ? '已保存 ' + esc(d.key.masked) + (d.key.fromEnv ? '（来自 .env）' : '') + ' · 留空则不改动' : '粘贴 Key'}"
+          onkeydown="if(event.key==='Enter')brainSaveKey()">
+        <button class="btn" onclick="brainSaveKey()">保存 Key</button>
+        ${d.key.set && !d.key.fromEnv ? '<button class="btn danger" onclick="brainClearKey()">清除</button>' : ''}
+      </div>
+      <div class="hint">Key 只存在本机数据库，接口永不回传明文，页面上只显示首尾几位。</div></div>
+
+    <div class="field"><span class="cap">模型（润色与默认）</span>
+      <div class="inputline">
+        <input type="text" id="bn-model" value="${esc(modelVal)}" placeholder="点「拉取模型」，或直接输入模型名" autocomplete="off">
+        <button class="btn" onclick="brainFetchModels()">拉取模型</button>
+      </div>
+      ${BRAIN_MODELS.length ? `<div class="modelgrid">${BRAIN_MODELS.map(m => `<label><input type="radio" name="bmdl" value="${esc(m.id)}" ${modelVal === m.id ? 'checked' : ''} onchange="brainPick('llmModel','${esc(m.id)}')">${esc(m.id)}</label>`).join('')}</div><div class="hint">共 ${BRAIN_MODELS.length} 个，点选即填入。</div>` : ''}</div>
+
+    <div class="field"><span class="cap">大脑用的模型（留空 = 同上）</span>
+      <div class="inputline"><input type="text" id="bn-brainmodel" value="${esc(bdv('brainModel', s.brainModel || ''))}" placeholder="判断类任务建议用更强的模型" autocomplete="off">
+        ${BRAIN_MODELS.length ? '<span class="hint" style="margin:0">在上面的列表里点选后会填进「模型」；这一栏手填。</span>' : ''}</div></div>
+
+    <div class="grid" style="grid-template-columns:repeat(auto-fit,minmax(150px,1fr))">
+      <div class="field"><span class="cap">润色最大输出 token</span><input type="number" id="bn-polishtok" value="${bnum(bdv('llmMaxTokens', s.llmMaxTokens))}"></div>
+      <div class="field"><span class="cap">润色温度（0–2）</span><input type="number" step="0.1" min="0" max="2" id="bn-polishtemp" value="${bnum(bdv('llmTemperature', s.llmTemperature))}"></div>
+    </div>
+
+    <div class="kv" style="margin-top:4px">
+      <label class="kv" style="cursor:pointer"><input type="checkbox" id="bn-enabled" style="width:auto" ${bdv('llmEnabled', s.llmEnabled) ? 'checked' : ''}> <span>启用连接</span></label>
+      <label class="kv" style="cursor:pointer"><input type="checkbox" id="bn-polish" style="width:auto" ${bdv('llmPolish', s.llmPolish) ? 'checked' : ''}> <span>用它润色帖子措辞</span></label>
+    </div>
+    <div class="kv" style="margin-top:10px">
+      <button class="btn primary" onclick="brainSave()">保存</button>
+      <button class="btn" onclick="brainTest()">测试大脑</button>
+      ${dirty.length ? `<span class="pill warn">未保存：${esc(dirty.map(k => k.replace(/^llm|^brain/, '')).join('、'))}</span><button class="btn" onclick="brainDiscard()">放弃修改</button>` : '<span class="pill on">已是最新</span>'}
+    </div>
+    <div class="hint">「测试大脑」走和真实任务同一条路径（用大脑的模型和温度），会记进下面的调用记录。</div>
+    <div class="result" id="bn-result"></div>
+  </div>`;
+}
+
+function brainJobsCard(d) {
+  const s = d.settings;
+  const rows = BRAIN_JOBS.map(([on, tok, name, what]) => `<tr>
+    <td><b>${esc(name)}</b><span class="sub" style="display:block">${esc(what)}</span></td>
+    <td class="num"><label style="cursor:pointer"><input type="checkbox" id="bn-${on}" style="width:auto" ${bdv(on, s[on]) ? 'checked' : ''}> 开</label></td>
+    <td class="num"><input type="number" id="bn-${tok}" style="width:90px" value="${bnum(bdv(tok, s[tok]))}"></td>
+  </tr>`).join('');
+  return `<div class="card" style="margin-bottom:14px">
+    <div class="card-hd"><h3>任务</h3><span class="sub">关掉一项只是不叫模型；确定性的那一半（归纳、哨兵警报、熔断）照常跑。</span></div>
+    <div class="tablewrap"><table><thead><tr><th>任务</th><th class="num">开关</th><th class="num">最大输出 token</th></tr></thead><tbody>${rows}</tbody></table></div>
+    <div class="grid" style="grid-template-columns:repeat(auto-fit,minmax(170px,1fr));margin-top:12px">
+      <div class="field"><span class="cap">大脑温度（0–1）</span><input type="number" step="0.05" min="0" max="1" id="bn-temp" value="${bnum(bdv('brainTemperature', s.brainTemperature))}"></div>
+      <div class="field"><span class="cap">哨兵每天最多唤醒几次</span><input type="number" min="0" max="10" id="bn-wake" value="${bnum(bdv('brainWakeCapPerDay', s.brainWakeCapPerDay))}"></div>
+    </div>
+    <div class="hint">今天已唤醒 ${d.wakesToday} 次。判断类任务温度建议 0.2；润色的温度在上面的「连接」里单独设置，互不影响。</div>
+    <div class="field" style="margin-top:10px"><span class="cap">给大脑的补充说明（可选，≤ 1000 字）</span>
+      <textarea id="bn-notes" rows="3" style="width:100%" placeholder="只影响取舍和措辞，不会放宽任何限制">${esc(bdv('__notes', d.notes))}</textarea>
+      <div class="row" style="margin-top:6px"><button class="btn" onclick="brainSaveNotes()">保存说明</button></div></div>
+  </div>`;
+}
+
+function brainColumnCard(d) {
+  const s = d.settings;
+  const target = ['views', 'engagement', 'money'];
+  return `<div class="card" style="margin-bottom:14px">
+    <div class="card-hd"><h3>栏目与实验</h3><span class="sub">开启后，账号只发固定栏目，不再发混合短帖。</span></div>
+    <div class="kv" style="margin:6px 0">
+      <label class="kv" style="cursor:pointer"><input type="checkbox" id="bn-colmode" style="width:auto" ${bdv('columnMode', s.columnMode) ? 'checked' : ''}> <span>启用固定栏目</span></label>
+      <span class="cap" style="margin-left:10px">每天最多</span>
+      <input type="number" min="1" max="6" id="bn-colper" style="width:70px" value="${bnum(bdv('columnPostsPerDay', s.columnPostsPerDay))}"> <span class="hint" style="margin:0">条（是上限，不是目标；市场没有够格的素材就不发）</span>
+    </div>
+    <div class="field"><span class="cap">实验判定指标</span>
+      <div class="seg">
+        <button class="${s.targetMode === 'auto' ? 'on' : ''}" onclick="brainTarget('auto')">自动（跟着关卡）</button>
+        ${target.map(t => `<button class="${s.targetMode === 'manual' && s.targetMetric === t ? 'on' : ''}" onclick="brainTarget('${t}')">${{ views: '浏览量', engagement: '互动质量', money: '返佣' }[t]}</button>`).join('')}
+      </div>
+      <div class="hint">自动：关卡 A 没过按浏览量，过了自动换成互动质量。手动选择会固定下来。返佣要先录入过后台数字。</div></div>
+    <div class="hint">正在分配流量的实验：${d.settings.activeExperiments ? d.settings.activeExperiments.map(x => `<code>${esc(x)}</code>`).join(' ') : '全部已登记的'}。其余只做观察，不占样本。</div>
+  </div>`;
+}
+const PURPOSE_CN = { reflect: '每日反思', sentinel: '哨兵', weekly: '周复盘', test: '测试' };
+const STATUS_CN = { pending: '待审阅', approved: '已批准', dismissed: '已忽略', failed: '批准后全被拒' };
+const ALARM_CN = { breaker: '熔断', no_comments: '无评论', outlier_good: '异常好', gate_a_cleared: '关卡 A 过线', calls_failing: '判断不成立', no_posts: '停发', brain_failing: '大脑调用失败', stats_stalled: '回抓停了' };
+
+function brainReportsCard(d) {
+  const rows = d.reports.map(r => `<tr>
+    <td class="num">${r.id}</td><td>${esc(fmtTs(r.created_at))}</td>
+    <td>${esc(r.title)}</td>
+    <td><span class="pill ${r.status === 'pending' ? 'gold' : r.status === 'approved' ? 'on' : r.status === 'failed' ? 'bad' : 'plain'}">${esc(STATUS_CN[r.status] || r.status)}</span></td>
+    <td><button class="btn sm" onclick="brainOpenReport(${r.id})">${BRAIN_OPEN_REPORT && BRAIN_OPEN_REPORT.id === r.id ? '收起' : '查看'}</button></td>
+  </tr>`).join('');
+  const open = BRAIN_OPEN_REPORT;
+  let detail = '';
+  if (open) {
+    const acts = JSON.parse(open.actions_json || '[]');
+    const res = open.result_json ? JSON.parse(open.result_json) : null;
+    detail = `<div class="result show" style="white-space:pre-wrap;line-height:1.7">${esc(open.body)}</div>
+      ${acts.length ? `<div class="hint" style="margin-top:10px"><b>待执行的建议（批准才会走闸门）：</b><ul style="margin:6px 0 0 18px">${acts.map(a => `<li>${esc(actionText(a))}</li>`).join('')}</ul></div>` : '<div class="hint">这份报告没有可执行的建议。</div>'}
+      ${res ? `<div class="hint"><b>闸门的答复：</b><ul style="margin:6px 0 0 18px">${res.map(x => `<li>${x.ok ? '✓' : '✗'} ${esc(actionText(x.action))} —— ${esc(x.detail)}</li>`).join('')}</ul></div>` : ''}
+      ${open.status === 'pending' ? `<div class="row" style="margin-top:10px">
+        ${acts.length ? '<button class="btn primary" onclick="brainApprove()">批准并执行</button>' : ''}
+        <button class="btn" onclick="brainDismiss()">忽略</button></div>` : ''}`;
+  }
+  return `<div class="card" style="margin-bottom:14px">
+    <div class="card-hd"><h3>报告</h3><span class="sub">周复盘和哨兵诊断。建议不会自己生效：批准后每一条都要过它自己的闸门，被拒的会记下来，下次复盘能读到。</span>
+      <span class="right"><button class="btn sm" onclick="brainRunWeekly()">现在生成一份周复盘</button></span></div>
+    ${rows ? `<div class="tablewrap"><table><thead><tr><th class="num">#</th><th>时间</th><th>标题</th><th>状态</th><th></th></tr></thead><tbody>${rows}</tbody></table></div>` : '<div class="empty"><b>还没有报告</b><span>周复盘每周日 22:00 后自动生成；哨兵有新警报且还没到唤醒上限时会写一份诊断。</span></div>'}
+    ${detail}
+    <div class="result" id="bn-report-result"></div>
+  </div>`;
+}
+
+function actionText(a) {
+  if (a.type === 'TEST') return `登记比较：${a.claim}（维度 ${a.dimension} / 指标 ${a.metric} / ${a.mode}）`;
+  if (a.type === 'PARAM') return `参数 ${a.key} 调到 ${a.to}：${a.reason}`;
+  if (a.type === 'VARIANT_OFF') return `下线变体 #${a.id}：${a.reason}`;
+  if (a.type === 'VARIANT_ADD') return `加变体（${a.kind}/${a.slot}）：${a.text}`;
+  return JSON.stringify(a);
+}
+
+function brainAlarmsCard(d) {
+  const rows = d.alarms.map(a => `<tr><td>${esc(fmtTs(a.at))}</td><td><span class="pill ${a.code === 'breaker' ? 'bad' : 'info'}">${esc(ALARM_CN[a.code] || a.code)}</span></td><td>${esc(a.detail)}</td>
+    <td>${a.woke ? '<span class="pill gold">叫了大脑</span>' : '<span class="pill plain">只记录</span>'}</td></tr>`).join('');
+  return `<div class="card" style="margin-bottom:14px">
+    <div class="card-hd"><h3>哨兵警报</h3><span class="sub">由代码判定。同一种警报 20 小时内不重复。</span>
+      <span class="right"><button class="btn sm" onclick="brainRunSentinel()">现在检查一次</button></span></div>
+    ${rows ? `<div class="tablewrap"><table><thead><tr><th>时间</th><th>警报</th><th>内容</th><th></th></tr></thead><tbody>${rows}</tbody></table></div>` : '<div class="empty"><b>没有警报</b><span>多数日子什么都没发生，这是正常的。</span></div>'}
+    <div class="result" id="bn-sentinel-result"></div>
+  </div>`;
+}
+
+function brainVariantsCard(d) {
+  const slotCn = { ask: '提问', watch: '接下来看', close: '收尾' };
+  const kindCn = { question: '盘中一问', anomaly: '今日反常', recap: '昨日对账' };
+  const rows = d.variants.map(v => `<tr style="${v.status === 'off' ? 'opacity:.55' : ''}">
+    <td>${esc(kindCn[v.kind] || v.kind)}</td><td>${esc(slotCn[v.slot] || v.slot)}</td><td>${esc(v.text)}</td>
+    <td>${v.origin === 'operator' ? '<span class="pill info">自加</span>' : '<span class="pill plain">内置</span>'}</td>
+    <td><button class="btn sm" onclick="brainToggleVariant(${v.id})">${v.status === 'active' ? '下线' : '恢复'}</button></td></tr>`).join('');
+  return `<div class="card" style="margin-bottom:14px">
+    <div class="card-hd"><h3>栏目措辞变体</h3><span class="sub">变体是一句短话：不能有数字、币种、第一人称或买卖字眼，所以它碰不到事实，也不会冒充持仓。</span></div>
+    <div class="tablewrap"><table><thead><tr><th>栏目</th><th>位置</th><th>短语</th><th></th><th></th></tr></thead><tbody>${rows}</tbody></table></div>
+    <div class="row" style="margin-top:10px">
+      <select id="bn-vkind"><option value="question">盘中一问</option><option value="anomaly">今日反常</option><option value="recap">昨日对账</option></select>
+      <select id="bn-vslot"><option value="ask">提问</option><option value="watch">接下来看</option><option value="close">收尾</option></select>
+      <input type="text" id="bn-vtext" placeholder="4–40 字，无数字" style="flex:1;min-width:200px" autocomplete="off">
+      <button class="btn" onclick="brainAddVariant()">加入</button></div>
+  </div>`;
+}
+
+function brainCallsCard(d) {
+  const t = d.calls_ledger.tally;
+  const recent = d.calls_ledger.recent.map(c => `<tr><td>$${esc(c.symbol)}</td><td>${esc(c.payer)}付</td><td class="num">${(c.rate_at * 100).toFixed(3)}%</td>
+    <td class="num">${c.rate_after == null ? '—' : (c.rate_after * 100).toFixed(3) + '%'}</td>
+    <td>${c.outcome ? `<span class="pill ${c.outcome === 'held' ? 'on' : 'warn'}">${{ held: '成立', faded: '减弱', flipped: '反转', void: '作废', late: '作废' }[c.outcome] || esc(c.outcome)}</span>` : '<span class="pill plain">待裁决</span>'}</td></tr>`).join('');
+  const use = d.usage7d.map(u => `<span class="pill plain">${esc(PURPOSE_CN[u.purpose] || u.purpose)} ${u.n} 次${u.failed ? `（失败 ${u.failed}）` : ''}</span>`).join(' ');
+  const calls = d.calls.map(c => `<tr><td>${esc(fmtTs(c.at))}</td><td>${esc(PURPOSE_CN[c.purpose] || c.purpose)}</td><td>${esc(c.model)}</td>
+    <td class="num">${c.ms} ms</td><td class="num">${c.in_chars} / ${c.out_chars}</td><td>${c.ok ? '<span class="pill on">成功</span>' : `<span class="pill bad" title="${esc(c.error || '')}">失败</span>`}</td></tr>`).join('');
+  return `<div class="card" style="margin-bottom:14px">
+    <div class="card-hd"><h3>判断记录与调用记录</h3><span class="sub">栏目帖子发出时登记一条可检验的判断，隔天由代码核对，「昨日对账」栏目用这些记录。</span></div>
+    <div class="kv" style="margin:6px 0"><span class="pill info">已裁决 ${t.total}</span><span class="pill on">成立 ${t.held}</span><span class="pill warn">减弱 ${t.faded}</span><span class="pill warn">反转 ${t.flipped}</span><span class="pill plain">待裁决 ${t.open}</span></div>
+    ${recent ? `<div class="tablewrap"><table><thead><tr><th>币</th><th>当时</th><th class="num">当时费率</th><th class="num">隔天费率</th><th>结果</th></tr></thead><tbody>${recent}</tbody></table></div>` : ''}
+    <div class="hint" style="margin-top:12px"><b>近 7 天的模型调用：</b> ${use || '没有'}</div>
+    ${calls ? `<div class="tablewrap"><table><thead><tr><th>时间</th><th>任务</th><th>模型</th><th class="num">耗时</th><th class="num">输入 / 输出（字）</th><th></th></tr></thead><tbody>${calls}</tbody></table></div>` : ''}
+  </div>`;
+}
+
+function brainBenchmarkCard(d) {
+  const c = d.benchmark.composition, by = d.benchmark.byLang;
+  const pct = x => (x * 100).toFixed(0) + '%';
+  return `<div class="card" style="margin-bottom:14px">
+    <div class="card-hd"><h3>对照：中文榜</h3><span class="sub">账号写中文，只和中文榜比。英文样本仍保留（${by.other} 条），但不进比较。</span></div>
+    <div class="kv" style="margin:6px 0">
+      <span class="pill info">中文样本 ${by.zh}</span>
+      <span class="pill plain">浏览中位数 ${fmtN(c.medianViews)}</span>
+      <span class="pill plain">每千次浏览：赞 ${fmtN(c.likesPer1k)} / 评论 ${fmtN(c.commentsPer1k)}</span>
+    </div>
+    ${c.n ? `<div class="kv"><span class="pill plain">提问 ${pct(c.shares.question)}</span><span class="pill plain">第一人称 ${pct(c.shares.firstPerson)}</span><span class="pill plain">带价位 ${pct(c.shares.pricePoint)}</span><span class="pill plain">快讯流 ${pct(c.shares.news)}</span><span class="pill plain">带图 ${pct(c.shares.image)}（带图中位数 ${fmtN(c.medianViewsImage)} / 不带 ${fmtN(c.medianViewsNoImage)}）</span></div>` : '<div class="empty"><b>还没有中文榜样本</b><span>基准采样每 4 轮一次，下一轮会开始存中文榜。</span></div>'}
+    <div class="hint">${esc(c.caveat)}</div>
+  </div>`;
+}
+
+async function brainView() {
+  brainCaptureForm();
+  BRAIN = await api('/api/brain');
+  const d = BRAIN;
+  return `
+    ${brainGateCards(d)}
+    ${brainConnectionCard(d)}
+    ${brainJobsCard(d)}
+    ${brainColumnCard(d)}
+    ${brainBreakerCard(d)}
+    ${brainReportsCard(d)}
+    ${brainAlarmsCard(d)}
+    ${brainVariantsCard(d)}
+    ${brainCallsCard(d)}
+    ${brainBenchmarkCard(d)}
+    <div class="card"><div class="card-hd"><h3>大脑被告知的规则</h3><span class="sub">只读。权限由代码里的闸门决定，改提示词不会放宽任何一条。</span></div>
+      <details><summary>每日反思 / 通用规则</summary><pre class="result show" style="white-space:pre-wrap">${esc(d.prompts.rules)}</pre></details>
+      <details><summary>周复盘提示词</summary><pre class="result show" style="white-space:pre-wrap">${esc(d.prompts.weekly)}</pre></details>
+      <details><summary>哨兵提示词</summary><pre class="result show" style="white-space:pre-wrap">${esc(d.prompts.sentinel)}</pre></details>
+    </div>`;
+}
+
+/* ------------------------------------------------------------- actions --- */
+
+function brainResult(id, kind, msg) {
+  const el = document.getElementById(id);
+  if (!el) return;
+  el.className = `result show ${kind || 'busy'}`;
+  el.innerHTML = msg;
+}
+
+function brainPayload() {
+  brainCaptureForm();
+  const out = {};
+  for (const [k, v] of Object.entries(BRAIN_DRAFT)) if (!k.startsWith('__')) out[k] = v;
+  return out;
+}
+
+async function brainSave() {
+  try {
+    if (BRAIN_DRAFT.__key) await brainSaveKey(true);
+    const r = await api('/api/brain/config', bjson(brainPayload()));
+    BRAIN_DRAFT = {};
+    toast(r.changed.length ? `已保存（${r.changed.length} 项）` : '没有改动');
+    await render();
+  } catch (e) { brainResult('bn-result', 'bad', '保存失败：' + esc(e.message)); toast(e.message, true); }
+}
+
+async function brainSaveKey(quiet) {
+  const el = document.getElementById('bn-key');
+  const value = (el && el.value.trim()) || BRAIN_DRAFT.__key || '';
+  if (!value) return toast('输入框是空的', true);
+  await api('/api/brain/key', bjson({ provider: BRAIN.settings.llmProvider, value }));
+  delete BRAIN_DRAFT.__key;
+  if (el) el.value = '';
+  if (!quiet) { toast('Key 已保存'); await render(); }
+}
+
+async function brainClearKey() {
+  if (!confirm('清除本机保存的这个 Key？')) return;
+  await api('/api/brain/key', bjson({ provider: BRAIN.settings.llmProvider, value: '' }));
+  toast('已清除'); await render();
+}
+
+function brainPick(key, id) {
+  BRAIN_DRAFT[key] = id;
+  const el = document.getElementById(key === 'llmModel' ? 'bn-model' : 'bn-brainmodel');
+  if (el) el.value = id;
+}
+
+function brainDiscard() {
+  BRAIN_DRAFT = {};
+  render();
+}
+
+async function brainSwitch(p) {
+  brainCaptureForm();
+  const cur = bdv('llmBaseUrl', BRAIN.settings.llmBaseUrl || '');
+  const stock = BRAIN_PRESETS.some(g => g.provider !== p && g.url === cur);
+  const url = stock || !cur.trim() ? (BRAIN_PRESETS.find(g => g.provider === p)?.url || cur) : cur;
+  BRAIN_DRAFT.llmBaseUrl = url;
+  try {
+    await api('/api/brain/config', bjson({ llmProvider: p, llmBaseUrl: url }));
+    BRAIN_MODELS = [];
+    delete BRAIN_DRAFT.llmBaseUrl;
+    await render();
+  } catch (e) { toast('切换失败：' + e.message, true); }
+}
+
+async function brainPreset(i) {
+  const g = BRAIN_PRESETS[i];
+  brainCaptureForm();
+  try {
+    await api('/api/brain/config', bjson({ llmProvider: g.provider, llmBaseUrl: g.url }));
+    delete BRAIN_DRAFT.llmBaseUrl;
+    BRAIN_MODELS = [];
+    await render();
+  } catch (e) { toast(e.message, true); }
+}
+
+async function brainFetchModels() {
+  brainCaptureForm();
+  brainResult('bn-result', 'busy', '正在拉取模型列表…');
+  try {
+    const typed = document.getElementById('bn-key');
+    const r = await api('/api/brain/models', bjson({ provider: BRAIN.settings.llmProvider, baseUrl: bdv('llmBaseUrl', BRAIN.settings.llmBaseUrl), apiKey: typed ? typed.value.trim() : '' }));
+    BRAIN_MODELS = r.models;
+    await render();
+    brainResult('bn-result', r.count ? 'good' : 'bad', r.count ? `✓ 拉到 ${r.count} 个模型，在上方列表里点选` : '该接口返回了 0 个模型，可直接手填模型名');
+  } catch (e) { brainResult('bn-result', 'bad', '拉取失败：' + esc(e.message)); }
+}
+
+async function brainTest() {
+  brainResult('bn-result', 'busy', '正在请求一次对话…');
+  try {
+    if (brainDirty().length || BRAIN_DRAFT.__key) await brainSave();
+    const r = await api('/api/brain/test', bjson({}));
+    brainResult('bn-result', 'good', `✓ ${esc(r.provider)} / ${esc(r.model)} 回复「${esc(r.reply)}」（${r.ms} ms）`);
+    toast('大脑连通');
+    const list = await api('/api/brain'); BRAIN = list;
+  } catch (e) { brainResult('bn-result', 'bad', '测试失败：' + esc(e.message)); }
+}
+
+async function brainSaveNotes() {
+  const el = document.getElementById('bn-notes');
+  await api('/api/brain/notes', bjson({ text: el ? el.value : '' }));
+  delete BRAIN_DRAFT.__notes;
+  toast('已保存'); await render();
+}
+
+async function brainTarget(t) {
+  try {
+    await api('/api/conversion/target', bjson({ target: t }));
+    toast('已切换'); await render();
+  } catch (e) { toast(e.message, true); }
+}
+
+async function brainResetBreaker() {
+  if (!confirm('确认恢复自动发布？\n\n建议先看一下上面的报告和哨兵诊断，确认原因处理过了。恢复后窗口重新起算。')) return;
+  const r = await api('/api/brain/breaker/reset', bjson({}));
+  toast(r.shifted ? `已恢复，${r.shifted} 个在途参数窗口已顺延` : '已恢复');
+  await render();
+}
+
+async function brainOpenReport(id) {
+  if (BRAIN_OPEN_REPORT && BRAIN_OPEN_REPORT.id === id) { BRAIN_OPEN_REPORT = null; return render(); }
+  BRAIN_OPEN_REPORT = await api('/api/brain/reports/' + id);
+  await render();
+}
+
+async function brainApprove() {
+  if (!BRAIN_OPEN_REPORT) return;
+  try {
+    const r = await api(`/api/brain/reports/${BRAIN_OPEN_REPORT.id}/approve`, bjson({}));
+    BRAIN_OPEN_REPORT = await api('/api/brain/reports/' + BRAIN_OPEN_REPORT.id);
+    toast(r.results.some(x => x.ok) ? '已执行，闸门的答复在报告里' : '闸门全部拒绝，原因在报告里', !r.results.some(x => x.ok));
+    await render();
+  } catch (e) { toast(e.message, true); }
+}
+
+async function brainDismiss() {
+  if (!BRAIN_OPEN_REPORT) return;
+  await api(`/api/brain/reports/${BRAIN_OPEN_REPORT.id}/dismiss`, bjson({}));
+  BRAIN_OPEN_REPORT = null;
+  toast('已忽略'); await render();
+}
+
+async function brainRunWeekly() {
+  brainResult('bn-report-result', 'busy', '正在生成周复盘…（要调用一次模型，可能要几十秒）');
+  try {
+    const r = await api('/api/brain/weekly', bjson({}));
+    brainResult('bn-report-result', 'good', '✓ ' + esc(r.note));
+    BRAIN_OPEN_REPORT = r.reportId ? await api('/api/brain/reports/' + r.reportId) : null;
+    await render();
+  } catch (e) { brainResult('bn-report-result', 'bad', esc(e.message)); }
+}
+
+async function brainRunSentinel() {
+  brainResult('bn-sentinel-result', 'busy', '检查中…');
+  try {
+    const r = await api('/api/brain/sentinel', bjson({}));
+    brainResult('bn-sentinel-result', r.raised.length ? 'good' : 'busy',
+      r.raised.length ? `发现 ${r.raised.length} 条新警报。${r.woke ? '已唤醒大脑并生成了诊断。' : esc(r.skippedWhy || '')}` : '没有新警报。');
+    if (r.raised.length) await render();
+  } catch (e) { brainResult('bn-sentinel-result', 'bad', esc(e.message)); }
+}
+
+async function brainAddVariant() {
+  try {
+    await api('/api/brain/variants', bjson({ kind: $('#bn-vkind').value, slot: $('#bn-vslot').value, text: $('#bn-vtext').value }));
+    toast('已加入'); await render();
+  } catch (e) { toast(e.message, true); }
+}
+
+async function brainToggleVariant(id) {
+  await api(`/api/brain/variants/${id}/toggle`, bjson({}));
+  await render();
+}
+
+window.brainView = brainView;
+window.brainSave = brainSave;
+window.brainSaveKey = brainSaveKey;
+window.brainClearKey = brainClearKey;
+window.brainPick = brainPick;
+window.brainDiscard = brainDiscard;
+window.brainSwitch = brainSwitch;
+window.brainPreset = brainPreset;
+window.brainFetchModels = brainFetchModels;
+window.brainTest = brainTest;
+window.brainSaveNotes = brainSaveNotes;
+window.brainTarget = brainTarget;
+window.brainResetBreaker = brainResetBreaker;
+window.brainOpenReport = brainOpenReport;
+window.brainApprove = brainApprove;
+window.brainDismiss = brainDismiss;
+window.brainRunWeekly = brainRunWeekly;
+window.brainRunSentinel = brainRunSentinel;
+window.brainAddVariant = brainAddVariant;
+window.brainToggleVariant = brainToggleVariant;
+})();

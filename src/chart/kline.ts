@@ -33,6 +33,9 @@ export interface ChartOptions {
   subtitle?: string;
   lastPrice: number;
   changePct: number;
+  /** What span `changePct` covers, e.g. «近72小时». It is printed next to the number so the header
+   *  can never be read as the 24h figure in the footer chips. */
+  changeLabel?: string;
   stats?: ChartStats;
 }
 
@@ -45,6 +48,13 @@ function sma(values: number[], period: number): (number | null)[] {
     out.push(i >= period - 1 ? sum / period : null);
   }
   return out;
+}
+
+/** Rough rendered width: CJK glyphs are about twice as wide as Latin ones at the same size. */
+function textWidth(s: string, size: number): number {
+  let w = 0;
+  for (const ch of s) w += ch.charCodeAt(0) > 0x2e80 ? size : size * 0.58;
+  return w;
 }
 
 function esc(s: string): string {
@@ -109,7 +119,7 @@ export function renderKlineSvg(klines: Kline[], opts: ChartOptions): string {
   const vy = (v: number) => volBottom - (v / maxVol) * (volBottom - volTop);
 
   const parts: string[] = [];
-  parts.push(`<svg xmlns="http://www.w3.org/2000/svg" width="${W}" height="${H}" viewBox="0 0 ${W} ${H}" font-family="DejaVu Sans, Arial, sans-serif">`);
+  parts.push(`<svg xmlns="http://www.w3.org/2000/svg" width="${W}" height="${H}" viewBox="0 0 ${W} ${H}" font-family="Microsoft YaHei, Noto Sans CJK SC, DejaVu Sans, Arial, sans-serif">`);
   parts.push(`<rect width="${W}" height="${H}" fill="${BG}"/>`);
   parts.push(`<rect x="${PAD_L}" y="${PAD_T}" width="${plotW}" height="${priceBottom - PAD_T}" fill="${PANEL}"/>`);
 
@@ -179,10 +189,9 @@ export function renderKlineSvg(klines: Kline[], opts: ChartOptions): string {
   const chg = opts.changePct;
   const chgCol = chg >= 0 ? UP : DOWN;
   parts.push(`<text x="${PAD_L + 4}" y="34" fill="${TEXT}" font-size="26" font-weight="bold">${esc(opts.title)}</text>`);
+  const chgText = `${opts.changeLabel ? `${opts.changeLabel} ` : ''}${chg >= 0 ? '+' : ''}${chg.toFixed(2)}%`;
   parts.push(
-    `<text x="${PAD_L + 4 + String(opts.title).length * 15 + 14}" y="34" fill="${chgCol}" font-size="22" font-weight="bold">${esc(
-      `${chg >= 0 ? '+' : ''}${chg.toFixed(2)}%`,
-    )}</text>`,
+    `<text x="${(PAD_L + 4 + textWidth(opts.title, 26) + 18).toFixed(0)}" y="34" fill="${chgCol}" font-size="22" font-weight="bold">${esc(chgText)}</text>`,
   );
   if (opts.subtitle) parts.push(`<text x="${PAD_L + 4}" y="58" fill="${DIM}" font-size="15">${esc(opts.subtitle)}</text>`);
 

@@ -1,5 +1,5 @@
 import { sampleSignals } from '../hot/signals.ts';
-import { annualizedFunding } from './derive.ts';
+import { annualizedFunding, fundingPayer } from './derive.ts';
 import type { Material } from './types.ts';
 
 /**
@@ -33,6 +33,9 @@ export async function enrichWithMarketContext(materials: Material[], fundingInte
     add('funding', s.funding);
     add('longRatio', s.longRatio == null ? null : Number(s.longRatio.toFixed(2)));
     add('oiChangePct', s.oiChangePct == null || Math.abs(s.oiChangePct) > 100 ? null : Number(s.oiChangePct.toFixed(1)));
+    // The 24h move is what lets a rate be read against the tape; funding materials carry the
+    // rate but never the price change, which made «谁在为涨/跌付费» unwritable for them.
+    add('chg24h', Number(s.chg24h.toFixed(2)));
     add('chg1h', Number(s.chg1h.toFixed(2)));
     add('volMultiple', s.volMultiple == null ? null : Number(s.volMultiple.toFixed(2)));
     add('quoteVolume24h', Math.round(s.quoteVolume24h));
@@ -47,7 +50,8 @@ export async function enrichWithMarketContext(materials: Material[], fundingInte
       add('annualized', annualizedFunding(f.funding, fundingIntervalHours));
     }
     if (typeof f.funding === 'number' && f.payer == null) {
-      add('payer', f.funding > 0 ? '多头' : f.funding < 0 ? '空头' : null);
+      // '' rather than null for the default rate: it must not be re-derived later from the sign.
+      add('payer', fundingPayer(f.funding, typeof f.annualized === 'number' ? f.annualized : null));
     }
     touched++;
   }

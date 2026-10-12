@@ -1,4 +1,5 @@
 import { makeMaterial, type Material } from '../material/types.ts';
+import { fundingPayer } from '../material/derive.ts';
 
 /**
  * Hyperliquid perpetual market.
@@ -75,6 +76,7 @@ export async function hyperliquid(opts: { fundingThreshold?: number; minVolumeUs
     if (!notable) continue;
 
     const fundingLed = Math.abs(funding) >= threshold;
+    const annualized = Number((funding * 24 * 365 * 100).toFixed(1));
     out.push(
       makeMaterial({
         category: 'onchain',
@@ -100,8 +102,9 @@ export async function hyperliquid(opts: { fundingThreshold?: number; minVolumeUs
           // sumOpenInterestValue for the same coins, so mark × size is the right USD figure.
           oiUsd: Math.round(Number(r.openInterest) * mark),
           // Annualised at the hourly settlement cadence Hyperliquid actually uses.
-          annualized: Number((funding * 24 * 365 * 100).toFixed(1)),
-          payer: funding > 0 ? '多头' : funding < 0 ? '空头' : '',
+          annualized,
+          // Empty at the venue's default rate: see fundingIsBaseline.
+          payer: fundingPayer(funding, annualized),
         },
       }),
     );

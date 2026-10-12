@@ -3,7 +3,7 @@ import { sampleSignals, type SymbolSignal } from './signals.ts';
 import { readSquare, type SquareSnapshot } from './square.ts';
 import type { Settings } from '../config.ts';
 import type { Context } from '../engine/types.ts';
-import { annualizedFunding } from '../material/derive.ts';
+import { annualizedFunding, fundingPayer } from '../material/derive.ts';
 
 /**
  * The attention pool.
@@ -27,6 +27,8 @@ export interface PoolEntry {
   samples: number;
   /** How long it has continuously been above the threshold. */
   sustainedMinutes: number;
+  /** True when the streak ran off the start of the data: the real duration is at least this, unknown beyond it. */
+  sustainedCapped: boolean;
   firstSeenAt: number;
   scoreStart: number;
   scorePeak: number;
@@ -43,6 +45,12 @@ export interface RefreshReport {
 }
 
 const LOOKBACK_MS = 6 * 3600_000;
+/**
+ * How far back the unbroken streak is allowed to reach. It used to share the 6h window above, so
+ * any coin that stayed hot simply measured «as long as the window» — 13 of 22 published posts said
+ * 持续约 5.5–6 小时, which was the length of the query, not of the signal.
+ */
+const STREAK_LOOKBACK_MS = 48 * 3600_000;
 
 /**
  * Is there anything concrete to report? Being talked about is the reason to look;
@@ -133,16 +141,20 @@ function build(store: Store, settings: Settings, square: SquareSnapshot): PoolEn
   const entries: PoolEntry[] = [];
 
   for (const c of square.coins.slice(0, 25)) {
-    const samples = store.samplesFor(c.symbol, now - LOOKBACK_MS);
+    const history = store.samplesFor(c.symbol, now - STREAK_LOOKBACK_MS);
+    const samples = history.filter(x => x.ts >= now - LOOKBACK_MS);
     if (!samples.length) continue;
     const latest = samples[samples.length - 1]!;
     if (now - latest.ts > 25 * 60_000) continue; // stale — we stopped seeing it
 
     // Count the unbroken tail of samples that stayed over the threshold.
     let sustainedFrom = latest.ts;
-    for (let i = samples.length - 1; i >= 0; i--) {
-      if ((samples[i] as { score: number }).score >= settings.attentionThreshold) sustainedFrom = (samples[i] as { ts: number }).ts;
-      else break;
+    let sustainedCapped = false;
+    for (let i = history.length - 1; i >= 0; i--) {
+      if ((history[i] as { score: number }).score >= settings.attentionThreshold) {
+        sustainedFrom = (history[i] as { ts: number }).ts;
+        if (i === 0) sustainedCapped = true;
+      } else break;
     }
     const parts = (latest.parts ?? {}) as Record<string, number | string | null>;
 
@@ -158,6 +170,7 @@ function build(store: Store, settings: Settings, square: SquareSnapshot): PoolEn
       market: null,
       samples: samples.filter(s => s.score >= settings.attentionThreshold).length,
       sustainedMinutes: Math.round((latest.ts - sustainedFrom) / 60_000),
+      sustainedCapped,
       firstSeenAt: sustainedFrom,
       scoreStart: (samples.find(s => s.ts >= sustainedFrom) ?? latest).score,
       scorePeak: Math.max(...samples.map(s => s.score)),
@@ -215,7 +228,8 @@ export function dossier(e: PoolEntry): Context {
   const funding = m?.funding ?? null;
   const intervalHours = 8;
   const annualized = annualizedFunding(funding, intervalHours);
-  const hours = e.sustainedMinutes >= 60 ? Number((e.sustainedMinutes / 60).toFixed(1)) : null;
+  // A capped streak is a lower bound, and a lower bound written as «持续约 N 小时» is a made-up number.
+  const hours = e.sustainedMinutes >= 60 && !e.sustainedCapped ? Number((e.sustainedMinutes / 60).toFixed(1)) : null;
 
   return {
     cashtag: `$${e.symbol}`,
@@ -226,6 +240,7 @@ export function dossier(e: PoolEntry): Context {
     volMultiple: m ? Number(m.volMultiple.toFixed(1)) : null,
     funding,
     annualized,
+    payer: fundingPayer(funding, annualized),
     oiChangePct: m?.oiChangePct != null ? Number(m.oiChangePct.toFixed(1)) : null,
     longRatio: m?.longRatio != null ? Number(m.longRatio.toFixed(2)) : null,
     agreeing: e.agreeing,

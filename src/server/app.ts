@@ -13,6 +13,9 @@ import { isStructuralDuplicate } from '../engine/guard.ts';
 import { line, tick, type TickResult } from '../daemon.ts';
 import { analyze, CATEGORY_LABELS, signalLabel } from '../stats/insight.ts';
 import { dashboard } from '../stats/dashboard.ts';
+import { boardComposition } from '../stats/benchmarks.ts';
+import { currentTarget } from '../rank/gates.ts';
+import { registerBrainRoutes } from './brainRoutes.ts';
 import { backupAgeHours, BACKUP_STALE_HOURS } from '../backup.ts';
 import { attributeConversions } from '../money/conversion.ts';
 import { scoreAll } from '../rank/score.ts';
@@ -21,7 +24,7 @@ import { armsOf } from '../rank/experiments.ts';
 import { playbook } from '../rank/playbook.ts';
 import { DIMENSION_NAMES, DIMENSIONS } from '../rank/hypotheses.ts';
 import { propose, proposals, registry, resolveProposal, retire } from '../rank/registry.ts';
-import { changeLedger, currentKnob, KNOBS, proposeChange } from '../rank/params.ts';
+import { changeLedger, currentKnob, KNOBS, liveKnobs, proposeChange } from '../rank/params.ts';
 import { brainFor } from '../brain/brain.ts';
 import { reflect } from '../brain/author.ts';
 import { TRACKS, UNIMPLEMENTED_TRACKS, trackById } from '../studio/tracks.ts';
@@ -106,6 +109,7 @@ app.get('/', (_req, reply) => reply.type('text/html').send(ui));
 const ASSETS: Record<string, { file: string; type: string }> = {
   '/app.css': { file: 'app.css', type: 'text/css; charset=utf-8' },
   '/app.js': { file: 'app.js', type: 'text/javascript; charset=utf-8' },
+  '/brain.js': { file: 'brain.js', type: 'text/javascript; charset=utf-8' },
 };
 for (const [route, a] of Object.entries(ASSETS)) {
   const body = readFileSync(join(here, 'public', a.file), 'utf8');
@@ -318,7 +322,7 @@ app.get('/api/dashboard', (req, reply) => {
 app.get('/api/rank', (req, reply) => {
   const q = req.query as { days?: string };
   const days = Math.max(1, Math.min(90, Number(q.days) > 0 ? Number(q.days) : 30));
-  const target = settingsFrom(store).targetMetric;
+  const target = currentTarget(store, settingsFrom(store));
   const verdicts = scoreAll(store, { days, writeMemory: false, target });
   const curve = distributionRows(store, days).map(r => ({
     postId: r.post_id, publishedAt: r.published_at, firstRead: r.first_read, v1h: r.v1h, v3h: r.v3h, v8h: r.v8h, v24h: r.v24h,
@@ -339,7 +343,7 @@ app.get('/api/rank', (req, reply) => {
     registry: registry(store).map(h => ({ id: h.id, claim: h.claim, mode: h.mode, dimension: h.dimension, metric: h.metric, minSamples: h.minSamples })),
     proposals: proposals(store),
     dimensions: DIMENSION_NAMES.map(d => ({ id: d, ...DIMENSIONS[d] })),
-    knobs: KNOBS.map(k => ({ ...k, current: currentKnob(store, k.key) })),
+    knobs: KNOBS.map(k => ({ ...k, current: currentKnob(store, k.key), live: liveKnobs(settingsFrom(store)).some(l => l.key === k.key) })),
     paramChanges: changeLedger(store, 20),
     target,
     conversion: {
@@ -444,18 +448,22 @@ app.post('/api/conversion', (req, reply) => {
 
 app.post('/api/conversion/target', (req, reply) => {
   const b = (req.body ?? {}) as { target?: string };
-  if (b.target !== 'views' && b.target !== 'money') return reply.code(400).send({ error: 'target 只能是 views 或 money' });
-  if (b.target === 'money' && !store.db.prepare('SELECT COUNT(*) n FROM conversion_daily').get()) {
-    return reply.code(400).send({ error: '还没有录入过任何一天的后台数字，先录一天再切' });
+  if (b.target === 'auto') {
+    saveSettings(store, { ...settingsFrom(store), targetMode: 'auto' });
+    return reply.send({ ok: true, target: currentTarget(store, settingsFrom(store)), mode: 'auto' });
+  }
+  if (b.target !== 'views' && b.target !== 'engagement' && b.target !== 'money') return reply.code(400).send({ error: 'target 只能是 auto、views、engagement 或 money' });
+  if (b.target === 'money' && !(store.db.prepare('SELECT COUNT(*) n FROM conversion_daily WHERE rebate_usd IS NOT NULL').get() as { n: number }).n) {
+    return reply.code(400).send({ error: '还没有录入过任何一天的返佣金额，先录一天再切' });
   }
   const s = settingsFrom(store);
-  saveSettings(store, { ...s, targetMetric: b.target });
+  saveSettings(store, { ...s, targetMetric: b.target, targetMode: 'manual' });
   return reply.send({ ok: true, target: b.target });
 });
 
 /** The comparison pool itself, so the numbers behind a conclusion can be inspected. */
 app.get('/api/benchmarks', (_req, reply) => {
-  return reply.send({ pool: store.boardCount(), rows: store.boardRows(40) });
+  return reply.send({ pool: store.boardCount(), byLang: store.boardCountByLang(), composition: boardComposition(store), rows: store.boardRows(40) });
 });
 
 /* ------------------------------------------------------------------ studio --- */
@@ -695,6 +703,8 @@ app.post('/api/llm/test', async (req, reply) => {
     return reply.code(502).send({ error: err instanceof Error ? err.message : String(err) });
   }
 });
+
+registerBrainRoutes(app, store);
 
 app.get('/api/templates', (_req, reply) => {
   const rows = store.db.prepare('SELECT * FROM templates ORDER BY category, id').all() as (Record<string, unknown> & { category: string | null; sub_type: string | null; style: string | null })[];

@@ -422,6 +422,101 @@ CREATE TABLE IF NOT EXISTS param_changes (
   after_median  REAL
 );
 CREATE INDEX IF NOT EXISTS param_changes_status ON param_changes(status);
+
+/*
+ * Every model call, successful or not. The brain is the one component that spends money and
+ * whose output cannot be re-derived, so it keeps a ledger: what it was asked, by whom, how long it
+ * took, and what it cost in tokens when the endpoint says. Prompts are not stored (they can be
+ * rebuilt from the snapshot); the reply is, truncated, because that is what a reviewer reads.
+ */
+CREATE TABLE IF NOT EXISTS brain_calls (
+  id          INTEGER PRIMARY KEY AUTOINCREMENT,
+  at          INTEGER NOT NULL,
+  purpose     TEXT NOT NULL,             -- reflect | sentinel | weekly | test
+  provider    TEXT NOT NULL,
+  model       TEXT NOT NULL,
+  ok          INTEGER NOT NULL,
+  ms          INTEGER NOT NULL,
+  in_chars    INTEGER NOT NULL,
+  out_chars   INTEGER NOT NULL,
+  error       TEXT,
+  reply       TEXT
+);
+CREATE INDEX IF NOT EXISTS brain_calls_at ON brain_calls(at DESC);
+
+/*
+ * The weekly review and sentinel diagnoses. actions_json holds the structured proposals the
+ * brain made (TEST / PARAM / VARIANT); none of them is executed until the operator approves the
+ * report, and approval runs them through the same gates a direct proposal faces.
+ */
+CREATE TABLE IF NOT EXISTS brain_reports (
+  id           INTEGER PRIMARY KEY AUTOINCREMENT,
+  kind         TEXT NOT NULL,             -- weekly | sentinel
+  created_at   INTEGER NOT NULL,
+  title        TEXT NOT NULL,
+  body         TEXT NOT NULL,
+  snapshot_json TEXT,
+  actions_json TEXT NOT NULL DEFAULT '[]',
+  status       TEXT NOT NULL DEFAULT 'pending',   -- pending | approved | dismissed | failed
+  resolved_at  INTEGER,
+  result_json  TEXT
+);
+CREATE INDEX IF NOT EXISTS brain_reports_status ON brain_reports(status, created_at DESC);
+
+/* Alarms the deterministic sentinel raised. Whether the brain was woken for one is recorded. */
+CREATE TABLE IF NOT EXISTS brain_alarms (
+  id         INTEGER PRIMARY KEY AUTOINCREMENT,
+  at         INTEGER NOT NULL,
+  code       TEXT NOT NULL,
+  detail     TEXT NOT NULL,
+  woke       INTEGER NOT NULL DEFAULT 0,
+  report_id  INTEGER
+);
+CREATE INDEX IF NOT EXISTS brain_alarms_at ON brain_alarms(at DESC, code);
+
+/*
+ * A checkable statement a column post made, registered when the post is created and judged by
+ * code (never by the model) once its check time passes. The recap column reads these.
+ */
+CREATE TABLE IF NOT EXISTS column_calls (
+  id          INTEGER PRIMARY KEY AUTOINCREMENT,
+  post_id     INTEGER NOT NULL,
+  symbol      TEXT NOT NULL,
+  kind        TEXT NOT NULL,             -- funding_persists
+  reading     TEXT NOT NULL,
+  payer       TEXT NOT NULL,             -- 多头 | 空头 at the time of the post
+  rate_at     REAL NOT NULL,             -- funding rate when posted
+  annualized_at REAL,
+  interval_hours INTEGER NOT NULL DEFAULT 8,
+  price_at    REAL,
+  check_at    INTEGER NOT NULL,
+  status      TEXT NOT NULL DEFAULT 'open',   -- open | held | failed | void
+  outcome     TEXT,                      -- held | flipped | faded | void reason
+  rate_after  REAL,
+  annualized_after REAL,
+  price_after REAL,
+  judged_at   INTEGER,
+  recapped_in INTEGER
+);
+CREATE INDEX IF NOT EXISTS column_calls_status ON column_calls(status, check_at);
+
+/*
+ * Wording variants for the fixed column shapes. A variant is a short phrase with no digits and no
+ * first person, so it can never carry a fact or a position claim; which one a post used is
+ * recorded in the post's trace, which is how a variant gets a performance of its own.
+ */
+CREATE TABLE IF NOT EXISTS column_variants (
+  id         INTEGER PRIMARY KEY AUTOINCREMENT,
+  kind       TEXT NOT NULL,              -- question | anomaly | ledger | recap
+  slot       TEXT NOT NULL,              -- ask | watch | close
+  text       TEXT NOT NULL,
+  status     TEXT NOT NULL DEFAULT 'active',   -- active | off
+  origin     TEXT NOT NULL DEFAULT 'builtin',  -- builtin | operator
+  created_at INTEGER NOT NULL,
+  off_reason TEXT,
+  off_at     INTEGER,
+  UNIQUE (kind, slot, text)
+);
 `;
 
 export class Store {
@@ -549,6 +644,23 @@ export class Store {
       )
       .all(...params, now - DEFAULT_TTL_MINUTES * 60_000, limit) as MaterialRow[];
     return rows.map(rowToMaterial);
+  }
+
+  /** Every live, unused row of one category, newest first. Not capped by score against other categories. */
+  unusedByCategory(category: string, now = Date.now()): Material[] {
+    const ttl = (TTL_MINUTES[category] ?? DEFAULT_TTL_MINUTES) * 60_000;
+    const rows = this.db
+      .prepare(
+        `SELECT * FROM materials m
+         WHERE m.category = ? AND m.discarded = 0 AND m.used_count = 0 AND m.occurred_at >= ?
+         ORDER BY m.occurred_at DESC`,
+      )
+      .all(category, now - ttl) as MaterialRow[];
+    return rows.map(rowToMaterial);
+  }
+
+  unusedFundingMaterials(now = Date.now()): Material[] {
+    return this.unusedByCategory('funding', now);
   }
 
   markMaterialUsed(id: string): void {
@@ -839,11 +951,11 @@ export class Store {
   publishedWithSquareId(limit = 50) {
     return this.db
       .prepare(
-        `SELECT id, square_post_id, COALESCE(published_at, created_at) AS posted_at
+        `SELECT id, square_post_id, COALESCE(published_at, created_at) AS posted_at, images_json
          FROM posts WHERE status = 'published' AND square_post_id IS NOT NULL
          ORDER BY id DESC LIMIT ?`,
       )
-      .all(limit) as { id: number; square_post_id: string; posted_at: number }[];
+      .all(limit) as { id: number; square_post_id: string; posted_at: number; images_json: string | null }[];
   }
 
   /** Per-template performance, used to nudge weights toward what actually reads well. */
@@ -897,8 +1009,10 @@ export class Store {
    * View counts of the comparison pool. Our own posts are excluded: measuring ourselves
    * against ourselves would flatter every number downstream.
    */
-  boardViewPool(filter: { coin?: string | null; cardType?: string | null; board?: string | null } = {}): number[] {
+  boardViewPool(filter: { coin?: string | null; cardType?: string | null; board?: string | null; lang?: 'zh' | 'other' | null } = {}): number[] {
     const where: string[] = ['is_ours = 0'];
+    if (filter.lang === 'zh') where.push("lang LIKE 'zh%'");
+    if (filter.lang === 'other') where.push("(lang IS NULL OR lang NOT LIKE 'zh%')");
     const args: (string | number)[] = [];
     for (const [col, val] of [['coin', filter.coin], ['card_type', filter.cardType], ['board', filter.board]] as const) {
       if (val) {
@@ -911,6 +1025,14 @@ export class Store {
 
   boardCount(): number {
     return (this.db.prepare('SELECT COUNT(*) c FROM square_board_samples').get() as { c: number }).c;
+  }
+
+  /** Pool sizes split by language, so the panel can say which sample a comparison is made against. */
+  boardCountByLang(): { zh: number; other: number } {
+    const r = this.db
+      .prepare("SELECT SUM(CASE WHEN lang LIKE 'zh%' THEN 1 ELSE 0 END) AS zh, SUM(CASE WHEN lang LIKE 'zh%' THEN 0 ELSE 1 END) AS other FROM square_board_samples WHERE is_ours = 0")
+      .get() as { zh: number | null; other: number | null };
+    return { zh: r.zh ?? 0, other: r.other ?? 0 };
   }
 
   /** Top board rows for the panel, newest sweep first. */
@@ -1263,6 +1385,13 @@ export class Store {
     this.db.prepare('INSERT INTO settings (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value').run(key, JSON.stringify(value));
   }
 
+  /** Has an event of this kind already been logged for this post? Reads `detail.postId`. */
+  hasEvent(kind: string, postId: number): boolean {
+    return Boolean(
+      this.db.prepare(`SELECT 1 FROM events WHERE kind = ? AND json_extract(detail, '$.postId') = ? LIMIT 1`).get(kind, postId),
+    );
+  }
+
   log(kind: string, detail: unknown): void {
     this.db.prepare('INSERT INTO events (at, kind, detail) VALUES (?, ?, ?)').run(Date.now(), kind, JSON.stringify(detail));
   }
@@ -1508,6 +1637,34 @@ export class Store {
              AND p.status IN ('draft','approved','published') AND COALESCE(p.published_at, p.created_at) >= @t`,
         )
         .get({ a: accountId, s: symbol, t: sinceMs }) as { n: number }
+    ).n;
+  }
+
+  /** Column-lane posts this account made (or queued) since `sinceMs`, counting drafts. */
+  columnPostsSince(accountId: number, sinceMs: number): number {
+    return (
+      this.db
+        .prepare(
+          `SELECT COUNT(*) AS n FROM posts
+           WHERE account_id = @a AND template_id LIKE 'column.%'
+             AND status IN ('draft','approved','published','uncertain')
+             AND COALESCE(published_at, created_at) >= @t`,
+        )
+        .get({ a: accountId, t: sinceMs }) as { n: number }
+    ).n;
+  }
+
+  /** Posts of one column template this account made (or queued) since `sinceMs`. */
+  columnKindSince(accountId: number, templateId: string, sinceMs: number): number {
+    return (
+      this.db
+        .prepare(
+          `SELECT COUNT(*) AS n FROM posts
+           WHERE account_id = @a AND template_id = @t
+             AND status IN ('draft','approved','published','uncertain')
+             AND COALESCE(published_at, created_at) >= @s`,
+        )
+        .get({ a: accountId, t: templateId, s: sinceMs }) as { n: number }
     ).n;
   }
 

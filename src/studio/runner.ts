@@ -338,6 +338,7 @@ export async function polishArticleDraft(store: Store, settings: Settings, artic
   if (!a) return { ok: false, changed: false, reason: '文章不存在' };
   const track = a.account_id ? trackForAccount(store, a.account_id) : undefined;
   if (!track) return { ok: false, changed: false, reason: '缺少赛道绑定，无法校验润色结果' };
+  if (settings.llmPolish === false) return { ok: false, changed: false, reason: '润色开关已关闭（AI 大脑页）' };
   const cfg = llmConfigFor(store, settings);
   if (!cfg) return { ok: false, changed: false, reason: 'AI 未启用' };
 

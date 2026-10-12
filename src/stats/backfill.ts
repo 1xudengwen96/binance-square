@@ -54,6 +54,8 @@ interface RawVo {
   commentCount?: number;
   shareCount?: number;
   totalReactionCount?: number;
+  /** Hosted URLs of the images Square actually kept. Empty when an upload was dropped. */
+  imageList?: string[];
   /** Articles only. On a post the text sits in `content`; on an article `content` is empty. */
   bodyTextOnly?: string;
   /** Articles only — a post cannot be subscribed to, an article can. */
@@ -122,6 +124,14 @@ export async function backfillStats(store: Store): Promise<BackfillReport> {
     };
     store.recordPostStats(post.id, due, sample);
     report.updated++;
+
+    // We attached a chart but Square shows none: the post ran as text under a chart label, which
+    // would quietly pull the image comparison toward zero. Leave the arm alone (the assignment is
+    // on record) and say so once per post, so the shortfall is countable.
+    const sentImages = post.images_json && post.images_json !== '[]';
+    if (sentImages && !(vo.imageList?.length) && !store.hasEvent('image_missing', post.id)) {
+      store.log('image_missing', { postId: post.id, squarePostId: post.square_post_id });
+    }
   }
 
   store.log('backfill', report);
@@ -155,8 +165,14 @@ export function tuneTemplateWeights(store: Store, opts: { minPosts?: number; ste
     const current = (store.db.prepare('SELECT weight FROM templates WHERE id = ?').get(r.template_id) as { weight: number } | undefined)?.weight;
     if (current === undefined) continue;
     const ratio = r.avg_views / overall;
-    // Move a bounded fraction toward the observed ratio, then clamp.
-    const target = Math.max(0.3, Math.min(3, current * (1 + Math.max(-0.5, Math.min(0.5, ratio - 1)) * (step / 0.15))));
+    // The weight is a function of the evidence, not of its own history. Multiplying the current
+    // weight by the ratio every tick compounded the same all-time averages until four templates sat
+    // at the 3.0 ceiling. Now: the weight a template's ratio earns (shrunk toward 1 when the sample
+    // is thin), approached by at most `step` per run — calling this twice on the same data is a
+    // no-op the second time once it has arrived.
+    const shrink = r.posts / (r.posts + 10);
+    const earned = Math.max(0.3, Math.min(3, 1 + (ratio - 1) * shrink));
+    const target = Math.abs(earned - current) <= step ? earned : current + Math.sign(earned - current) * step;
     const next = Math.round(target * 100) / 100;
     if (Math.abs(next - current) < 0.01) continue;
     store.setTemplateWeight(r.template_id, next);

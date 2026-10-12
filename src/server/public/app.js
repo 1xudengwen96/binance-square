@@ -38,6 +38,7 @@ const ICON = {
   studio: '<path d="M4 19.5V6a2 2 0 012-2h12v16H6a2 2 0 00-2 2 2 2 0 002-2h12"/>',
   settings: '<path d="M4 6h16M4 12h16M4 18h16M9 4v4M15 10v4M7 16v4"/>',
   connect: '<path d="M9 3v5M15 3v5M6 8h12v4a6 6 0 01-12 0zM12 18v3"/>',
+  brain: '<path d="M9 4a3 3 0 00-3 3v.5A3 3 0 004 10.5 3 3 0 005 13a3.5 3.5 0 004 5.5V20h2V4zM15 4a3 3 0 013 3v.5a3 3 0 012 3 3 3 0 01-1 2.5 3.5 3.5 0 01-4 5.5V20h-2V4z"/>',
 };
 
 /**
@@ -64,7 +65,8 @@ const NAV = [
   ]],
   ['系统', [
     ['settings', '设置', '全局规则：额度、节奏、敏感词、保留期', ICON.settings],
-    ['connect', '接入与 AI', '广场 Key、代理、润色模型', ICON.connect],
+    ['brain', 'AI 大脑', '算法大脑的连接、任务、关卡、熔断和周报', ICON.brain],
+    ['connect', '接入与 AI', '广场 Key、代理', ICON.connect],
   ]],
 ];
 
@@ -94,7 +96,13 @@ function renderNav() {
       }).join('')}
     </div>`).join('');
 }
-async function go(tab) { TAB = tab; renderNav(); await render(); }
+async function go(tab) {
+  TAB = tab;
+  // The tab survives a reload, and a page can be linked to as /#brain.
+  if (location.hash !== '#' + tab) history.replaceState(null, '', '#' + tab);
+  renderNav();
+  await render();
+}
 
 function fmtTs(ms) {
   if (!ms) return '—';
@@ -154,6 +162,7 @@ async function render() {
   else if (TAB === 'studio') el.innerHTML = await studioView();
   else if (TAB === 'templates') el.innerHTML = await templatesView();
   else if (TAB === 'settings') el.innerHTML = settingsView();
+  else if (TAB === 'brain') el.innerHTML = await brainView();
   else el.innerHTML = await connectView();
 }
 
@@ -1194,7 +1203,7 @@ async function saveConversion() {
 async function setTarget(t) {
   try {
     await api('/api/conversion/target', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ target: t }) });
-    toast(t === 'money' ? '实验结论今后按「每千次浏览返佣」判定' : '实验结论按浏览量判定');
+    toast(t === 'money' ? '实验结论今后按「每千次浏览返佣」判定' : t === 'engagement' ? '实验结论今后按「每千次浏览的赞 + 评论×3 + 转发×4」判定' : '实验结论按浏览量判定');
     await render();
   } catch (e) { toast(e.message, true); }
 }
@@ -1248,6 +1257,7 @@ async function rankView() {
     <div class="row"><button class="btn primary" onclick="saveConversion()">记下</button>
       <span class="seg">
         <button class="${cv.target === 'views' ? 'on' : ''}" onclick="setTarget('views')">按浏览量优化</button>
+        <button class="${cv.target === 'engagement' ? 'on' : ''}" onclick="setTarget('engagement')">按互动质量优化</button>
         <button class="${cv.target === 'money' ? 'on' : ''}" onclick="setTarget('money')">按返佣优化</button>
       </span>
       <span class="muted">${entered ? `已录 ${entered} 天，累计返佣 ${money.toFixed(2)} USDT，归因到 ${cv.attributed.posts} 条帖子` : '一天都还没录 —— 「按返佣优化」要等你录入至少一天'}</span></div>
@@ -1264,7 +1274,7 @@ async function rankView() {
     ${tile('已观察帖子', d.curve.length, '按 20 分钟 / 1 / 3 / 8 / 24 小时回看', null)}
     ${tile('每千次浏览返佣', per1k == null ? '<span style="font-size:18px">还没录</span>' : `${per1k.toFixed(2)}<small> USDT</small>`,
       per1k == null ? '录一次后台数字，系统才开始优化真正挣钱那一环' : `累计 ${money.toFixed(2)} USDT / ${entered} 天`,
-      [['累计返佣', `${money.toFixed(2)} USDT`], ['录入天数', `${entered} 天`], ['当前优化目标', d.target === 'money' ? '每千次浏览返佣' : '浏览量'], ['归因方式', `${ATTRIBUTION_WINDOW} 小时窗口内按已积累浏览量加权`], ['提醒', '这是近似：它假设看得多就点得多，而这正是要验证的假设']])}
+      [['累计返佣', `${money.toFixed(2)} USDT`], ['录入天数', `${entered} 天`], ['当前优化目标', d.target === 'money' ? '每千次浏览返佣' : d.target === 'engagement' ? '每千次浏览互动质量' : '浏览量'], ['归因方式', `${ATTRIBUTION_WINDOW} 小时窗口内按已积累浏览量加权`], ['提醒', '这是近似：它假设看得多就点得多，而这正是要验证的假设']])}
     ${tile('长期记忆', d.memory.length, '条当前生效的判断', d.memory.slice(0, 6).map(m => [m.kind, `${m.text.slice(0, 28)}… 置信 ${(m.confidence * 100).toFixed(0)}%`]))}
     ${tile('AI 大脑', d.brain ? '已接入' : '未启用', d.brain ? `${d.brain.provider} · ${d.brain.model}` : '没有大脑也照常运转：规则由测量直接得出',
       d.brain ? [['提供方', d.brain.provider], ['模型', d.brain.model], ['权限', '只改写与排序，不得新增数字或币种']] : [['状态', '未配置或已关闭'], ['影响', '自我迭代仍在工作，只是少一层归纳']] )}
@@ -1822,62 +1832,12 @@ async function connectView() {
   </div>
 
   <div class="card">
-    <div class="card-hd"><h3>AI 润色（可选）</h3>
-      <span class="sub">模型只允许改写模版已填好事实的句子，不得新增数字或币种；生成后做数字回比，对不上就退回模版原文</span>
-      <span class="right"><span class="pill ${s.llmEnabled ? (lk.set ? 'on' : 'warn') : ''}">${s.llmEnabled ? (lk.set ? '已启用' : '缺 Key') : '未启用'}</span></span>
+    <div class="card-hd"><h3>AI 连接</h3>
+      <span class="sub">Base URL、Key、模型、润色开关都搬到了「AI 大脑」页，和大脑共用同一个连接。</span>
+      <span class="right"><span class="pill ${s.llmEnabled ? 'on' : ''}">${s.llmEnabled ? '已启用 · ' + esc(s.llmModel || '未选模型') : '未启用'}</span></span>
     </div>
-
-    <div class="field">
-      <span class="cap">接口类型</span>
-      <div class="seg">
-        <button class="${provider === 'openai' ? 'on' : ''}" onclick="switchProvider('openai')">OpenAI 通用</button>
-        <button class="${provider === 'anthropic' ? 'on' : ''}" onclick="switchProvider('anthropic')">Anthropic</button>
-      </div>
-      <div class="hint">「OpenAI 通用」覆盖 OpenRouter、DeepSeek、new-api / one-api、LM Studio、Ollama 等所有兼容网关。</div>
-    </div>
-
-    <div class="field">
-      <span class="cap">常用网关（点击填入）</span>
-      <div class="kv">${GATEWAY_PRESETS.map(g => `<button class="btn" onclick="applyPreset('${g.provider}','${g.url}')">${esc(g.label)}</button>`).join('')}</div>
-    </div>
-
-    <div class="field">
-      <span class="cap">Base URL（填到 /v1 为止）</span>
-      <input type="text" id="in-base" value="${esc(dv('llmBaseUrl', s.llmBaseUrl || ''))}" placeholder="https://api.openai.com/v1">
-    </div>
-
-    <div class="field">
-      <span class="cap">${provider === 'anthropic' ? 'Anthropic' : 'OpenAI / 兼容'} Key</span>
-      <div class="inputline">
-        <input type="password" id="in-llmkey" value="${esc(LLM_DRAFT.llmKeyPending || '')}" placeholder="${lk.set ? '已保存 ' + esc(lk.masked) + ' · 留空则不改动' : '粘贴 Key'}" autocomplete="off" onkeydown="if(event.key==='Enter')saveLlmKey()">
-        <button class="btn" onclick="saveLlmKey()">保存 Key</button>
-      </div>
-      <div class="hint">Key 只存在本机 SQLite，接口永不回传明文，页面上只显示首尾几位。</div>
-    </div>
-
-    <div class="field">
-      <span class="cap">模型</span>
-      <div class="inputline">
-        <input type="text" id="in-model" value="${esc(dv('llmModel', s.llmModel || ''))}" placeholder="点「拉取模型」选择，或直接输入模型名">
-        <button class="btn" onclick="fetchModels()">拉取模型</button>
-      </div>
-      ${MODELS.length ? `<div class="modelgrid">${MODELS.map(m => `<label><input type="radio" name="mdl" value="${esc(m.id)}" ${dv('llmModel', s.llmModel || '') === m.id ? 'checked' : ''} onchange="pickModel(this.value)">${esc(m.id)}<span class="mn">${esc(m.name)}</span></label>`).join('')}</div><div class="hint">共 ${MODELS.length} 个，点选即填入上方输入框。</div>` : ''}
-    </div>
-
-    <div class="grid" style="grid-template-columns:repeat(auto-fit,minmax(150px,1fr))">
-      <div class="field"><span class="cap">最大输出 token</span><input type="number" id="in-maxtok" value="${esc(dv('llmMaxTokens', s.llmMaxTokens || 1024))}"></div>
-      <div class="field"><span class="cap">温度（0–2）</span><input type="number" id="in-temp" step="0.1" min="0" max="2" value="${esc(dv('llmTemperature', s.llmTemperature ?? 0.7))}"></div>
-    </div>
-
-    <div class="kv" style="margin-top:4px">
-      <label class="kv" style="cursor:pointer"><input type="checkbox" id="in-llmon" style="width:auto" ${dv('llmEnabled', s.llmEnabled ? 'true' : 'false') === 'true' ? 'checked' : ''}> <span>启用 AI 润色</span></label>
-      <button class="btn primary" onclick="saveLlm()">保存配置</button>
-      <button class="btn" onclick="testLlm()">测试对话</button>
-      ${dirty.length ? `<span class="pill warn">未保存：${esc(dirty.map(k => FIELD_NAMES[k] || k).join('、'))}</span><button class="btn" onclick="discardLlmDraft()">放弃修改</button>` : '<span class="pill on">已是最新</span>'}
-    </div>
-    <div class="hint">「测试对话」会先把当前填的内容保存再发请求；「保存 Key」只存 Key，其余框里的值不会丢，但仍要点「保存配置」才生效。</div>
-    <div class="result" id="llmResult"></div>
-  </div>`;
+    <div class="row" style="margin-top:8px"><button class="btn primary" onclick="go('brain')">去 AI 大脑页配置</button></div>
+    </div>`;
 }
 
 async function saveSqKey() {
@@ -2023,6 +1983,10 @@ async function publish() {
 }
 
 document.documentElement.dataset.theme = localStorage.getItem('sf-theme') || 'dark';
+{
+  const fromHash = location.hash.replace('#', '');
+  if (NAV_FLAT.some(([k]) => k === fromHash)) TAB = fromHash;
+}
 renderNav();
 render();
 setInterval(() => { if (TAB === 'overview' || TAB === 'board' || TAB === 'queue') render(); }, 30000);

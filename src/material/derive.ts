@@ -18,3 +18,26 @@ export function annualizedFunding(rate: number | null | undefined, intervalHours
   if (!Number.isFinite(annual) || Math.abs(annual) > ANNUALIZED_LIMIT) return null;
   return Number(annual.toFixed(1));
 }
+
+/**
+ * The funding rate nobody chose.
+ *
+ * Binance's default is 0.01% per 8h and Hyperliquid's is 0.00125% per hour; both annualise to the
+ * same 10.95%. A contract sitting on that number has no crowd on either side — the exchange's
+ * interest-rate component is simply showing through — and 80% of the Hyperliquid rows in the
+ * live database were exactly this. «多头在付费» on such a row is true of every contract on the
+ * venue at once, so it is not an observation about the coin. Compare on the annualised figure so
+ * 8h and 1h settlement land on the same number.
+ */
+export const FUNDING_BASELINE_ANNUALIZED = 10.95;
+
+export function fundingIsBaseline(annualized: number | null | undefined): boolean {
+  return typeof annualized === 'number' && Number.isFinite(annualized) && Math.abs(annualized - FUNDING_BASELINE_ANNUALIZED) < 1.5;
+}
+
+/** Who pays, or '' when the rate is the default and nobody in particular does. */
+export function fundingPayer(funding: number | null | undefined, annualized: number | null | undefined): '多头' | '空头' | '' {
+  if (typeof funding !== 'number' || !Number.isFinite(funding) || funding === 0) return '';
+  if (fundingIsBaseline(annualized)) return '';
+  return funding > 0 ? '多头' : '空头';
+}

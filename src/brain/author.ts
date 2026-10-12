@@ -4,8 +4,9 @@ import { BRAIN_RULES, type Brain } from './brain.ts';
 import { revokeStaleRules, scoreAll, type Verdict } from '../rank/score.ts';
 import { DIMENSION_NAMES, DIMENSIONS } from '../rank/hypotheses.ts';
 import { propose, registry } from '../rank/registry.ts';
-import { KNOBS, proposeChange } from '../rank/params.ts';
+import { liveKnobs, proposeChange } from '../rank/params.ts';
 import { signalLabel } from '../stats/insight.ts';
+import { settingsFrom } from '../schedule.ts';
 
 /**
  * The part that behaves like a person who writes regularly: before drafting, it re-reads what it
@@ -44,8 +45,9 @@ export function brief(
  * asked for the one thing a template cannot do — what to try next, given that these arms are
  * still indistinguishable. Its answer is stored as a hypothesis to test, never as a fact.
  */
-export async function reflect(store: Store, brain: Brain | null, opts: { days?: number } = {}): Promise<{ stored: string[]; notes: string[] }> {
-  const verdicts = scoreAll(store, { days: opts.days ?? 30, writeMemory: true });
+export async function reflect(store: Store, brain: Brain | null, opts: { days?: number; target?: 'views' | 'engagement' | 'money' } = {}): Promise<{ stored: string[]; notes: string[] }> {
+  const settings = settingsFrom(store);
+  const verdicts = scoreAll(store, { days: opts.days ?? 30, writeMemory: true, target: opts.target });
   const stored: string[] = [];
   const notes: string[] = [];
 
@@ -70,7 +72,7 @@ export async function reflect(store: Store, brain: Brain | null, opts: { days?: 
   const vocabulary = DIMENSION_NAMES
     .map(d => `${d}（${DIMENSIONS[d].label}，臂 ${DIMENSIONS[d].arms.join('/')}，${DIMENSIONS[d].kind === 'knob' ? '可随机分配' : '只能观察'}）`)
     .join('；');
-  const knobs = KNOBS.map(k => `${k.key}（${k.label}，现在 ${k.judge} 判定）`).join('；');
+  const knobs = liveKnobs(settingsFrom(store)).map(k => `${k.key}（${k.label}，现在 ${k.judge} 判定）`).join('；');
   // The measured failure this format is designed against: with a free-form prompt the model spent
   // its daily suggestion restating h_chart, h_hashtag_count and h_opening. Asking for a line in a
   // closed vocabulary makes a restatement impossible to submit — `propose()` rejects it — and
@@ -84,7 +86,7 @@ export async function reflect(store: Store, brain: Brain | null, opts: { days?: 
 1) 一条新的、还没有被登记过的比较：
    TEST|维度代号|指标代号|experiment或observed|一句话主张
    可用维度：${vocabulary}
-   可用指标：views24h / growth1h / engagementPer1k / rebatePer1k
+   可用指标：views24h / growth1h / engagementPer1k / qualityPer1k / rebatePer1k
    只有「可随机分配」的维度才允许写 experiment。
 
 2) 一次有界的参数调整建议（最多一行，且必须有理由）：
@@ -95,7 +97,7 @@ export async function reflect(store: Store, brain: Brain | null, opts: { days?: 
 
 **已经登记在测的比较见下面，复述它们会被系统拒绝。如果你觉得答案就是"继续攒样本"，那就只输出第 3 类或者什么都不输出。**`,
     context: `最近 30 天各假设的测量结果（median/样本数）：\n${evidence}\n\n已经在测的主张：\n${registered.map(h => `- ${h.id}: ${h.claim}`).join('\n')}\n\n还没结论的实验：${stuck.map(v => `${v.id}(还需 ${v.missing} 条)`).join('、') || '无'}`,
-    maxTokens: 700,
+    maxTokens: settings.brainMaxTokensDaily,
   });
   if (!r.ok) {
     notes.push(`大脑反思失败：${r.error.slice(0, 90)}`);

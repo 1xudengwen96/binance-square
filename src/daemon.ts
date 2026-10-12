@@ -1,6 +1,7 @@
 import 'dotenv/config';
 import { Store, type AccountRow } from './db/index.ts';
 import { collect, generate, generateForMatrix, generateFromPool, publishDue, pauseState } from './pipeline.ts';
+import { generateColumn } from './column.ts';
 import { settingsFrom } from './schedule.ts';
 import { backfillStats, tuneTemplateWeights } from './stats/backfill.ts';
 import { observeDistribution } from './rank/observations.ts';
@@ -17,6 +18,10 @@ import { matrixEligibleAccounts } from './studio/lock.ts';
 import { runStudio } from './studio/runner.ts';
 import { getSecret } from './secrets.ts';
 import { backupDatabase } from './backup.ts';
+import { currentTarget, evaluateBreaker } from './rank/gates.ts';
+import { judgeCalls } from './calls.ts';
+import { runSentinel } from './brain/sentinel.ts';
+import { runWeekly } from './brain/weekly.ts';
 
 /**
  * The unattended loop. One tick = collect → expire stale material → split the hot coins
@@ -107,7 +112,15 @@ export async function tick(store: Store, opts: { live?: boolean; statsEveryTicks
     // auto-approved rows into a bucket nothing can drain — which is exactly what the
     // "every draft must belong to an account" rule below is there to prevent.
     const canPublish = accounts.length > 0 || Boolean(process.env.SQUARE_API_KEY);
-    if (!canPublish) {
+    if (settings.columnMode && accounts.length) {
+      // The column replaces the mixed lane outright: a fixed heading sharing a feed with the
+      // thirty-odd generic data posts is not a column. Quiet markets simply produce nothing.
+      for (const a of accounts) {
+        const c = await generateColumn(store, settings, a);
+        res.poolCreated += c.created.length;
+        for (const n of c.skipped) res.notes.push(`${a.label}：${n}`);
+      }
+    } else if (!canPublish) {
       res.notes.push('短帖已停摆：唯一可用账号被工作室占用，且 .env 未配 SQUARE_API_KEY，再生成也发不出去');
     } else {
     if (accounts.length) {
@@ -144,7 +157,13 @@ export async function tick(store: Store, opts: { live?: boolean; statsEveryTicks
     res.notes.push(`generate 失败：${String(err).slice(0, 100)}`);
   }
 
-  if (opts.live && settings.autoPublish) {
+  // The breaker only stops *automatic* publishing: an operator pressing 发布 by hand is a person
+  // deciding, which is exactly what a tripped breaker asks for.
+  const breakerNow = evaluateBreaker(store, settings);
+  if (breakerNow.tripped && opts.live && settings.autoPublish) {
+    res.notes.push(`熔断：最近 ${breakerNow.window} 条浏览中位数 ${Math.round(breakerNow.median ?? 0)} < ${breakerNow.floor}，已停止自动发布，需要在 AI 大脑页手动恢复`);
+  }
+  if (opts.live && settings.autoPublish && !breakerNow.tripped) {
     // Each account publishes only its own approved posts, with its own key and egress.
     const accounts = matrixEligibleAccounts(store);
     const targets: { account?: AccountRow }[] = accounts.length ? accounts.map(a => ({ account: a })) : [{}];
@@ -190,9 +209,15 @@ export async function tick(store: Store, opts: { live?: boolean; statsEveryTicks
     try {
       const b = await backfillStats(store);
       res.statsUpdated = b.updated;
-      const t = tuneTemplateWeights(store, {});
-      res.tuned = t.adjusted.length;
-      if (t.skipped) res.notes.push(`调权跳过：${t.skipped}`);
+      // Template weights read all-time averages that move by a post or two a day; re-deciding them
+      // every 15 minutes only re-applies the same verdict. Daily is the cadence the evidence has.
+      const lastTune = store.getSetting<number>('lastTuneAt', 0);
+      if (Date.now() - lastTune >= 20 * 3600_000) {
+        const t = tuneTemplateWeights(store, {});
+        store.setSetting('lastTuneAt', Date.now());
+        res.tuned = t.adjusted.length;
+        if (t.skipped) res.notes.push(`调权跳过：${t.skipped}`);
+      }
       // The curve only becomes knowledge if someone reads it: distribution facts, then the
       // hypotheses scored against them, then whatever earned the right to be called a rule.
       res.observed = observeDistribution(store);
@@ -200,7 +225,7 @@ export async function tick(store: Store, opts: { live?: boolean; statsEveryTicks
       // this morning is reflected in this afternoon's verdicts.
       const conv = attributeConversions(store, {});
       if (conv.posts) res.conversionAttributed = conv.posts;
-      const verdicts = scoreAll(store, { writeMemory: true, target: settings.targetMetric });
+      const verdicts = scoreAll(store, { writeMemory: true, target: currentTarget(store, settings) });
       res.rules = verdicts.filter(v => v.status === 'rule').length;
       res.testing = verdicts.filter(v => v.status === 'observing').length;
       // Learning has two directions. Writing what earned belief is the easy half; retiring what
@@ -215,11 +240,15 @@ export async function tick(store: Store, opts: { live?: boolean; statsEveryTicks
       // successor inside one tick.
       const culled = retireStalled(store, verdicts);
       if (culled.length) res.notes.push(`退休了 ${culled.length} 条攒不到样本的假设：${culled.join('、')}`);
-      const decided = evaluateChanges(store);
+      // While the breaker is tripped the account is not publishing, so a parameter window would be
+      // measuring nothing. Both steps wait; the reset shifts the open windows by the time frozen.
+      const frozen = evaluateBreaker(store, settings).tripped;
+      const decided = frozen ? { improved: [], rolledBack: [], deferred: [] } : evaluateChanges(store);
+      if (frozen) res.notes.push('熔断中：参数回路已冻结');
       if (decided.improved.length) res.notes.push(`参数改动见效，保留：${decided.improved.join('、')}`);
       if (decided.rolledBack.length) res.notes.push(`参数改动没有改善，已自动回滚：${decided.rolledBack.join('、')}`);
       if (decided.deferred.length) res.notes.push(`参数改动样本还不够，继续观察：${decided.deferred.join('、')}`);
-      const applied = applyPendingChanges(store);
+      const applied = frozen ? [] : applyPendingChanges(store);
       res.paramsApplied = applied.length;
       if (applied.length) res.notes.push(`开始验证参数：${applied.map(a => `${a.label} ${a.from}→${a.to}`).join('，')}`);
       const exp = expireMemories(store);
@@ -237,8 +266,9 @@ export async function tick(store: Store, opts: { live?: boolean; statsEveryTicks
   try {
     const REFLECT_EVERY_MS = 20 * 3600_000;
     const lastReflect = store.getSetting<number>('lastReflectAt', 0);
+    // brainDaily switches the *model* off; the deterministic half of reflect() still runs.
     if (Date.now() - lastReflect >= REFLECT_EVERY_MS) {
-      const r = await reflect(store, brainFor(store, settings), {});
+      const r = await reflect(store, settings.brainDaily ? brainFor(store, settings) : null, { target: currentTarget(store, settings) });
       store.setSetting('lastReflectAt', Date.now());
       res.reflected = r.stored.length;
       for (const n of r.notes) res.notes.push(n);
@@ -246,6 +276,42 @@ export async function tick(store: Store, opts: { live?: boolean; statsEveryTicks
     }
   } catch (err) {
     res.notes.push(`反思失败：${String(err).slice(0, 100)}`);
+  }
+
+  // The call ledger: code rules on the statements the column made a day ago. Cheap (one request)
+  // and a no-op when nothing is due.
+  try {
+    const j = await judgeCalls(store);
+    if (j.judged || j.voided) res.notes.push(`栏目判断裁决 ${j.judged} 条（成立 ${j.held}），作废 ${j.voided} 条`);
+  } catch (err) {
+    res.notes.push(`裁决失败：${String(err).slice(0, 100)}`);
+  }
+
+  // The sentinel is arithmetic every tick; the model only hears about it when an alarm is new and
+  // the daily wake cap allows.
+  try {
+    const sn = await runSentinel(store, settings);
+    for (const a of sn.raised) res.notes.push(`警报 ${a.code}：${a.detail.slice(0, 60)}`);
+    if (sn.raised.length && sn.skippedWhy) res.notes.push(`未唤醒大脑：${sn.skippedWhy}`);
+  } catch (err) {
+    res.notes.push(`哨兵失败：${String(err).slice(0, 100)}`);
+  }
+
+  // Sunday 22:00 Beijing or later, once. runWeekly refuses a second report inside the week.
+  try {
+    // A two-hour window meant one network blip skipped the whole week (it did, on the first run).
+    // Now: from Sunday 22:00 through Tuesday, retried at most every 2 hours until one lands.
+    const bj = new Date(Date.now() + 8 * 3600_000);
+    const day = bj.getUTCDay();
+    const inWindow = (day === 0 && bj.getUTCHours() >= 22) || day === 1 || day === 2;
+    const lastTry = store.getSetting<number>('lastWeeklyTryAt', 0);
+    if (inWindow && Date.now() - lastTry >= 2 * 3600_000) {
+      store.setSetting('lastWeeklyTryAt', Date.now());
+      const w = await runWeekly(store, settings);
+      if (w.ok) res.notes.push(`周复盘已生成（#${w.reportId}），等你在 AI 大脑页审阅`);
+    }
+  } catch (err) {
+    res.notes.push(`周复盘失败：${String(err).slice(0, 100)}`);
   }
 
   // Once a day, on the first tick that finds it due. Everything the robot has learned lives in

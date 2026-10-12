@@ -49,11 +49,18 @@ export interface ArmPlan {
  * registered in the database get its arms assigned with no change here. Every hypothesis the
  * registry knows appears in the verdict list even at zero samples, so nothing is skipped.
  */
-export function planArms(opts: { seed: number; verdicts: Verdict[]; recheckShare?: number }): ArmPlan {
-  const rnd = mulberry32(opts.seed);
+export function planArms(opts: { seed: number; verdicts: Verdict[]; recheckShare?: number; only?: readonly string[] | null; exclude?: readonly string[] }): ArmPlan {
   const plan: ArmPlan = {};
   for (const v of opts.verdicts) {
     if (v.mode !== 'experiment') continue;
+    // A hypothesis outside the active set draws nothing and gets no arm.
+    if (opts.only && !opts.only.includes(v.id)) continue;
+    // Lane-specific hypotheses (the column shape) must not be drawn for posts from another lane.
+    if (opts.exclude?.includes(v.id)) continue;
+    // Each hypothesis has its own stream, keyed by the post seed and its id. One shared stream
+    // advances by a different amount depending on which branch a hypothesis takes, so adding or
+    // removing one would quietly reassign every arm after it.
+    const rnd = mulberry32(hashString(`${opts.seed}:${v.id}`));
     const arms = v.arms.map(a => a.arm);
     if (!arms.length) continue;
     const pick = () => arms[Math.floor(rnd() * arms.length)]!;

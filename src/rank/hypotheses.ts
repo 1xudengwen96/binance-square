@@ -7,7 +7,7 @@
  * system is allowed to form an opinion about reach.
  */
 
-export type Metric = 'views24h' | 'growth1h' | 'engagementPer1k' | 'rebatePer1k';
+export type Metric = 'views24h' | 'growth1h' | 'engagementPer1k' | 'qualityPer1k' | 'rebatePer1k';
 
 /**
  * The complete set of things a post can be sorted by.
@@ -29,6 +29,8 @@ export type Dimension =
   | 'hook_form'
   | 'stance'
   | 'follow_cta'
+  | 'column'
+  | 'polish'
   | 'length_band'
   | 'hour_band'
   | 'repeat_interval'
@@ -47,6 +49,8 @@ export const DIMENSIONS: Record<Dimension, DimensionSpec> = {
   hook_form: { kind: 'knob', label: '首句形态', arms: ['data', 'tension'] },
   stance: { kind: 'knob', label: '有无观点句', arms: ['none', 'read'] },
   follow_cta: { kind: 'knob', label: '结尾是否求关注', arms: ['none', 'follow'] },
+  column: { kind: 'knob', label: '栏目形态', arms: ['ledger', 'question', 'anomaly', 'recap'] },
+  polish: { kind: 'knob', label: '栏目是否经 AI 改写措辞', arms: ['raw', 'polished'] },
   length_band: { kind: 'observed', label: '正文字数带', arms: ['short', 'mid', 'long'] },
   hour_band: { kind: 'observed', label: '发帖时段带', arms: ['morning', 'midday', 'afternoon', 'evening', 'late'] },
   repeat_interval: { kind: 'observed', label: '同币同类重发间隔', arms: ['within6h', '6to24h', 'over24h'] },
@@ -72,6 +76,28 @@ export interface Hypothesis {
 }
 
 export const HYPOTHESES: Hypothesis[] = [
+  {
+    id: 'h_column',
+    claim: '不同的固定栏目（费率账 / 盘中一问 / 今日反常 / 昨日对账）换来的回应不一样',
+    mode: 'experiment',
+    dimension: 'column',
+    arms: ['ledger', 'question', 'anomaly', 'recap'],
+    metric: 'views24h',
+    minSamples: 10,
+    how: '栏目形态在当次可用的形态里随机抽取，抽签先于发帖并落库；比较各形态的 24 小时浏览，达标后改比互动质量。',
+    risk: '被抽到的形态可能比其余的差；这是回答「读者要什么」的唯一办法。',
+  },
+  {
+    id: 'h_column_polish',
+    claim: '栏目帖经 AI 改写措辞后，读起来不那么机械，换来更多浏览',
+    mode: 'experiment',
+    dimension: 'polish',
+    arms: ['raw', 'polished'],
+    metric: 'views24h',
+    minSamples: 8,
+    how: '栏目帖随机一半交给 AI 改写措辞（数字、标签、栏目标题不得改动，改不过校验就用原文），比较 24 小时浏览。',
+    risk: '改写版可能更像通稿；改写失败的帖子按实际跑的臂记为 raw，不污染比较。',
+  },
   {
     id: 'h_chart',
     claim: '带自绘 K 线图的帖子比纯文字拿到更多分发',

@@ -203,6 +203,23 @@ export async function detectLeaderboards(minQuoteVolume = 30_000_000): Promise<M
  * Funding rates far from zero are the most postable derivatives signal: they are
  * concrete, verifiable and change often enough to fill a schedule.
  */
+/**
+ * How many consecutive settlements, ending now, the rate has had the same sign — and what that
+ * cost the paying side in total, as a percentage of position. Zero rates break a streak.
+ */
+export function fundingStreak(rates: readonly number[]): { periods: number; costPct: number } | null {
+  const clean = rates.filter(Number.isFinite);
+  const last = clean[clean.length - 1];
+  if (last === undefined || last === 0) return null;
+  let periods = 0;
+  let sum = 0;
+  for (let i = clean.length - 1; i >= 0 && Math.sign(clean[i]!) === Math.sign(last); i--) {
+    periods++;
+    sum += clean[i]!;
+  }
+  return { periods, costPct: Number((Math.abs(sum) * 100).toFixed(2)) };
+}
+
 export async function detectFundingExtremes(threshold = 0.0004, limit = 8): Promise<Material[]> {
   const rows = await binance.premiumIndex();
   const now = Date.now();
@@ -217,11 +234,15 @@ export async function detectFundingExtremes(threshold = 0.0004, limit = 8): Prom
   for (const r of extreme) {
     // Funding interval differs per symbol (4h/8h), so read it from actual settlements.
     let intervalHours = 8;
+    let streak: { periods: number; costPct: number } | null = null;
     try {
-      const hist = await binance.fundingHistory(r.symbol, 3);
+      // Twelve prints instead of three costs nothing extra (same request) and is what makes «this
+      // has been going on» a measurable statement rather than an adjective.
+      const hist = await binance.fundingHistory(r.symbol, 12);
+      streak = fundingStreak(hist.map(h => num(h.fundingRate)));
       if (hist.length >= 2) {
         const gaps: number[] = [];
-        for (let i = 1; i < hist.length; i++) gaps.push((hist[i]!.fundingTime - hist[i - 1]!.fundingTime) / 3_600_000);
+        for (let i = Math.max(1, hist.length - 2); i < hist.length; i++) gaps.push((hist[i]!.fundingTime - hist[i - 1]!.fundingTime) / 3_600_000);
         const avg = gaps.reduce((s, v) => s + v, 0) / gaps.length;
         if (avg > 0 && avg <= 24) intervalHours = Math.round(avg);
       }
@@ -244,6 +265,7 @@ export async function detectFundingExtremes(threshold = 0.0004, limit = 8): Prom
           payer: r.rate > 0 ? '多头' : '空头',
           intervalHours,
           price: num(r.markPrice),
+          ...(streak && streak.periods >= 2 ? { streakPeriods: streak.periods, streakCostPct: streak.costPct } : {}),
         },
       }),
     );

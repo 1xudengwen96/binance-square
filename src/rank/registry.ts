@@ -25,7 +25,7 @@ export const MAX_PROPOSED = 2;
 /** A proposed hypothesis that has still drawn zero samples after this long gets retired. */
 export const STALL_DAYS = 21;
 
-const METRICS: Metric[] = ['views24h', 'growth1h', 'engagementPer1k', 'rebatePer1k'];
+const METRICS: Metric[] = ['views24h', 'growth1h', 'engagementPer1k', 'qualityPer1k', 'rebatePer1k'];
 const isDimension = (x: string): x is Dimension => Object.prototype.hasOwnProperty.call(DIMENSIONS, x);
 const isMetric = (x: string): x is Metric => (METRICS as string[]).includes(x);
 

@@ -190,7 +190,7 @@ export const templates: TemplateDef[] = [
     body: `{{#if squarePosts > 3}}{{cashtag}} 这几天在广场上被反复提起：相关帖子 {{squarePosts}} 条，累计浏览 {{squareViews|count}}。
 {{#else}}{{cashtag}} 现在排在广场热榜第 {{squareRank}} 位：{{squarePosts}} 条相关帖子，累计浏览 {{squareViews|count}}。
 {{/if}}把数据摆在一起看：现价 {{price|price}}，24 小时 {{chg24h|spct}}，1 小时 {{chg1h|spct}}；最近 1 小时成交额是前六小时均值的 {{volMultiple|fixed:1}} 倍{{#if oiChangePct}}，持仓同期{{#if oiChangePct > 0}}增加{{#else}}减少{{/if}}约 {{oiChangePct|abs|fixed:1}}%{{/if}}。
-{{#if funding}}资金费率 {{funding|rate}}{{#if annualized}}，折合年化约 {{annualized|fixed:1}}%{{/if}}，{{#if funding > 0}}付费方是多头{{#else}}付费方是空头{{/if}}。{{/if}}{{#if sustainedHours}}这个状态已经持续约 {{sustainedHours}} 小时。{{/if}}
+{{#if funding}}资金费率 {{funding|rate}}{{#if annualized}}，折合年化约 {{annualized|fixed:1}}%{{/if}}{{#if payer}}，付费方是{{payer}}{{/if}}。{{/if}}{{#if sustainedHours}}这个状态已经持续约 {{sustainedHours}} 小时。{{/if}}
 {{#if chg24h > 0}}{{#if volMultiple >= 1.2}}{{@take.move.up}}{{#else}}{{@take.move.thin}}{{/if}}{{#else}}{{@take.move.down}}{{/if}}。
 {{@phrase.notAdvice}}`,
   },
@@ -1027,7 +1027,7 @@ export const templates: TemplateDef[] = [
     subType: 'funding_extreme',
     angle: '结构',
     style: 'tech',
-    requires: [{ path: 'cashtag' }, { path: 'price' }, { path: 'chg1h' }, { path: 'funding' }],
+    requires: [{ path: 'cashtag' }, { path: 'price' }, { path: 'chg1h' }, { path: 'funding' }, { path: 'payer' }],
     body: `{{cashtag}} 现价 {{price|price}}，1 小时 {{chg1h|spct}}，同期费率 {{funding|rate}}。
 {{#if chg1h > 0 && funding > 0}}价格往上、多头付费——{{@take.funding.long}}。
 {{#elif chg1h < 0 && funding < 0}}跌的同时空头还在付费——方向上赚的要先抵掉这块成本，说明做空的人多到愿意付钱维持仓位。

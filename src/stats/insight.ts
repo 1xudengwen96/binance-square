@@ -188,9 +188,10 @@ export function analyze(store: Store, opts: { days?: number } = {}): AnalysisRep
   const totalViews = sum(views);
   const totalEngagement = sum(measured.map(engagementOf));
 
-  const pool = store.boardViewPool();
-  const trendPool = store.boardViewPool({ board: 'trend' });
-  const newsPool = store.boardViewPool({ board: 'news' });
+  // The account writes in Chinese, so it is held against the Chinese boards only.
+  const pool = store.boardViewPool({ lang: 'zh' });
+  const trendPool = store.boardViewPool({ board: 'trend', lang: 'zh' });
+  const newsPool = store.boardViewPool({ board: 'news', lang: 'zh' });
 
   const dimensions: Dimension[] = DIMS.map(dim => {
     const buckets = new Map<string, PerformanceRow[]>();
@@ -209,7 +210,7 @@ export function analyze(store: Store, opts: { days?: number } = {}): AnalysisRep
       const med = median(gViews);
       // Benchmarks only exist per coin: the board sweep records which coin a post is about,
       // not which template wrote it. Anything else would be an invented comparison.
-      const bench = dim.matchesBoardCoin ? store.boardViewPool({ coin: key }) : [];
+      const bench = dim.matchesBoardCoin ? store.boardViewPool({ coin: key, lang: 'zh' }) : [];
       const benchMedian = bench.length >= MIN_SAMPLE ? median(bench) : null;
       return {
         key,

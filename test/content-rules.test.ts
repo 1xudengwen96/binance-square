@@ -70,3 +70,14 @@ test('hashtags still land above the disclaimer when the copy carries its own clo
   }));
   assert.match(out, /#MET #行情异动\n?$/);
 });
+
+test('a streak that runs off the start of the data is a lower bound, so it is never written as a duration', async () => {
+  // 13 of 22 published posts said 持续约 5.5–6 小时: the length of the query window, not of the signal.
+  const { dossier } = await import('../src/hot/pool.ts');
+  const entry = (sustainedCapped: boolean) => ({
+    symbol: 'ETH', rank: 1, score: 50, squareRank: 1, squareViews: 1, squarePosts: 1, squareDiscuss: 1, tag: '', market: null,
+    samples: 20, sustainedMinutes: 350, sustainedCapped, firstSeenAt: 0, scoreStart: 50, scorePeak: 55, agreeing: 1, mature: true, blocked: null,
+  });
+  assert.equal(dossier(entry(true) as never).sustainedHours, null);
+  assert.equal(dossier(entry(false) as never).sustainedHours, 5.8);
+});

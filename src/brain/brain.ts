@@ -14,12 +14,16 @@ import { chat, type ChatMessage, type LlmConfig } from '../llm/providers.ts';
  * below treats `null` as a normal, healthy answer.
  */
 
+export type BrainPurpose = 'reflect' | 'sentinel' | 'weekly' | 'test';
+
 export interface BrainTask {
   /** Shown in logs and in the panel, so a human can see what was asked of the model. */
-  purpose: string;
+  purpose: BrainPurpose;
   system: string;
   context: string;
   maxTokens?: number;
+  /** Judging jobs want a low value; falls back to the configured brain temperature. */
+  temperature?: number;
 }
 
 export interface Brain {
@@ -30,7 +34,8 @@ export interface Brain {
 
 export function brainFor(store: Store, settings: Settings): Brain | null {
   if (!settings.llmEnabled) return null;
-  const cfg: LlmConfig | null = llmConfigFor(store, settings);
+  const base: LlmConfig | null = llmConfigFor(store, settings);
+  const cfg: LlmConfig | null = base ? { ...base, model: settings.brainModel.trim() || base.model } : null;
   if (!cfg || !cfg.apiKey || !cfg.model) return null;
   return {
     provider: cfg.provider,
@@ -40,14 +45,41 @@ export function brainFor(store: Store, settings: Settings): Brain | null {
         { role: 'system', content: task.system },
         { role: 'user', content: task.context },
       ];
+      const started = Date.now();
+      const inChars = task.system.length + task.context.length;
+      // The polish layer shares the endpoint and wants some variety; the brain judges, so it has
+      // its own temperature and never inherits the polish one.
+      const temperature = task.temperature ?? settings.brainTemperature;
       try {
-        const text = await chat({ ...cfg, maxTokens: task.maxTokens ?? 600 }, messages);
-        return { ok: true, text: text.trim() };
+        const text = (await chat({ ...cfg, maxTokens: task.maxTokens ?? 600, temperature }, messages)).trim();
+        recordCall(store, { purpose: task.purpose, cfg, ok: true, ms: Date.now() - started, inChars, reply: text });
+        return { ok: true, text };
       } catch (err) {
-        return { ok: false, error: err instanceof Error ? err.message : String(err) };
+        const error = err instanceof Error ? err.message : String(err);
+        recordCall(store, { purpose: task.purpose, cfg, ok: false, ms: Date.now() - started, inChars, error });
+        return { ok: false, error };
       }
     },
   };
+}
+
+function recordCall(
+  store: Store,
+  c: { purpose: string; cfg: LlmConfig; ok: boolean; ms: number; inChars: number; reply?: string; error?: string },
+): void {
+  try {
+    store.db
+      .prepare('INSERT INTO brain_calls (at, purpose, provider, model, ok, ms, in_chars, out_chars, error, reply) VALUES (?,?,?,?,?,?,?,?,?,?)')
+      .run(Date.now(), c.purpose, c.cfg.provider, c.cfg.model, c.ok ? 1 : 0, c.ms, c.inChars, c.reply?.length ?? 0, c.error?.slice(0, 300) ?? null, c.reply?.slice(0, 4000) ?? null);
+  } catch {
+    /* the ledger must never be the reason a brain call fails */
+  }
+}
+
+/** Calls the brain made in the last 24h, for the daily wake cap and the config page. */
+export function callsSince(store: Store, since: number, purposes?: BrainPurpose[]): number {
+  const where = purposes?.length ? `AND purpose IN (${purposes.map(() => '?').join(',')})` : '';
+  return (store.db.prepare(`SELECT COUNT(*) AS n FROM brain_calls WHERE at >= ? ${where}`).get(since, ...(purposes ?? [])) as { n: number }).n;
 }
 
 /** The contract the brain is held to. Kept in one place so every task says the same thing. */
