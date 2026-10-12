@@ -183,7 +183,10 @@ export const DEFAULT_SETTINGS: Settings = {
   targetMetric: 'views',
   targetMode: 'manual',
   dailyCap: 12,
-  postsPerDay: 8,
+  // 定稿 §2 节奏：每号短帖承诺 4 条/日（区间 3–5，取 4 作期望告警分母）。
+  // default 必须和线上 stored 同值——「改了代码没改线上」已经绊过两次（activeExperiments、
+  // symbolDailyCap），测试口径新增 default/stored 一致性机检，这一条不许反向漂移。
+  postsPerDay: 4,
   minIntervalMinutes: 45,
   activeStartHour: 8,
   activeEndHour: 24,
