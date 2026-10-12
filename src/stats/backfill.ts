@@ -1,5 +1,6 @@
 import { Store } from '../db/index.ts';
 import { fetchJson } from '../collectors/http.ts';
+import { ALERT_KINDS, raise as raiseAlert } from '../alerts/bus.ts';
 
 /**
  * Performance backfill.
@@ -60,6 +61,23 @@ interface RawVo {
   bodyTextOnly?: string;
   /** Articles only — a post cannot be subscribed to, an article can. */
   subscribeCount?: number;
+  // 旗标三件套（P0-3）。平台不给键时保持 undefined —— 一等列写 NULL，绝不默认成「没被旗标」。
+  isCreatedByAI?: boolean | number;
+  factCheckStatus?: string | number;
+  blockType?: string | number;
+  rejectReason?: string;
+}
+
+/**
+ * missing ≠ pass: the envelope carries an explicit null only where the platform actually
+ * answered. An absent key must stay null in the column — 「读不到」 is not 「没事」, the same
+ * rule the subscribers column got in P0-1, now applied to the flags that gate auto-flow.
+ */
+export function platformFlags(vo: RawVo): import('../db/index.ts').PlatformFlags {
+  const n = (v: unknown): number | null =>
+    v === undefined || v === null ? null : typeof v === 'boolean' ? (v ? 1 : 0) : Number.isFinite(Number(v)) ? Number(v) : null;
+  const s = (v: unknown): string | null => (v === undefined || v === null ? null : String(v));
+  return { createdByAi: n(vo.isCreatedByAI), factCheckStatus: s(vo.factCheckStatus), blockType: s(vo.blockType), rejectReason: s(vo.rejectReason) };
 }
 
 export interface BackfillReport {
@@ -114,17 +132,30 @@ export async function backfillStats(store: Store): Promise<BackfillReport> {
     }
     if (!vo) continue;
     report.read++;
+    const flags = platformFlags(vo);
     const sample = {
       views: Number(vo.viewCount ?? 0),
       likes: Number(vo.likeCount ?? 0),
       comments: Number(vo.commentCount ?? 0),
       shares: Number(vo.shareCount ?? 0),
       reactions: Number(vo.totalReactionCount ?? 0),
+      flags,
       raw: vo,
     };
     store.recordPostStats(post.id, due, sample);
     report.updated++;
 
+    // 定稿 §2 自动流转熔断：旗标非零单条即切。只有平台明确说了的非零值才算「被旗标」，
+    // 键缺失走 NULL 分支，绝不升档成告警——那是把读不到当证据。
+    const flagged = (flags.blockType !== null && flags.blockType !== '0' && flags.blockType !== '')
+      || (flags.rejectReason !== null && flags.rejectReason !== '');
+    if (flagged && !store.hasEvent('breaker_tripped', post.id)) {
+      store.log('breaker_tripped', { postId: post.id, flags, note: '平台旗标非零，单条即切自动流转' });
+      raiseAlert(store, {
+        kind: ALERT_KINDS.breakerTripped, severity: 'breach', key: `post:${post.id}`,
+        subreason: 'platform_flag', extra: { flags },
+      });
+    }
     // We attached a chart but Square shows none: the post ran as text under a chart label, which
     // would quietly pull the image comparison toward zero. Leave the arm alone (the assignment is
     // on record) and say so once per post, so the shortfall is countable.

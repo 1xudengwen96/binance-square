@@ -1,5 +1,6 @@
 import type { AccountRow, Store } from './db/index.ts';
 import type { Settings } from './config.ts';
+import { beijingDayStart } from './schedule.ts';
 import type { Material } from './material/types.ts';
 import type { Context, Fact, FieldValue } from './engine/types.ts';
 import { columnContext, columnTemplates, pickColumnMaterial, COLUMN_NAME } from './content/column.ts';
@@ -237,8 +238,12 @@ export async function generateColumn(
     facts,
     trace: { ...trace, lane: 'column', kind, variants: variantIds, account: account.label, ...(polishNote ? { polish: polishNote } : {}) },
     images,
+    // P0-2: bound at the write, not in a follow-up update; label_id defaults to the primary
+    // label inside addPost and refuses the insert if none is active. Column posts spend the
+    // account's short lane — the lease row is the audit half of lane accounting.
+    accountId: account.id,
   });
-  store.updatePost(id, { accountId: account.id });
+  store.recordLaneLease(account.id, 'short', beijingDayStart(Date.now()), slot.at, 'matrix');
   // The arm on record is the shape that actually ran, not the one drawn: a draw that had to fall
   // back must not be counted under an arm the post did not carry.
   recordArms(store, id, { ...arms, h_column: kind, ...(polishArm ? { h_column_polish: polishArm } : {}) });

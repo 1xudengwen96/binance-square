@@ -32,6 +32,8 @@ import type { Context, Fact } from './engine/types.ts';
 import type { Material } from './material/types.ts';
 import type { Settings } from './config.ts';
 import { matrixEligibleAccounts } from './studio/lock.ts';
+import { beijingDayStart } from './schedule.ts';
+import { ALERT_KINDS, raise as raiseAlert } from './alerts/bus.ts';
 import { exploreRepeat, planArms, recordArms } from './rank/experiments.ts';
 import { playbook, type Playbook } from './rank/playbook.ts';
 import { followCta, stanceLine, tensionLine } from './content/voice.ts';
@@ -339,6 +341,12 @@ export async function generate(
   const account = opts.account;
   const defs = defsForAccount(store.allTemplates(), account);
   const report: GenerateReport = { created: [], skipped: [] };
+  // P0-2 草稿必须挂账号：没有账号的生成路径就是「无账号兜底空转」的源头——草稿写得进、
+  // 没有密钥与出口能发它，4.7 小时停摆期间堆的全是这种注定作废的行。预览不受影响。
+  if (!account && !opts.dryRun) {
+    report.skipped.push('草稿必须挂账号：无账号的生成路径已废弃（P0-2），拒写注定没人能发的草稿');
+    return report;
+  }
   // Scored once per pass: every draft in a tick should see the same beliefs, and scoring is a
   // table scan, not something to repeat per post.
   const rankVerdicts: Verdict[] = scoreAll(store, { writeMemory: false });
@@ -408,6 +416,13 @@ export async function generate(
       const recent = store.coinPostsSince(account?.id ?? null, m.symbol, Date.now() - 86_400_000);
       if (recent >= eff.symbolDailyCap) {
         report.skipped.push(`${m.title}: ${m.symbol} 近 24 小时已发 ${recent} 篇（各类合计），上限 ${eff.symbolDailyCap} —— 一味蹭热门币会被判账号不健康`);
+        // 定稿 v1.5 §7.9: 这条滚动窗计数就是 ≤2 主护栏本身，不再另造平行闸门；命中即按
+        // 契约 v1.1 落 surge_blocked/blocked_by_symbol_cap（同一 kind，两型不混用）。
+        raiseAlert(store, {
+          kind: ALERT_KINDS.surgeBlocked, severity: 'warning', key: `${account?.id ?? 0}:${m.symbol}`,
+          reasonCode: 'blocked_by_symbol_cap', samplesInWindow: recent,
+          extra: { symbol: m.symbol, cap: eff.symbolDailyCap, lane: 'short' },
+        });
         continue;
       }
     }
@@ -487,8 +502,10 @@ export async function generate(
       facts: c.result.facts,
       trace: { ...c.result.trace, polish: polished.note, account: account?.label ?? null },
       images,
+      // P0-2: bound and labelled at the write itself — no second update that can half-fail.
+      accountId: account?.id ?? null,
     });
-    if (account) store.updatePost(id, { accountId: account.id });
+    if (account) store.recordLaneLease(account.id, 'short', beijingDayStart(Date.now()), slot.at, 'matrix');
     recordArms(store, id, arms);
     // Consume the material. Without this every account's pass sees the same unused list
     // and drafts the same events, which is the duplication the matrix exists to avoid.
@@ -553,12 +570,20 @@ export async function publishDue(
 ): Promise<PublishReport> {
   const report: PublishReport = { attempted: 0, published: [], uncertain: [], failed: [], notes: [], paused: false };
   const acct = opts.account ?? null;
-  const apiKey = opts.apiKey ?? (acct ? getAccountSecret(store, acct.id) : process.env.SQUARE_API_KEY ?? '');
+  // P0-2: the env-var fallback is gone. A live publish without an account-bound key used to
+  // quietly drain nothing and count as 「失败1」 every tick — the 4.7h stall dressed up as a
+  // healthy queue. The key is now only ever the account's own (or a hand-passed CLI key for
+  // the operator's deliberate manual send), and a missing one raises credential_missing.
+  const apiKey = opts.apiKey ?? (acct ? getAccountSecret(store, acct.id) : '');
   if (!opts.live) {
     report.failed.push({ id: 0, label: '未加 --live，仅演练' });
   }
   if (opts.live && !apiKey) {
-    report.failed.push({ id: 0, label: acct ? `${acct.label} 还没有广场 Key` : '还没有配置广场 Key（设置页 → 密钥）' });
+    report.failed.push({ id: 0, label: acct ? `${acct.label} 还没有广场 Key` : '无账号发布路径已废弃（P0-2）：密钥只随账号走' });
+    raiseAlert(store, {
+      kind: ALERT_KINDS.credentialMissing, severity: 'fault', key: acct ? String(acct.id) : 'global',
+      subreason: 'square_key_missing',
+    });
     return report;
   }
 
@@ -840,6 +865,11 @@ export async function generateFromPool(
     const repeatProbe = exploreRepeat(`attention:${e.symbol}:${acct?.id ?? 0}:${slot.at}`);
     if (!repeatProbe && eff.symbolDailyCap > 0 && store.coinPostsSince(acct?.id ?? null, e.symbol, Date.now() - 86_400_000) >= eff.symbolDailyCap) {
       report.skipped.push({ symbol: e.symbol, why: `这个币近 24 小时已发满 ${eff.symbolDailyCap} 篇（各类合计），一味蹭热门币伤账号健康度` });
+      raiseAlert(store, {
+        kind: ALERT_KINDS.surgeBlocked, severity: 'warning', key: `${acct?.id ?? 0}:${e.symbol}`,
+        reasonCode: 'blocked_by_symbol_cap', samplesInWindow: eff.symbolDailyCap,
+        extra: { symbol: e.symbol, cap: eff.symbolDailyCap, lane: 'short', source: 'attention' },
+      });
       continue;
     }
     if (!repeatProbe && store.recentCoinSignal(acct?.id ?? null, e.symbol, 'attention', Date.now() - eff.coinSignalCooldownMinutes * 60_000)) {
@@ -922,8 +952,9 @@ export async function generateFromPool(
       facts: c.result.facts,
       trace: { ...c.result.trace, polish: polished.note, account: acct?.label ?? null },
       images: chart ? [chart] : [],
+      accountId: acct?.id ?? null,
     });
-    if (acct) store.updatePost(id, { accountId: acct.id });
+    if (acct) store.recordLaneLease(acct.id, 'short', beijingDayStart(Date.now()), slot.at, 'matrix');
     recordArms(store, id, arms);
     store.markMaterialUsed(material.id);
     // One post per attention rise; the coin stays blocked until the cooldown passes.
@@ -961,12 +992,11 @@ export interface MatrixGenerateReport {
  * and hoping the copy differs is how ten accounts end up saying the same thing. Allocation
  * is exclusive, so a coin belongs to one account for the whole exclusion window.
  */
-export async function generateForMatrix(store: Store, settings: Settings): Promise<MatrixGenerateReport> {
-  const report: MatrixGenerateReport = { accounts: [], matureCount: 0, errors: [] };
+export async function generateForMatrix(store: Store, settings: Settings): Promise<MatrixGenerateReport> {  const report: MatrixGenerateReport = { accounts: [], matureCount: 0, errors: [] };
   // Accounts the studio owns are skipped: a teaching account must not also be drawing
   // mixed-voice short posts from this queue, or the persona the track exists to build is
   // undone by the module that was never meant to touch it.
-  const accounts = matrixEligibleAccounts(store);
+  const accounts = matrixEligibleAccounts(store, settings);
   if (!accounts.length) return report;
 
   try {

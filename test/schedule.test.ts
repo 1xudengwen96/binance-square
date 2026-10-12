@@ -26,13 +26,21 @@ function tempStore(): { store: Store; close: () => void } {
 }
 
 function approve(store: Store, at: number, i: number): void {
+  // P0-2: 草稿必须挂账号。When the fixture has an enabled account the draft belongs to it;
+  // stores without one keep writing unbound rows only for the pure queue-count assertions.
+  const acct = store.db.prepare('SELECT id FROM accounts WHERE enabled = 1 ORDER BY id LIMIT 1').get() as { id: number } | undefined;
   store.addPost({
     materialId: null,
     templateId: null,
     text: `$TOK 1小时多空比 ${2 + i}.10，多头占 6${i}.9%。测试正文，不构成投资建议。`,
     status: 'approved',
     scheduledAt: at,
+    accountId: acct?.id ?? null,
   });
+}
+
+function makeAcct(store: Store): number {
+  return store.createAccount({ label: '调度号', enabled: true });
 }
 
 test('drafts reserved one at a time never share a minute', () => {
@@ -79,8 +87,9 @@ test('generation stops once the queue already covers the day', async () => {
   const { store, close } = tempStore();
   try {
     const s = { ...DEFAULT_SETTINGS, postsPerDay: 2, autoPublish: true };
+    const acct = store.accountById(makeAcct(store))!;
     for (let i = 0; i < 2; i++) approve(store, Date.now() + i * GAP, i);
-    const r = await generate(store, s, 3);
+    const r = await generate(store, s, 3, { account: acct });
     assert.equal(r.created.length, 0, 'a full queue must not add more drafts');
     assert.match(r.skipped.join(' '), /待发布/);
   } finally {
@@ -88,15 +97,25 @@ test('generation stops once the queue already covers the day', async () => {
   }
 });
 
-test('a draft is not written when its slot lands after the material expires', async () => {
+test('a draft is not written when its slot lands after the material expires', async (t) => {
   // The waste this stops: on 2026-10-08 the robot wrote 100 drafts and published 9. The queue
   // ceiling counts pending drafts, so every batch the sweeper voided reopened the ceiling and the
   // next tick wrote another. Bounding the reservation by shelf life turns that loop into
   // backpressure — and a fresh signal in the same run must still go through, or the guard is
   // just a stop button.
+  //
+  // QA-FLAKY-001: the seed inside generate() is personaSeed(materialId, account, slot.at), and
+  // slot.at came from the wall clock, so every minute the wordBank/template draw changed and
+  // ~9% of minutes landed on a thin funding variant that the (correct) info-density gate then
+  // refused — flaking the 「fresh signal must still be written」 assertion. The clock is now
+  // pinned to an explicit instant, so the draw is a fixed fixture rather than a lottery.
+  // The assertion itself is unchanged: pinning time is allowed, pinning expectations is not.
+  t.mock.timers.enable({ apis: ['Date'], now: Date.UTC(2026, 9, 12, 2, 0, 0) }); // 2026-10-12 10:00:00 北京
+  const now = Date.now();
   const { store, close } = tempStore();
   try {
     const s = { ...DEFAULT_SETTINGS, autoPublish: true, dailyCap: 30, postsPerDay: 20, activeStartHour: 0, activeEndHour: 24 };
+    const acct = store.accountById(makeAcct(store))!; // 先有主人，approve 的排队分钟才算进同一条队列
     const funding = (symbol: string, occurredAt: number) => store.insertMaterial(makeMaterial({
       category: 'funding', subType: 'funding_extreme', title: `${symbol} 资金费率极端`, symbol,
       source: 'test', at: occurredAt, sentiment: 'bear', score: 80,
@@ -106,17 +125,17 @@ test('a draft is not written when its slot lands after the material expires', as
       },
     }));
     // One approved post at `now` pushes the next reserved minute out by the nominal gap.
-    approve(store, Date.now(), 0);
+    approve(store, now, 0);
     const ttl = ttlFor('funding') * 60_000;
     assert.ok(GAP > 0 && ttl > GAP, 'the test needs a shelf life longer than one gap but a slot past it');
-    funding('STALE', Date.now() - ttl + 10 * 60_000); // dies ten minutes from now, slot is a gap away
+    funding('STALE', now - ttl + 10 * 60_000); // dies ten minutes from now, slot is a gap away
 
-    const r = await generate(store, s, 3);
+    const r = await generate(store, s, 3, { account: acct });
     assert.equal(r.created.length, 0, `expected no drafts, got: ${r.skipped.join(' | ')}`);
     assert.match(r.skipped.join(' '), /保质期/);
 
-    funding('FRESH', Date.now());
-    const r2 = await generate(store, s, 3);
+    funding('FRESH', now);
+    const r2 = await generate(store, s, 3, { account: acct });
     assert.equal(r2.created.length, 1, `the fresh signal must still be written: ${r2.skipped.join(' | ')}`);
     assert.match(r2.created[0]!.material, /FRESH/);
   } finally {
@@ -128,7 +147,7 @@ test('the queue count sees articles as well as posts', () => {
   const { store, close } = tempStore();
   try {
     approve(store, Date.now(), 0);
-    store.addArticle({ trackId: 'trading_literacy', conceptId: 'oi_vs_volume', accountId: null, symbol: 'X', title: 't', body: 'b' });
+    store.addArticle({ trackId: 'trading_literacy', conceptId: 'oi_vs_volume', accountId: makeAcct(store), symbol: 'X', title: 't', body: 'b' });
     assert.equal(store.pendingQueueCount(), 2);
     assert.equal(store.pendingQueueCount(99), 0, 'scoping to an account must not count another account\'s work');
   } finally {
@@ -142,7 +161,7 @@ test('an article spends the same daily ceiling as a post', () => {
   const { store, close } = tempStore();
   try {
     const now = Date.now();
-    const articleId = store.addArticle({ trackId: 'trading_literacy', conceptId: 'oi_vs_volume', accountId: null, symbol: 'X', title: 't', body: 'b' });
+    const articleId = store.addArticle({ trackId: 'trading_literacy', conceptId: 'oi_vs_volume', accountId: makeAcct(store), symbol: 'X', title: 't', body: 'b' });
     store.db.prepare("UPDATE studio_articles SET status = 'published', published_at = ? WHERE id = ?").run(now, articleId);
     approve(store, now, 0);
     store.db.prepare("UPDATE posts SET status = 'published', published_at = ? WHERE id = (SELECT MAX(id) FROM posts)").run(now);

@@ -4,6 +4,7 @@ import { readFileSync } from 'node:fs';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { Store } from '../db/index.ts';
+import { ALERT_KINDS, activeAlerts, ack as ackAlert, clear as clearAlert, dayGapReason, raise as raiseAlert, type AlertEnvelope } from '../alerts/bus.ts';
 import { collect, generate, generateFromPool, publishDue, pauseState, reroll } from '../pipeline.ts';
 import { pool, refreshPool } from '../hot/pool.ts';
 import { nextSlot, nextSlotFor, settingsFrom, saveSettings, beijingDayStart } from '../schedule.ts';
@@ -122,6 +123,43 @@ app.get('/healthz', (_req, reply) => {
   return reply.send({ ok: true, autoRun: s.autoRun, accounts: store.activeAccounts().length });
 });
 
+/**
+ * loop_stalled 生产者（契约 v1.1）。放在面板进程里而不是 daemon 里，是因为「循环死了」这件事
+ * 只有还活着的观察者能说：进程整体没了，总线也哑了——那时面板拉不到 /api/status 打红灯，
+ * 前端派生态补最后一段，契约里写明了这条不是 kind。
+ */
+function loopScan(store: Store, s: Settings, now = Date.now()): void {
+  const lastTickAt = store.getSetting<number>('lastTickAt', 0);
+  const failStreak = store.getSetting<number>('tickFailStreak', 0);
+  const intervalMs = Math.max(3, Math.min(240, s.tickMinutes ?? 15)) * 60_000;
+  const staleMs = Math.max(2 * intervalMs, 45 * 60_000);
+  const stale = s.autoRun && lastTickAt > 0 && now - lastTickAt > staleMs;
+  const failing = failStreak >= 2;
+  if (!s.autoRun) {
+    raiseAlert(store, { kind: ALERT_KINDS.loopStalled, severity: 'warning', key: 'loop', subreason: 'auto_run_off', now });
+  } else if (!lastTickAt) {
+    raiseAlert(store, { kind: ALERT_KINDS.loopStalled, severity: 'fault', key: 'loop', subreason: 'tick_never_ran', now });
+  } else if (stale) {
+    raiseAlert(store, {
+      kind: ALERT_KINDS.loopStalled, severity: 'fault', key: 'loop', subreason: 'tick_stale', now,
+      extra: { tickAgeMinutes: Math.round((now - lastTickAt) / 60_000) },
+    });
+  }
+  if (failing) {
+    raiseAlert(store, { kind: ALERT_KINDS.loopStalled, severity: 'fault', key: 'loop', subreason: 'tick_reports_failure', now, extra: { failStreak } });
+  }
+  // 条件全不成立且心跳新鲜——循环确实活着，关灯。auto_run_off 由下一次 raise 重新点亮，
+  // 这里只在三种故障都不成立时清掉整个 loop 条目。
+  if (s.autoRun && !stale && !failing && lastTickAt > 0) clearAlert(store, ALERT_KINDS.loopStalled, 'loop');
+}
+
+app.post('/api/alerts/ack', (req, reply) => {
+  const body = req.body as { kind?: string; key?: string; by?: string };
+  if (!body.kind || !body.key) return reply.code(400).send({ error: '需要 kind 与 key' });
+  const ok = ackAlert(store, body.kind, body.key, body.by ?? 'operator');
+  return reply.send({ ok, alerts: activeAlerts(store) });
+});
+
 app.get('/api/status', (_req, reply) => {
   const s = settingsFrom(store);
   const slot = nextSlot(store, s);
@@ -143,6 +181,9 @@ app.get('/api/status', (_req, reply) => {
     templateCount: store.allTemplates().length,
     next: slot,
     pause,
+    // 契约 v1.1 §1：总线的活动告警与事件流同源，面板轮询这一份就够渲染三件套的灯。
+    alerts: (loopScan(store, s), activeAlerts(store)),
+    gapReasonToday: dayGapReason(store, beijingDayStart()),
     hasKey: Boolean(getSecret(store, 'squareApiKey')),
     llm: { enabled: settingsFrom(store).llmEnabled, provider: settingsFrom(store).llmProvider, model: settingsFrom(store).llmModel },
     materials: store.materialCounts(),
@@ -755,9 +796,12 @@ async function runTick(store: Store, opts: { force?: boolean; live?: boolean } =
   try {
     const r = await tick(store, { live: opts.live ?? true, tickNo: ++tickNo });
     lastTick = r;
+    store.setSetting('tickFailStreak', 0);
     console.log(line(r));
     return r;
   } catch (err) {
+    // 连续两轮异常 = tick_reports_failure，loopScan 会上 loop_stalled/fault。
+    store.setSetting('tickFailStreak', store.getSetting<number>('tickFailStreak', 0) + 1);
     console.log(`tick 异常：${String(err).slice(0, 200)}`);
     return null;
   } finally {

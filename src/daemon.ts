@@ -1,6 +1,6 @@
 import 'dotenv/config';
 import { Store, type AccountRow } from './db/index.ts';
-import { collect, generate, generateForMatrix, generateFromPool, publishDue, pauseState } from './pipeline.ts';
+import { collect, generate, generateForMatrix, publishDue, pauseState } from './pipeline.ts';
 import { generateColumn } from './column.ts';
 import { settingsFrom } from './schedule.ts';
 import { backfillStats, tuneTemplateWeights } from './stats/backfill.ts';
@@ -15,6 +15,10 @@ import { attributeConversions } from './money/conversion.ts';
 import { sampleSquareBoards } from './stats/benchmarks.ts';
 import { retire } from './lifecycle.ts';
 import { matrixEligibleAccounts } from './studio/lock.ts';
+import type { Settings } from './config.ts';
+import { beijingDayStart } from './schedule.ts';
+import { laneCap } from './lanes.ts';
+import { ALERT_KINDS, noteGapReason, dayGapReason, raise as raiseAlert, clear as clearAlert, hasActiveUnacked } from './alerts/bus.ts';
 import { runStudio } from './studio/runner.ts';
 import { getSecret } from './secrets.ts';
 import { backupDatabase } from './backup.ts';
@@ -105,68 +109,96 @@ export async function tick(store: Store, opts: { live?: boolean; statsEveryTicks
     }
   }
 
+  // P0-3 期望驱动: every tick is accounted for, every gap carries either a reason code or an
+  // alert. Silence used to be a legal state, which is how a 4.7-hour stall produced zero
+  // visible events. The tick heartbeat is also what the panel's loop_stalled scan reads.
+  const prevTickAt = store.getSetting<number>('lastTickAt', 0);
+  store.setSetting('lastTickAt', res.at);
+  if (opts.live) {
+    // 停摆 >2h 且无人为暂停记录 → 熔断（锁存，只有 ack 能放行自动发布）。A loop that was dead
+    // for two hours says so on the first tick after it wakes up.
+    if (prevTickAt && res.at - prevTickAt > 2 * 3_600_000 && settings.autoPublish) {
+      const gapH = Math.round(((res.at - prevTickAt) / 3_600_000) * 10) / 10;
+      raiseAlert(store, { kind: ALERT_KINDS.breakerTripped, severity: 'breach', key: 'loop_stall', subreason: 'stall_gt_2h', extra: { gapHours: gapH } });
+      res.notes.push(`熔断：主循环停摆 ${gapH}h 且无人为暂停记录，自动发布已阻断，需人工 ack breaker_tripped/loop_stall`);
+    }
+    // 日终对账：跨过北京日界，先结昨日「应发 vs 实发」。
+    if (prevTickAt && beijingDayStart(prevTickAt) !== beijingDayStart(res.at)) {
+      reconcileGapDay(store, settings, beijingDayStart(prevTickAt), res.notes);
+    }
+  }
+
   try {
-    const accounts = matrixEligibleAccounts(store);
-    // Without a publisher there is no point generating. Drafts with no account can only be
-    // posted by the env-key fallback, so when neither exists every tick would pile more
-    // auto-approved rows into a bucket nothing can drain — which is exactly what the
-    // "every draft must belong to an account" rule below is there to prevent.
-    const canPublish = accounts.length > 0 || Boolean(process.env.SQUARE_API_KEY);
-    if (settings.columnMode && accounts.length) {
-      // The column replaces the mixed lane outright: a fixed heading sharing a feed with the
-      // thirty-odd generic data posts is not a column. Quiet markets simply produce nothing.
-      for (const a of accounts) {
-        const c = await generateColumn(store, settings, a);
-        res.poolCreated += c.created.length;
-        for (const n of c.skipped) res.notes.push(`${a.label}：${n}`);
-      }
-    } else if (!canPublish) {
-      res.notes.push('短帖已停摆：唯一可用账号被工作室占用，且 .env 未配 SQUARE_API_KEY，再生成也发不出去');
+    const accounts = matrixEligibleAccounts(store, settings);
+    const enabledAll = store.activeAccounts(res.at);
+    if (!accounts.length) {
+      // 「可发布账号集合为空」本身即告警（定稿 §3-P0-3）。因由码分两形态：一个启用号都没有
+      // （human_pause，只有 PATCH 审计路径写得出来）/ 有启用号但短帖租约已满（quota_spent）。
+      const reasonCode = enabledAll.length ? ('quota_spent' as const) : ('human_pause' as const);
+      raiseAlert(store, { kind: ALERT_KINDS.accountPoolEmpty, severity: 'fault', key: 'pool', reasonCode, samplesInWindow: enabledAll.length });
+      noteGapReason(store, beijingDayStart(res.at), reasonCode, enabledAll.length);
+      res.notes.push(enabledAll.length
+        ? '短帖生成停：启用账号的今日短帖租约都已用满'
+        : '短帖生成停：一个启用账号都没有——这是故障形态，account_pool_empty 已上总线');
     } else {
-    if (accounts.length) {
-      const m = await generateForMatrix(store, settings);
-      res.accountsRun = m.accounts.length;
-      res.poolCreated = m.accounts.reduce((s, a) => s + a.created, 0);
-      for (const a of m.accounts.filter(x => !x.created)) res.notes.push(`${a.label}：${a.skipped[0] ?? '未产出'}`);
-      if (m.errors.length) res.notes.push(`矩阵 ${m.errors.length} 个错误`);
-    } else {
-      const g = await generateFromPool(store, settings, { count: 2 });
-      res.poolCreated = g.created.length;
-      if (g.errors.length) res.notes.push(`热度池 ${g.errors.length} 个错误`);
-      if (g.matureCount === 0) res.notes.push(`热度池无成熟标的（${g.skipped.length} 个被挡）`);
-    }
-    // Fill remaining slots from event materials so a quiet market still posts. Every
-    // draft must belong to an account, or no account can ever publish it.
-    const want = Math.max(0, Math.ceil(settings.postsPerDay / 4) - res.poolCreated);
-    if (want > 0) {
-      const owners = matrixEligibleAccounts(store);
-      const shares = new Map<number, number>();
-      for (let i = 0; i < want; i++) {
-        const key = owners.length ? (owners[i % owners.length]?.id ?? 0) : 0;
-        shares.set(key, (shares.get(key) ?? 0) + 1);
+      clearAlert(store, ALERT_KINDS.accountPoolEmpty, 'pool');
+      if (settings.columnMode) {
+        // The column replaces the mixed lane outright: a fixed heading sharing a feed with the
+        // thirty-odd generic data posts is not a column. Quiet markets simply produce nothing.
+        for (const a of accounts) {
+          const c = await generateColumn(store, settings, a);
+          res.poolCreated += c.created.length;
+          for (const n of c.skipped) res.notes.push(`${a.label}：${n}`);
+        }
+      } else {
+        const m = await generateForMatrix(store, settings);
+        res.accountsRun = m.accounts.length;
+        res.poolCreated = m.accounts.reduce((s, a) => s + a.created, 0);
+        for (const a of m.accounts.filter(x => !x.created)) res.notes.push(`${a.label}：${a.skipped[0] ?? '未产出'}`);
+        if (m.errors.length) res.notes.push(`矩阵 ${m.errors.length} 个错误`);
       }
-      for (const [accountId, n] of shares) {
-        const a = owners.find(x => x.id === accountId);
-        const g = await generate(store, settings, n, { account: a });
-        res.eventCreated += g.created.length;
-        for (const s of g.skipped) res.notes.push(`${a?.label ?? '单号'}: ${s}`);
+      // Fill remaining slots from event materials so a quiet market still posts. P0-2: 每一笔
+      // 草稿从写下第一行起就有主人——没有 owners 就没有这个循环，env 兜底路径已废弃。
+      const want = Math.max(0, Math.ceil(settings.postsPerDay / 4) - res.poolCreated);
+      if (want > 0) {
+        const shares = new Map<number, number>();
+        for (let i = 0; i < want; i++) {
+          const key = accounts[i % accounts.length]!.id;
+          shares.set(key, (shares.get(key) ?? 0) + 1);
+        }
+        for (const [accountId, n] of shares) {
+          const a = accounts.find(x => x.id === accountId);
+          const g = await generate(store, settings, n, { account: a });
+          res.eventCreated += g.created.length;
+          for (const s of g.skipped) res.notes.push(`${a?.label ?? '单号'}: ${s}`);
+        }
       }
-    }
+      if (settings.columnMode && !res.poolCreated && !res.eventCreated) {
+        noteGapReason(store, beijingDayStart(res.at), 'no_material', 0);
+      }
     }
   } catch (err) {
     res.notes.push(`generate 失败：${String(err).slice(0, 100)}`);
   }
 
   // The breaker only stops *automatic* publishing: an operator pressing 发布 by hand is a person
-  // deciding, which is exactly what a tripped breaker asks for.
+  // deciding, which is exactly what a tripped breaker asks for. P0-3 adds a second breaker
+  // surface — any un-acked breaker_tripped on the bus (平台旗标非零单条即切 / 停摆>2h) also latches.
   const breakerNow = evaluateBreaker(store, settings);
+  const busBreaker = hasActiveUnacked(store, ALERT_KINDS.breakerTripped);
   if (breakerNow.tripped && opts.live && settings.autoPublish) {
     res.notes.push(`熔断：最近 ${breakerNow.window} 条浏览中位数 ${Math.round(breakerNow.median ?? 0)} < ${breakerNow.floor}，已停止自动发布，需要在 AI 大脑页手动恢复`);
   }
-  if (opts.live && settings.autoPublish && !breakerNow.tripped) {
+  if (busBreaker && opts.live && settings.autoPublish && !breakerNow.tripped) {
+    res.notes.push('熔断：总线上有未确认的 breaker_tripped（旗标非零或停摆超 2h），自动发布阻断，人工 ack 后恢复');
+  }
+  if (opts.live && settings.autoPublish && !breakerNow.tripped && !busBreaker) {
     // Each account publishes only its own approved posts, with its own key and egress.
-    const accounts = matrixEligibleAccounts(store);
-    const targets: { account?: AccountRow }[] = accounts.length ? accounts.map(a => ({ account: a })) : [{}];
+    // P0-2: the `: [{}]` no-account fallback is gone — an empty pool publishes nothing and
+    // the pool state itself is the alert (raised in the generate stage above), never a silent
+    // env-key drain. Delivery iterates *enabled* accounts, not lease-open ones: a day's cap
+    // binds drafts, it must never strand the account's own approved queue.
+    const targets: { account: AccountRow }[] = store.activeAccounts(res.at).map(a => ({ account: a }));
     for (const t of targets) {
       try {
         const p = await publishDue(store, settings, { live: true, ...t });
@@ -178,9 +210,34 @@ export async function tick(store: Store, opts: { live?: boolean; statsEveryTicks
         res.deferred += deferred;
         res.failed += p.failed.length - deferred;
         if (p.uncertain.length) res.notes.push(`${p.uncertain.length} 条状态未知，需人工到广场确认`);
-        if (p.paused) res.notes.push(`${t.account?.label ?? '账号'}已自动暂停`);
+        if (p.paused) res.notes.push(`${t.account.label}已自动暂停`);
       } catch (err) {
         res.notes.push(`publish 失败：${String(err).slice(0, 100)}`);
+      }
+    }
+  }
+  // auto_run_off 不在这里发：自动循环关没关由面板的 loopScan 判（s.autoRun），
+  // tick 能跑到说明循环在转。
+
+  // 期望驱动的停摆阶梯（定稿 §2）：应发（有素材·有可用账号·配额未满）而未发，5h 预警、
+  // 12h 故障、24h 违约。有计划内因由码的空档走 gapReason 记账，不进阶梯。
+  if (opts.live && settings.autoPublish) {
+    const lastOk = store.getSetting<number>('lastPublishOkAt', 0);
+    if (res.published > 0) {
+      store.setSetting('lastPublishOkAt', res.at);
+      for (const k of [ALERT_KINDS.stallWarning, ALERT_KINDS.stallFault, ALERT_KINDS.stallBreach]) clearAlert(store, k, 'matrix');
+      clearAlert(store, ALERT_KINDS.loopStalled, 'loop');
+    } else if (lastOk) {
+      const ageH = (res.at - lastOk) / 3_600_000;
+      const roomy = matrixEligibleAccounts(store, settings).length > 0;
+      const hasMat = store.unusedCount() > 0;
+      if (ageH >= 5 && roomy && hasMat && !breakerNow.tripped && !busBreaker) {
+        if (ageH >= 5) raiseAlert(store, { kind: ALERT_KINDS.stallWarning, severity: 'warning', key: 'matrix', samplesInWindow: res.deferred });
+        if (ageH >= 12) raiseAlert(store, { kind: ALERT_KINDS.stallFault, severity: 'fault', key: 'matrix', samplesInWindow: res.deferred });
+        if (ageH >= 24) raiseAlert(store, { kind: ALERT_KINDS.stallBreach, severity: 'breach', key: 'matrix', samplesInWindow: res.deferred });
+      } else if (ageH >= 5) {
+        const code = breakerNow.tripped || busBreaker ? 'breaker_on' : !hasMat ? 'no_material' : 'quota_spent';
+        noteGapReason(store, beijingDayStart(res.at), code, res.deferred);
       }
     }
   }
@@ -343,6 +400,34 @@ export function line(r: TickResult): string {
     `${r.paramsApplied ? ` 调参${r.paramsApplied}` : ''}` +
     `${r.notes.length ? `  (${r.notes.join('; ')})` : ''}`
   );
+}
+
+/**
+ * 日终对账（定稿 §3-P0-3 / 契约 v1.1 §4）：应发 = 当日各启用账号的两条通道日额度之和；
+ * 实发 = 当日 published（短帖+长文同账）。有差的日必须已有因由码——计划内空档要落码 +
+ * 窗内样本数，「没码的没发」本身就是 expected_gap 故障，这正是 4.7 小时停摆的结构性修法。
+ */
+export function reconcileGapDay(store: Store, settings: Settings, prevDayStart: number, notes: string[]): void {
+  const dayEnd = prevDayStart + 24 * 3_600_000;
+  const enabled = store.db.prepare('SELECT id FROM accounts WHERE enabled = 1').all() as { id: number }[];
+  let expected = 0;
+  for (const a of enabled) expected += laneCap(store, settings, a.id, 'short') + laneCap(store, settings, a.id, 'long');
+  const counts = store.db
+    .prepare(
+      `SELECT (SELECT COUNT(*) FROM posts WHERE status = 'published' AND published_at >= ? AND published_at < ?)
+            + (SELECT COUNT(*) FROM studio_articles WHERE status = 'published' AND published_at >= ? AND published_at < ?) AS n`,
+    )
+    .get(prevDayStart, dayEnd, prevDayStart, dayEnd) as { n: number };
+  const actual = counts.n;
+  if (actual >= expected || expected === 0) return;
+  const reason = dayGapReason(store, prevDayStart);
+  if (reason) return; // 计划内空档有码有样本，不判故障——但它在空档表里必须看得见（面板读 gapReasons）
+  raiseAlert(store, {
+    kind: ALERT_KINDS.expectedGap, severity: 'fault', key: String(prevDayStart),
+    reasonCode: null, samplesInWindow: expected - actual,
+    extra: { expected, actual, day: new Date(prevDayStart).toISOString().slice(0, 10) },
+  });
+  notes.push(`日终对账：${new Date(prevDayStart).toISOString().slice(0, 10)} 应发 ${expected} 实发 ${actual}，无因由码——expected_gap 已上总线`);
 }
 
 export async function runLoop(intervalMinutes: number, live: boolean): Promise<never> {

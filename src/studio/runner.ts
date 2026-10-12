@@ -14,7 +14,9 @@ import { preFlight } from '../engine/preflight.ts';
 import type { Fact } from '../engine/types.ts';
 import { getAccountSecret } from '../secrets.ts';
 import { wordBank } from '../content/wordbank.ts';
-import { nextCheckDue, readPost } from '../stats/backfill.ts';
+import { nextCheckDue, readPost, platformFlags } from '../stats/backfill.ts';
+import { ALERT_KINDS, raise as raiseAlert, clear as clearAlert } from '../alerts/bus.ts';
+import { laneCap, tryAcquireLaneLease } from '../lanes.ts';
 import { writingNotes } from '../brain/author.ts';
 /**
  * When may this account's next long post go out?
@@ -130,7 +132,7 @@ export type CollectMissLedger = Record<string, CollectMiss>;
  * A successful read closes the streak and reports whether an alert had been raised.
  */
 export function noteCollectMiss(ledger: CollectMissLedger, articleId: number, ok: boolean, now = Date.now()):
-  { changed: boolean; events: { severity: string; miss: CollectMiss }[]; cleared?: CollectMiss } {
+  { changed: boolean; events: { severity: 'warning' | 'fault' | 'breach'; miss: CollectMiss }[]; cleared?: CollectMiss } {
   const key = String(articleId);
   const cur = ledger[key];
   if (ok) {
@@ -142,7 +144,7 @@ export function noteCollectMiss(ledger: CollectMissLedger, articleId: number, ok
     ? { misses: cur.misses + 1, firstAt: cur.firstAt, lastAt: now, alerted: cur.alerted }
     : { misses: 1, firstAt: now, lastAt: now, alerted: null };
   ledger[key] = miss;
-  const events: { severity: string; miss: CollectMiss }[] = [];
+  const events: { severity: 'warning' | 'fault' | 'breach'; miss: CollectMiss }[] = [];
   if (miss.misses >= 2) {
     const ageH = (now - miss.firstAt) / 3600e3;
     const severity = ageH >= 24 ? 'breach' : ageH >= 12 ? 'fault' : 'warning';
@@ -191,10 +193,11 @@ export async function runStudio(
       return m;
     });
 
-    const want = b.articles_per_day ?? track.cadence.articlesPerDay;
-    const alreadyToday = (store.db.prepare(
-      'SELECT COUNT(*) AS n FROM studio_articles WHERE account_id = ? AND created_at >= ?',
-    ).get(b.account_id, beijingDayStart(now)) as { n: number }).n;
+    // P0-2: the long lane's daily cap comes from laneCap — binding disabled ⇒ 0, and the
+    // ≤2/日 hard ceiling in 定稿 §2 is written once there, not here. The old read of
+    // `b.articles_per_day ?? track.cadence` could exceed 2 if a binding was configured higher.
+    const want = laneCap(store, settings, b.account_id, 'long');
+    const alreadyToday = store.laneUsage(b.account_id, 'long', beijingDayStart(now));
     const budget = Math.max(0, want - alreadyToday);
     if (!budget) {
       entry.skipped.push(`今日 ${want} 篇额度已用完`);
@@ -223,6 +226,11 @@ export async function runStudio(
         }
 
         const claimAt = nextArticleSlot(store, b.account_id, track, now);
+        const lease = tryAcquireLaneLease(store, settings, b.account_id, 'long', 'studio', claimAt, now);
+        if (!lease.ok) {
+          entry.skipped.push(lease.reason ?? '长文通道额度已满');
+          break;
+        }
         const id = store.addArticle({
           trackId: track.id,
           conceptId: choice.conceptId,
@@ -352,20 +360,27 @@ export async function runStudio(
     const miss = noteCollectMiss(missLedger, a.id, vo !== null);
     if (miss.changed) ledgerDirty = true;
     for (const ev of miss.events) {
-      store.log('collect_gap', {
-        articleId: a.id, squarePostId: a.square_post_id, severity: ev.severity,
-        misses: ev.miss.misses, firstAt: ev.miss.firstAt, lastAt: ev.miss.lastAt,
-        ageHours: Math.round(((ev.miss.lastAt - ev.miss.firstAt) / 3600e3) * 10) / 10,
+      // 契约 v1.1：collect_gap 走总线——升档只单调向上、kind+key 去重、ack 后 24h 静默，
+      // 同一 JSON 信封会出现在 /api/status.alerts。专有字段按契约 §3 放在 extra 里。
+      raiseAlert(store, {
+        kind: ALERT_KINDS.collectGap, severity: ev.severity, key: String(a.id),
+        samplesInWindow: ev.miss.misses,
+        extra: { articleId: a.id, squarePostId: a.square_post_id, misses: ev.miss.misses },
+        now: ev.miss.lastAt,
       });
       report.errors.push(`collect_gap ${a.id}: ${ev.severity} x${ev.miss.misses}`);
     }
-    if (miss.cleared) store.log('collect_gap_clear', { articleId: a.id, squarePostId: a.square_post_id, misses: miss.cleared.misses, firstAt: miss.cleared.firstAt });
+    if (miss.cleared) {
+      clearAlert(store, ALERT_KINDS.collectGap, String(a.id));
+      report.errors.push(`collect_gap_clear ${a.id}`);
+    }
     if (!vo) continue;
     const sub = subscribeSample(vo);
     store.recordStudioObservation(a.id, dueIdx, {
       views: Number(vo.viewCount ?? 0), likes: Number(vo.likeCount ?? 0), comments: Number(vo.commentCount ?? 0),
       shares: Number(vo.shareCount ?? 0), reactions: Number(vo.totalReactionCount ?? 0),
       subscribers: sub.value, subscribersReason: sub.reason,
+      flags: platformFlags(vo),
       onBoard: false,
     });
     report.statsUpdated++;

@@ -48,6 +48,7 @@ CREATE TABLE IF NOT EXISTS posts (
   scheduled_at   INTEGER,
   published_at   INTEGER,
   account_id     INTEGER,
+  label_id       INTEGER,
   square_post_id TEXT,
   url            TEXT,
   error          TEXT,
@@ -67,6 +68,11 @@ CREATE TABLE IF NOT EXISTS post_stats (
   comments    INTEGER,
   shares      INTEGER,
   reactions   INTEGER,
+  -- 旗标三件套（P0-3）：NULL = 读不到（missing ≠ pass），0/'' = 平台明确说没事。
+  created_by_ai     INTEGER,
+  fact_check_status TEXT,
+  block_type        TEXT,
+  reject_reason     TEXT,
   raw_json    TEXT
 );
 
@@ -129,6 +135,44 @@ CREATE TABLE IF NOT EXISTS events (
   kind  TEXT NOT NULL,
   detail TEXT
 );
+
+/* ============================================================================
+ * P0-2 — labels and lane leases (定稿 v1.5 §3-P0-2).
+ *
+ * A label is the asset R1 exists to accumulate: 1 primary label carries every
+ * judgement, candidates only accumulate (20% quota, never participate in
+ * verdicts). Every new draft must trace to one label — "读者看三条说不出这个账号
+ * 是干什么的" was the old failure, and it cannot be fixed retroactively if the
+ * rows do not record which label produced them.
+ * ========================================================================== */
+CREATE TABLE IF NOT EXISTS labels (
+  id           INTEGER PRIMARY KEY AUTOINCREMENT,
+  name         TEXT NOT NULL UNIQUE,
+  kind         TEXT NOT NULL DEFAULT 'primary',        -- primary | candidate
+  status       TEXT NOT NULL DEFAULT 'active',         -- active | accumulating | retired
+  persona_json TEXT,
+  created_at   INTEGER NOT NULL
+);
+
+/*
+ * Lane leases replace the studio's static lock. The old invariant — a studio-bound
+ * account cannot feed the short-form matrix at all — is what made 「启用 zhang 短帖
+ * 还是发不出」. A lease says instead: an account serves 短帖/长文 lanes concurrently,
+ * each lane capped per Beijing day (short = 承诺 4 条/日期望, long ≤ 2 硬上限), and the
+ * cap is the invariant, not module ownership. Rows are append-only audit: usage is
+ * derived from the drafts themselves, so a crash can never leak a held lease.
+ */
+CREATE TABLE IF NOT EXISTS lane_leases (
+  id         INTEGER PRIMARY KEY AUTOINCREMENT,
+  account_id INTEGER NOT NULL REFERENCES accounts(id),
+  lane       TEXT NOT NULL,              -- short | long
+  day_start  INTEGER NOT NULL,           -- 北京日日界（毫秒）
+  slot_at    INTEGER,                    -- 预约的发布时刻
+  held_by    TEXT NOT NULL,              -- matrix | studio | surge | manual
+  state      TEXT NOT NULL DEFAULT 'held', -- held | used | released
+  created_at INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_lane_day ON lane_leases(account_id, lane, day_start);
 
 -- Rolling attention history. This is what lets a post say "连续第 3 个小时放量"
 -- instead of only ever describing one instant.
@@ -235,6 +279,7 @@ CREATE TABLE IF NOT EXISTS studio_articles (
   track_id     TEXT NOT NULL,
   concept_id   TEXT NOT NULL,
   account_id   INTEGER REFERENCES accounts(id),
+  label_id     INTEGER,
   -- The claim re-checker needs this: "持仓还在增加" is only falsifiable against the same
   -- coin's current data, not against anything in the article text.
   symbol       TEXT,
@@ -577,6 +622,42 @@ export class Store {
     if (!has('studio_observations', 'subscribers_reason')) {
       this.db.exec('ALTER TABLE studio_observations ADD COLUMN subscribers_reason TEXT');
     }
+    // P0-3 旗标三件套同样适用于长文观察：missing 记 NULL，读不到 ≠ 没事。
+    for (const [col, decl] of [
+      ['created_by_ai', 'INTEGER'],
+      ['fact_check_status', 'TEXT'],
+      ['block_type', 'TEXT'],
+      ['reject_reason', 'TEXT'],
+    ] as const) {
+      if (!has('studio_observations', col)) this.db.exec(`ALTER TABLE studio_observations ADD COLUMN ${col} ${decl}`);
+    }
+
+    // P0-2: label_id on both lanes' rows. Historical rows stay NULL — they predate the label
+    // system and must not be backfilled into a label that never produced them (that would
+    // launder the R1 asset out of nothing). New drafts get the primary label or are refused.
+    if (!has('posts', 'label_id')) this.db.exec('ALTER TABLE posts ADD COLUMN label_id INTEGER');
+    if (!has('studio_articles', 'label_id')) this.db.exec('ALTER TABLE studio_articles ADD COLUMN label_id INTEGER');
+
+    // P0-3: the platform's own flags become first-class columns. `missing ≠ pass` is why they
+    // are nullable instead of default 0: an absent key is 「读不到」, and reading it as 未旗标
+    // is exactly the disguise this whole round removes.
+    for (const [col, decl] of [
+      ['created_by_ai', 'INTEGER'],
+      ['fact_check_status', 'TEXT'],
+      ['block_type', 'TEXT'],
+      ['reject_reason', 'TEXT'],
+    ] as const) {
+      if (!has('post_stats', col)) this.db.exec(`ALTER TABLE post_stats ADD COLUMN ${col} ${decl}`);
+    }
+
+    // One primary label, seeded idempotently. The persona text is 运营's to fill (标签手册);
+    // the row exists so label_id has something real to point at from the first draft.
+    const labelN = (this.db.prepare('SELECT COUNT(*) AS n FROM labels').get() as { n: number }).n;
+    if (labelN === 0) {
+      this.db
+        .prepare(`INSERT INTO labels (name, kind, status, created_at) VALUES ('盘面反常观察员', 'primary', 'active', ?)`)
+        .run(Date.now());
+    }
   }
 
   close(): void {
@@ -759,6 +840,49 @@ export class Store {
 
   /* ----------------------------------------------------------------- posts */
 
+  /* ---------------------------------------------------------------- labels */
+
+  listLabels(): { id: number; name: string; kind: string; status: string; persona_json: string | null; created_at: number }[] {
+    return this.db.prepare('SELECT * FROM labels ORDER BY kind DESC, id ASC').all() as never;
+  }
+
+  activePrimaryLabelId(): number | null {
+    const row = this.db
+      .prepare(`SELECT id FROM labels WHERE kind = 'primary' AND status = 'active' ORDER BY id LIMIT 1`)
+      .get() as { id: number } | undefined;
+    return row?.id ?? null;
+  }
+
+  labelById(id: number): { id: number; name: string; kind: string; status: string } | undefined {
+    return this.db.prepare('SELECT id, name, kind, status FROM labels WHERE id = ?').get(id) as
+      | { id: number; name: string; kind: string; status: string }
+      | undefined;
+  }
+
+  /* ----------------------------------------------------------------- lanes */
+
+  /** Drafts made today (any non-rejected status) on one lane of one account. */
+  laneUsage(accountId: number, lane: 'short' | 'long', dayStart: number): number {
+    const table = lane === 'long' ? 'studio_articles' : 'posts';
+    const row = this.db
+      .prepare(`SELECT COUNT(*) AS n FROM ${table} WHERE account_id = ? AND created_at >= ? AND status != 'rejected'`)
+      .get(accountId, dayStart) as { n: number };
+    return row.n;
+  }
+
+  /** Append-only audit row for a lease grant; usage counts come from the drafts, not this table. */
+  recordLaneLease(accountId: number, lane: 'short' | 'long', dayStart: number, slotAt: number | null, heldBy: string): void {
+    this.db
+      .prepare('INSERT INTO lane_leases (account_id, lane, day_start, slot_at, held_by, state, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)')
+      .run(accountId, lane, dayStart, slotAt, heldBy, 'held', Date.now());
+  }
+
+  laneLeasesToday(accountId: number, lane: 'short' | 'long', dayStart: number): { lane: string; slot_at: number | null; held_by: string; created_at: number }[] {
+    return this.db
+      .prepare('SELECT lane, slot_at, held_by, created_at FROM lane_leases WHERE account_id = ? AND lane = ? AND day_start = ? ORDER BY id')
+      .all(accountId, lane, dayStart) as never;
+  }
+
   addPost(p: {
     materialId: string | null;
     templateId: string | null;
@@ -768,11 +892,17 @@ export class Store {
     facts?: unknown;
     trace?: unknown;
     images?: string[];
+    accountId?: number | null;
+    labelId?: number | null;
   }): number {
+    // label_id 必填（P0-2）：调用方没点名标签时落到唯一主标签上；主标签不存在
+    // （被退役后忘了补位）就拒写——宁可不发，也不发一条记不了账的帖子。
+    const labelId = p.labelId === undefined ? this.activePrimaryLabelId() : p.labelId;
+    if (labelId === null) throw new Error('label_id 必填：没有 active 主标签，拒绝生成无标签草稿');
     const res = this.db
       .prepare(
-        `INSERT INTO posts (material_id, template_id, text, status, created_at, scheduled_at, facts_json, trace_json, images_json)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        `INSERT INTO posts (material_id, template_id, text, status, created_at, scheduled_at, account_id, label_id, facts_json, trace_json, images_json)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       )
       .run(
         p.materialId,
@@ -781,6 +911,8 @@ export class Store {
         p.status,
         Date.now(),
         p.scheduledAt,
+        p.accountId ?? null,
+        labelId,
         JSON.stringify(p.facts ?? null),
         JSON.stringify(p.trace ?? null),
         JSON.stringify(p.images ?? []),
@@ -899,15 +1031,23 @@ export class Store {
   /* ------------------------------------------------------------- stats */
 
   upsertPostStats(postId: number, s: StatSample): void {
+    const f = s.flags ?? null;
     this.db
       .prepare(
-        `INSERT INTO post_stats (post_id, checked_at, views, likes, comments, shares, reactions, raw_json)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        `INSERT INTO post_stats (post_id, checked_at, views, likes, comments, shares, reactions, created_by_ai, fact_check_status, block_type, reject_reason, raw_json)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
          ON CONFLICT(post_id) DO UPDATE SET checked_at = excluded.checked_at, views = excluded.views,
            likes = excluded.likes, comments = excluded.comments, shares = excluded.shares,
-           reactions = excluded.reactions, raw_json = excluded.raw_json`,
+           reactions = excluded.reactions, created_by_ai = excluded.created_by_ai,
+           fact_check_status = excluded.fact_check_status, block_type = excluded.block_type,
+           reject_reason = excluded.reject_reason, raw_json = excluded.raw_json`,
       )
-      .run(postId, Date.now(), s.views, s.likes, s.comments, s.shares ?? null, s.reactions ?? null, JSON.stringify(s.raw ?? null));
+      .run(
+        postId, Date.now(), s.views, s.likes, s.comments, s.shares ?? null, s.reactions ?? null,
+        // NULL = the key was not in the response (读不到). Never coerce a missing flag into 0.
+        f ? f.createdByAi : null, f ? f.factCheckStatus : null, f ? f.blockType : null, f ? f.rejectReason : null,
+        JSON.stringify(s.raw ?? null),
+      );
   }
 
   /**
@@ -1181,6 +1321,7 @@ export class Store {
     trackId: string;
     conceptId: string;
     accountId: number | null;
+    labelId?: number | null;
     symbol?: string | null;
     title: string;
     body: string;
@@ -1191,14 +1332,22 @@ export class Store {
     expiresAt?: number | null;
     windowClaims?: unknown;
   }): number {
+    // P0-2: a draft must belong to an account, and must carry a label. The studio runner binds
+    // both; anything arriving without them is a wiring bug and the insert refuses loudly instead
+    // of writing an orphan the panel then has to count.
+    if (a.accountId === null || a.accountId === undefined) {
+      throw new Error('草稿必须挂账号：addArticle 拒绝 accountId 为空的长文草稿');
+    }
+    const labelId = a.labelId === undefined ? this.activePrimaryLabelId() : a.labelId;
+    if (labelId === null) throw new Error('label_id 必填：没有 active 主标签，拒绝生成无标签草稿');
     const res = this.db
       .prepare(
         `INSERT INTO studio_articles
-         (track_id, concept_id, account_id, symbol, title, body, sections_json, facts_json, cover_path, status, created_at, scheduled_at, expires_at, window_claims_json)
-         VALUES (?,?,?,?,?,?,?,?,?,'draft',?,?,?,?)`,
+         (track_id, concept_id, account_id, label_id, symbol, title, body, sections_json, facts_json, cover_path, status, created_at, scheduled_at, expires_at, window_claims_json)
+         VALUES (?,?,?,?,?,?,?,?,?,?, 'draft', ?, ?, ?, ?)`,
       )
       .run(
-        a.trackId, a.conceptId, a.accountId, a.symbol ?? null, a.title, a.body,
+        a.trackId, a.conceptId, a.accountId, labelId, a.symbol ?? null, a.title, a.body,
         JSON.stringify(a.sections ?? null), JSON.stringify(a.facts ?? null), a.coverPath ?? null,
         Date.now(), a.scheduledAt ?? null, a.expiresAt ?? null, JSON.stringify(a.windowClaims ?? null),
       );
@@ -1250,17 +1399,22 @@ export class Store {
   }
 
   recordStudioObservation(articleId: number, checkpoint: number, s: StudioStatSample & { onBoard?: boolean }): void {
+    const f = s.flags ?? null;
     this.db
       .prepare(
-        `INSERT INTO studio_observations (article_id, checkpoint, at, views, likes, comments, shares, reactions, subscribers, subscribers_reason, on_board)
-         VALUES (?,?,?,?,?,?,?,?,?,?,?)
+        `INSERT INTO studio_observations (article_id, checkpoint, at, views, likes, comments, shares, reactions, subscribers, subscribers_reason, created_by_ai, fact_check_status, block_type, reject_reason, on_board)
+         VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
          ON CONFLICT(article_id, checkpoint) DO UPDATE SET
            at = excluded.at, views = excluded.views, likes = excluded.likes, comments = excluded.comments,
            shares = excluded.shares, reactions = excluded.reactions, subscribers = excluded.subscribers,
-           subscribers_reason = excluded.subscribers_reason, on_board = excluded.on_board`,
+           subscribers_reason = excluded.subscribers_reason, created_by_ai = excluded.created_by_ai,
+           fact_check_status = excluded.fact_check_status, block_type = excluded.block_type,
+           reject_reason = excluded.reject_reason, on_board = excluded.on_board`,
       )
       .run(articleId, checkpoint, Date.now(), s.views ?? null, s.likes ?? null, s.comments ?? null, s.shares ?? null, s.reactions ?? null,
-        s.subscribers ?? null, s.subscribers == null ? (s.subscribersReason ?? 'field_missing') : null, s.onBoard ? 1 : 0);
+        s.subscribers ?? null, s.subscribers == null ? (s.subscribersReason ?? 'field_missing') : null,
+        f ? f.createdByAi : null, f ? f.factCheckStatus : null, f ? f.blockType : null, f ? f.rejectReason : null,
+        s.onBoard ? 1 : 0);
   }
 
   studioObservations(articleId: number): (StudioStatSample & { checkpoint: number; at: number; on_board: number })[] {
@@ -1785,17 +1939,26 @@ interface TemplateRow {
 }
 
 /** One read of a published post's counters, taken at a checkpoint. */
+export interface PlatformFlags {
+  createdByAi: number | null;
+  factCheckStatus: string | null;
+  blockType: string | null;
+  rejectReason: string | null;
+}
+
 export interface StatSample {
   views: number;
   likes: number;
   comments: number;
   shares?: number | null;
   reactions?: number | null;
+  flags?: PlatformFlags | null;
   raw?: unknown;
 }
 
 export interface PostRow {
   id: number;
+  label_id: number | null;
   material_id: string | null;
   template_id: string | null;
   text: string;
@@ -1864,6 +2027,7 @@ export interface StudioArticle {
   track_id: string;
   concept_id: string;
   account_id: number | null;
+  label_id: number | null;
   symbol: string | null;
   title: string;
   body: string;
@@ -1892,6 +2056,8 @@ export interface StudioStatSample {
   subscribers: number | null;
   /** Why subscribers is NULL: 'field_missing' | 'parse_fail'. Null when the value was read. */
   subscribersReason?: string | null;
+  /** 旗标三件套（P0-3）：同上——读不到记 NULL，不默认成「没事」。 */
+  flags?: PlatformFlags | null;
 }
 
 /** What the list view adds on top of a post row: attribution and the latest reading. */

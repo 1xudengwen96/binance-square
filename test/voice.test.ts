@@ -271,16 +271,18 @@ test('one coin cannot be posted eight times a day under different headings', asy
   // is about the cap, not about template eligibility.
   const dir = mkdtempSync(join(tmpdir(), 'sf-cap-'));
   const store = Store.open(join(dir, 't.db'));
+  // P0-2 草稿必须挂账号：the cap lives per account now, and the planted posts belong to this one.
+  const capAcct = store.accountById(store.createAccount({ label: '上限号', enabled: true }))!;
   try {
     const at = Date.now();
     for (const [i, cat] of ['onchain', 'market_move', 'long_short'].entries()) {
       const title = `STRK 旧信号 ${i}`;
       store.insertMaterial(makeMaterial({ category: cat as never, subType: 'spike', title, symbol: 'STRK', source: 'test', at: at - (i + 1) * 3600_000, score: 80, facts: {} }));
       const m = store.db.prepare('SELECT id FROM materials WHERE title = ?').get(title) as { id: string };
-      const id = store.addPost({ materialId: m.id, templateId: null, text: `$STRK 这条旧信号已经发过了。不构成投资建议。`, status: 'published', scheduledAt: null });
+      const id = store.addPost({ materialId: m.id, templateId: null, text: `$STRK 这条旧信号已经发过了。不构成投资建议。`, status: 'published', scheduledAt: null, accountId: capAcct.id });
       store.db.prepare('UPDATE posts SET published_at = ? WHERE id = ?').run(at - (i + 1) * 3600_000, id);
     }
-    assert.equal(store.coinPostsSince(null, 'STRK', at - 86_400_000), 3, 'the cap can see all three categories');
+    assert.equal(store.coinPostsSince(capAcct.id, 'STRK', at - 86_400_000), 3, 'the cap can see all three categories on this account');
 
     store.insertMaterial(makeMaterial({
       category: 'funding', subType: 'funding_extreme', title: 'STRK 资金费率极端', symbol: 'STRK', source: 'test', at: at - 60_000, score: 82,
@@ -290,7 +292,7 @@ test('one coin cannot be posted eight times a day under different headings', asy
       },
     }));
     const s = { ...DEFAULT_SETTINGS, autoPublish: true, dailyCap: 30, postsPerDay: 20, symbolDailyCap: 3, activeStartHour: 0, activeEndHour: 24 };
-    const r = await generate(store, s, 1);
+    const r = await generate(store, s, 1, { account: capAcct });
     assert.equal(r.created.length, 0, `the cap should have blocked a fourth: ${r.skipped.join(' | ')}`);
     assert.match(r.skipped.join(' '), /一味蹭热门币/);
 
@@ -298,7 +300,7 @@ test('one coin cannot be posted eight times a day under different headings', asy
     // cap rather than to some other guard that happened to fire first. Deliberately not asserting
     // that a draft is produced: whether one composes depends on which template the seed picks and
     // on the information floor, and neither is what this test is about.
-    const roomier = await generate(store, { ...s, symbolDailyCap: 6 }, 1);
+    const roomier = await generate(store, { ...s, symbolDailyCap: 6 }, 1, { account: capAcct });
     assert.doesNotMatch(roomier.skipped.join(' '), /一味蹭热门币/, 'the cap must be the only thing that stopped it');
   } finally {
     store.close();

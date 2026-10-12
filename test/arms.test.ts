@@ -29,6 +29,13 @@ function fundingMaterial(store: Store, symbol: string, at: number): void {
 
 const SYMBOLS = ['BWET', 'ORDI', 'MINA', 'MET', 'NEAR', 'OGN'];
 
+// P0-2「草稿必须挂账号」: generate refuses to draft for nobody. These tests are about arms
+// bookkeeping, not account binding, so every store gets one plain enabled account.
+function oneAccount(store: Store) {
+  const id = store.createAccount({ label: '实验号', enabled: true });
+  return store.accountById(id)!;
+}
+
 test('a generated draft carries the arms it was written under', async () => {
   // The parts are tested elsewhere; this is the seam — if `generate` forgot to record the plan,
   // every comparison downstream silently becomes folklore about posts nobody labelled.
@@ -38,7 +45,7 @@ test('a generated draft carries the arms it was written under', async () => {
     // null = every registered experiment, the behaviour before the active set existed.
     const s = { ...ALWAYS_OPEN, autoPublish: true, dailyCap: 30, postsPerDay: 20, activeExperiments: null };
     for (const [i, sym] of SYMBOLS.entries()) fundingMaterial(store, sym, Date.now() - i * 1000);
-    const r = await generate(store, s, 4);
+    const r = await generate(store, s, 4, { account: oneAccount(store) });
     assert.ok(r.created.length > 0, `expected drafts, skipped: ${r.skipped.join(' | ')}`);
 
     const rows = store.db.prepare('SELECT post_id, experiment, arm FROM post_arms').all() as { post_id: number; experiment: string; arm: string }[];
@@ -72,7 +79,7 @@ test('every recorded arm is one of the arms the hypothesis declares', async () =
   const store = Store.open(join(dir, 't.db'));
   try {
     for (const [i, sym] of SYMBOLS.entries()) fundingMaterial(store, sym, Date.now() - i * 1000);
-    const r = await generate(store, { ...ALWAYS_OPEN, autoPublish: true, activeExperiments: null }, 4);
+    const r = await generate(store, { ...ALWAYS_OPEN, autoPublish: true, activeExperiments: null }, 4, { account: oneAccount(store) });
     assert.ok(r.created.length > 0);
     const rows = store.db.prepare('SELECT experiment, arm FROM post_arms').all() as { experiment: string; arm: string }[];
     assert.ok(rows.length > 0);
@@ -109,7 +116,7 @@ test('only the active experiments draw arms, and a column-only hypothesis never 
   const store = Store.open(join(dir, 't.db'));
   try {
     for (const [i, sym] of SYMBOLS.entries()) fundingMaterial(store, sym, Date.now() - i * 1000);
-    const r = await generate(store, { ...ALWAYS_OPEN, autoPublish: true, dailyCap: 30, postsPerDay: 20, activeExperiments: ['h_chart', 'h_column'] }, 4);
+    const r = await generate(store, { ...ALWAYS_OPEN, autoPublish: true, dailyCap: 30, postsPerDay: 20, activeExperiments: ['h_chart', 'h_column'] }, 4, { account: oneAccount(store) });
     assert.ok(r.created.length > 0, r.skipped.join(' | '));
     const used = new Set((store.db.prepare('SELECT DISTINCT experiment FROM post_arms').all() as { experiment: string }[]).map(x => x.experiment));
     assert.deepEqual([...used], ['h_chart'], 'h_hashtag_count etc. are switched off, and h_column belongs to the column lane only');

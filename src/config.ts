@@ -197,7 +197,11 @@ export const DEFAULT_SETTINGS: Settings = {
   crossAccountGapMinutes: 14,
   crossAccountCoinExclusionMinutes: 360,
   coinSignalCooldownMinutes: 720,
-  symbolDailyCap: 3,
+  // 定稿 v1.2/v1.5 §7.9: 3→2. Same guardrail, tightened — the rolling 24h account×symbol
+  // count in pipeline.ts IS the ≤2 cap; no parallel check. The stored override in the live
+  // DB must be rewritten with this default at the ④ restart (two stale keys land together:
+  // this and activeExperiments), or the runtime keeps posting by 3.
+  symbolDailyCap: 2,
   columnMode: false,
   columnPostsPerDay: 4,
   columnCoinCooldownHours: 24,

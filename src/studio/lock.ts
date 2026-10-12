@@ -1,5 +1,7 @@
 import type { Material } from '../material/types.ts';
+import type { Settings } from '../config.ts';
 import type { Store } from '../db/index.ts';
+import { laneEligibleAccounts } from '../lanes.ts';
 import type { Track } from './tracks.ts';
 import { findRefusals, trackById } from './tracks.ts';
 import { CONCEPTS } from './concepts.ts';
@@ -66,16 +68,19 @@ export function studioAccountIds(store: Store): Set<number> {
 }
 
 /**
- * Accounts the mixed-style matrix may use.
+ * Accounts the short lane may use.
  *
- * This is the whole of the isolation between the two systems on the publishing side: one
- * predicate, applied where the matrix picks its owners. Without it a bound account would
- * keep drawing short-form posts in a second voice, and the track would be undone by the
- * module that was never supposed to touch it.
+ * P0-2 changed what this predicate means. It used to be the studio's static lock —
+ * bound to the studio ⇒ excluded from the matrix entirely — which is the shape that
+ * starved zhang's short lane while his account was switched on (定稿 §3-P0-2 names it
+ * 「无账号兜底空转」的另一半). Ownership no longer decides; per-lane daily quota does:
+ * the same account can hold 短帖 (4/日期望) and 长文 (≤2/日) lanes the same day, and
+ * the timeline stays coherent because one primary label rides both, not because a
+ * module owns the account.
  */
-export function matrixEligibleAccounts(store: Store) {
-  const owned = studioAccountIds(store);
-  return store.activeAccounts().filter(a => !owned.has(a.id));
+export function matrixEligibleAccounts(store: Store, settings?: Settings) {
+  if (!settings) return store.activeAccounts();
+  return laneEligibleAccounts(store, settings);
 }
 
 export function trackForAccount(store: Store, accountId: number): Track | undefined {

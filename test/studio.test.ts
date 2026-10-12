@@ -18,6 +18,7 @@ import { nextArticleSlot, polishArticleDraft } from '../src/studio/runner.ts';
 import { createServer } from 'node:http';
 import { setSecret } from '../src/secrets.ts';
 import { DEFAULT_SETTINGS } from '../src/config.ts';
+import { laneCap } from '../src/lanes.ts';
 import { remember } from '../src/brain/memory.ts';
 
 const TRACK = 'trading_literacy';
@@ -85,17 +86,31 @@ test('the polish pass is re-checked, because rewording is how description become
   assert.equal(assertTextOnTrack(track, polished, 'polish').ok, false);
 });
 
-test('an account bound to a track leaves the mixed-style matrix', () => {
+test('a studio binding no longer locks the short lane — the daily lease does (P0-2)', () => {
+  // 旧契约（静态锁）：绑进工作室 ⇒ 矩阵完全不能碰这个号。它就是「启用 zhang 短帖还是发
+  // 不出」的成因，定稿 §3-P0-2 明文废弃。新契约：所有权不决定通道，日额度决定——短帖通道
+  // 直到当日草稿用满 posts_per_day 才关；长文通道的 ≤2/日硬上限在 laneCap 一处写死。
   const { store, close } = tempStore();
   try {
     const a = makeAccount(store, '教学号');
     const b = makeAccount(store, '普通号');
-    assert.deepEqual(matrixEligibleAccounts(store).map(x => x.id).sort(), [a, b].sort());
+    assert.deepEqual(matrixEligibleAccounts(store, DEFAULT_SETTINGS).map(x => x.id).sort(), [a, b].sort());
     store.bindStudioTrack(a, TRACK);
-    assert.deepEqual(matrixEligibleAccounts(store).map(x => x.id), [b], 'the bound account must not be drawn by the matrix');
-    assert.ok(studioAccountIds(store).has(a));
+    assert.ok(
+      matrixEligibleAccounts(store, DEFAULT_SETTINGS).some(x => x.id === a),
+      '绑定不再把账号从短帖通道里摘出去——同一账号同一天可以持两条通道的租约',
+    );
+    assert.ok(studioAccountIds(store).has(a), '绑定仍在册：长文的赛道校验与额度照旧');
+    for (let i = 0; i < DEFAULT_SETTINGS.postsPerDay; i++) {
+      store.addPost({ materialId: null, templateId: null, text: `占位 ${i}`, status: 'draft', scheduledAt: null, accountId: a });
+    }
+    assert.deepEqual(
+      matrixEligibleAccounts(store, DEFAULT_SETTINGS).map(x => x.id), [b],
+      '短帖日额度用满才退出池子；被关的是额度，不是所有权',
+    );
+    assert.equal(laneCap(store, DEFAULT_SETTINGS, a, 'long'), 2, '长文通道硬上限 2/日（定稿 §2）');
     store.unbindStudioTrack(a);
-    assert.equal(matrixEligibleAccounts(store).length, 2, 'unbinding returns it');
+    assert.equal(laneCap(store, DEFAULT_SETTINGS, a, 'long'), 0, '解绑后长文通道为 0');
   } finally {
     close();
   }
