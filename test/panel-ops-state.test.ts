@@ -1,7 +1,7 @@
 /**
  * 运行台状态层（app.js 末尾那一段）的单元测试。
  *
- * 它把「面板能看见的事实」翻译成后端契约（shared/告警总线契约v1.md）的信封，并决定
+ * 它把「面板能看见的事实」翻译成后端契约（shared/告警总线契约v1.md，v1.1）的信封，并决定
  * 标题灯 / 图标 / 系统通知。规则错一条，要么停摆没人知道，要么素材荒被当故障天天报警、
  * 最后没人看通知 —— 两边都是上一轮真发生过的形态，所以这些断言不是形式。
  *
@@ -18,7 +18,7 @@ const NOW = 1_760_000_000_000;
 
 type Panel = Record<string, unknown>;
 
-function loadPanel(): { panel: Panel; document: { title: string }; made: unknown[][] } {
+function loadPanel(permission = 'granted'): { panel: Panel; document: { title: string }; made: unknown[][] } {
   const src = readFileSync(join(import.meta.dirname, '../src/server/public/app.js'), 'utf8');
   // 启动行要找准：toggleTheme 里也写 documentElement.dataset.theme，短前缀会切在函数中间。
   const boot = src.indexOf("document.documentElement.dataset.theme = localStorage.getItem('sf-theme') || 'dark';");
@@ -27,7 +27,7 @@ function loadPanel(): { panel: Panel; document: { title: string }; made: unknown
   const storage = new Map<string, string>();
   const document = { title: '' };
   const NotificationStub = new Proxy(function () {}, {
-    get: (_t, p) => (p === 'permission' ? 'granted' : undefined),
+    get: (_t, p) => (p === 'permission' ? permission : undefined),
     construct: (_t, args) => { made.push(args); return {}; },
   });
   const ctx: Record<string, unknown> = {
@@ -44,7 +44,7 @@ function loadPanel(): { panel: Panel; document: { title: string }; made: unknown
   return { panel: ctx.__panel as Panel, document, made };
 }
 
-const P = (p: Panel) => p as unknown as {
+type Api = {
   opsState: (s: object, now?: number) => any;
   mergeAlerts: (a: any[]) => any[];
   envelope: (k: string, s: string, key: string, d: string, o?: object) => any;
@@ -53,6 +53,7 @@ const P = (p: Panel) => p as unknown as {
   CONTRACT_KINDS: Set<string>;
   NOT_WIRED_YET: string[];
 };
+const P = (p: Panel) => p as unknown as Api;
 
 const state = (over: Record<string, unknown> = {}) => ({
   settings: { dailyCap: 4, autoRun: true, autoPublish: true },
@@ -91,20 +92,52 @@ test('planned gaps carry a code and never reach the live list', () => {
   assert.equal(paused.live.length, 0, '有暂停记录就不算账号池故障');
 });
 
-test('a stale loop, a failing tick and a missing key all surface', () => {
+test('the four loop states collapse into one contract kind, per 契约 v1.1', () => {
   const { panel } = loadPanel(); const api = P(panel);
   const stale = api.opsState(state({ loop: { lastTick: { at: NOW - 3 * HOUR, failed: 0 } } }), NOW);
-  assert.equal(stale.worst, 'warning');
-  assert.equal(stale.live[0].kind, 'tick_stale');
+  assert.equal(stale.live[0].kind, 'loop_stalled');
+  assert.equal(stale.live[0].key, 'loop', '全局只许一条活动停摆告警，不许四态各开一条');
+  assert.equal(stale.live[0].subreason, 'tick_stale');
+  assert.equal(stale.worst, 'fault');
 
   const failing = api.opsState(state({ loop: { lastTick: { at: NOW - 60_000, failed: 1 } } }), NOW);
-  assert.ok(failing.live.some((a: any) => a.kind === 'tick_reports_failure'), '每 tick failed:1 的空转形态必须看得见');
-
-  const noKey = api.opsState(state({ hasKey: false }), NOW);
-  assert.ok(noKey.live.some((a: any) => a.kind === 'square_key_missing'));
+  assert.equal(failing.live.length, 1);
+  assert.equal(failing.live[0].kind, 'loop_stalled');
+  assert.equal(failing.live[0].subreason, 'tick_reports_failure');
 
   const never = api.opsState(state({ loop: {} }), NOW);
-  assert.ok(never.live.some((a: any) => a.kind === 'tick_never_ran'));
+  assert.equal(never.live[0].subreason, 'tick_never_ran');
+
+  // auto_run_off 单独出现：降 warning（契约 v1.1），且仍不另开 kind。
+  const off = api.opsState(state({ settings: { dailyCap: 4, autoRun: false } }), NOW);
+  assert.equal(off.live.length, 1);
+  assert.equal(off.live[0].kind, 'loop_stalled');
+  assert.equal(off.live[0].severity, 'warning');
+  assert.equal(off.worst, 'warning', '只是关了自动，不该按故障弹通知');
+
+  // 关自动 + tick 也陈旧：合成一条，等级取高的那个。
+  const both = api.opsState(state({ settings: { dailyCap: 4, autoRun: false }, loop: { lastTick: { at: NOW - 5 * HOUR, failed: 0 } } }), NOW);
+  assert.equal(both.live.length, 1);
+  assert.equal(both.live[0].severity, 'fault');
+  assert.equal(both.live[0].subreasons.sort().join(','), 'auto_run_off,tick_stale');
+});
+
+test('a missing square key is credential_missing at fault level (契约 v1.1)', () => {
+  const { panel } = loadPanel(); const api = P(panel);
+  const noKey = api.opsState(state({ hasKey: false }), NOW);
+  const cred = noKey.live.find((a: any) => a.kind === 'credential_missing');
+  assert.ok(cred, '缺 Key 必须进总线口径，不能留在面板自造的名目里');
+  assert.equal(cred.severity, 'fault');
+  assert.equal(cred.subreason, 'square_key_missing');
+});
+
+test('orphan posts display but never drive the light', () => {
+  const { panel } = loadPanel(); const api = P(panel);
+  const r = api.opsState(state({ orphanPending: 3 }), NOW);
+  assert.equal(r.live.some((a: any) => a.kind === 'orphan_posts'), false, '后端从源头消灭的那类，面板不替它报警');
+  assert.equal(r.shown.length, 1);
+  assert.equal(r.shown[0].kind, 'orphan_posts');
+  assert.equal(r.worst, 'info');
 });
 
 test('alerts merge on kind+key and only ever escalate', () => {
@@ -140,13 +173,21 @@ test('notifications fire at fault level once, then throttle for 20 hours', () =>
   const { panel, made } = loadPanel(); const api = P(panel);
   const res = api.opsState(state({ accounts: [], loop: { lastTick: { at: NOW - 3 * HOUR, failed: 0 } } }), NOW);
   const fired = api.opsNotify(res, NOW);
-  assert.equal(fired.map((a: any) => a.kind).join(','), 'account_pool_empty', 'warning 不该弹通知，洪水会让人直接关掉权限');
+  // account_pool_empty 与 loop_stalled 都是 fault，warning 级不许弹 —— 洪水会让人直接关掉权限。
+  assert.equal(fired.map((a: any) => a.kind).sort().join(','), 'account_pool_empty,loop_stalled');
   assert.equal(api.opsNotify(res, NOW + HOUR).length, 0);
-  assert.equal(api.opsNotify(res, NOW + 21 * HOUR).length, 1);
-  assert.equal(made.length, 2);
+  assert.equal(api.opsNotify(res, NOW + 21 * HOUR).length, 2);
+  assert.equal(made.length, 4);
 });
 
-test('the title light and favicon follow the worst unacked level', () => {
+test('notifications stay silent until the operator grants permission', () => {
+  const { panel } = loadPanel('denied'); const api = P(panel);
+  const res = api.opsState(state({ accounts: [] }), NOW);
+  assert.equal(res.worst, 'fault');
+  assert.equal(api.opsNotify(res, NOW).length, 0);
+});
+
+test('the title light follows the worst unacked level', () => {
   const { panel, document } = loadPanel(); const api = P(panel);
   api.paintOpsTitle(api.opsState(state({ accounts: [] }), NOW));
   assert.match(document.title, /^■ /);
@@ -158,8 +199,14 @@ test('the title light and favicon follow the worst unacked level', () => {
 test('the panel never claims it cannot see something it does compute', () => {
   const { panel } = loadPanel(); const api = P(panel);
   for (const k of api.NOT_WIRED_YET) assert.ok(api.CONTRACT_KINDS.has(k), `${k} 不是契约里的 kind`);
-  const computed: string[] = api.opsState(state({ accounts: [] }), NOW).all.map((a: any) => String(a.kind));
+  const computed: string[] = api.opsState(state({ hasKey: false, orphanPending: 2, loop: {} }), NOW)
+    .all.map((a: any) => String(a.kind));
   for (const k of new Set(computed)) {
     assert.ok(!api.NOT_WIRED_YET.includes(k), `${k} 面板自己算得出来，却列进了「还没接上」`);
+  }
+  // 面板现在能算的契约 kind，必须都在契约表里 —— 自造名目驱动灯是本项目要消灭的东西。
+  for (const k of new Set(computed)) {
+    if (k === 'orphan_posts') continue;
+    assert.ok(api.CONTRACT_KINDS.has(k), `${k} 不在契约 15 个 kind 内，却在驱动标题灯`);
   }
 });

@@ -2026,10 +2026,10 @@ const SEVERITY = ['info', 'warning', 'fault', 'breach'];
 const sevRank = s => { const i = SEVERITY.indexOf(s); return i < 0 ? 0 : i; };
 /** 契约 §4：带因由码的「没发」是计划内空档，没码的「没发」才是故障。 */
 const PLANNED_CODES = new Set(['no_material', 'quota_spent', 'breaker_on', 'human_pause']);
-/** 契约 §2 的 13 个 kind。不在表内的面板项进「未归类」，不冒充契约项。 */
+/** 契约 §2 的 kind（v1.1 起 15 个：原 13 + loop_stalled + credential_missing）。 */
 const CONTRACT_KINDS = new Set(['collect_gap', 'collect_gap_clear', 'publish_stall_warning', 'publish_stall_fault',
   'publish_stall_breach', 'expected_gap', 'account_pool_empty', 'breaker_tripped', 'receipt_mismatch',
-  'degrade_declared', 'image_missing', 'font_subset_missing', 'surge_blocked']);
+  'degrade_declared', 'image_missing', 'font_subset_missing', 'surge_blocked', 'loop_stalled', 'credential_missing']);
 const HOUR = 3600_000;
 
 const KIND_CN = {
@@ -2038,6 +2038,13 @@ const KIND_CN = {
   expected_gap: '应发与实发有差', account_pool_empty: '可发布账号集合为空', breaker_tripped: '熔断触发',
   receipt_mismatch: '回执与声明不符', degrade_declared: '发布前显式降级', image_missing: '广场侧无图',
   font_subset_missing: 'CJK 子集缺失', surge_blocked: '放大未入队',
+  loop_stalled: '主循环停摆', credential_missing: '发布凭据不可用',
+};
+/** 契约 §3 v1.1：loop_stalled / credential_missing 用 subreason 分态，不另开 kind。 */
+const SUBREASON_CN = {
+  tick_never_ran: '这个进程还没跑过一轮 tick', tick_stale: '最后一轮 tick 距今超过 2 小时',
+  tick_reports_failure: '上一轮 tick 记了失败', auto_run_off: '自动循环被关着',
+  square_key_missing: '没有广场 Key，只能演练', key_decrypt_fail: '密钥读不出来',
 };
 const CODE_CN = { no_material: '素材荒（供给不足）', quota_spent: '配额用尽', breaker_on: '熔断中', human_pause: '人为暂停' };
 /** 契约里靠服务端产出、面板此刻读不到的那些 —— 明写出来，别让它沉默地变成绿色。 */
@@ -2055,13 +2062,15 @@ function mergeAlerts(items) {
   for (const it of items) {
     const id = `${it.kind}|${it.key}`;
     const prev = by.get(id);
-    if (!prev) { by.set(id, { ...it }); continue; }
-    if (sevRank(it.severity) > sevRank(prev.severity)) prev.severity = it.severity;
+    if (!prev) { by.set(id, { ...it, subreasons: it.subreasons || (it.subreason ? [it.subreason] : undefined) }); continue; }
+    if (sevRank(it.severity) > sevRank(prev.severity)) { prev.severity = it.severity; if (it.subreason) prev.subreason = it.subreason; }
+    if (it.subreasons) prev.subreasons = [...new Set([...(prev.subreasons || []), ...it.subreasons])];
     prev.count = (prev.count || 1) + (it.count || 1);
     prev.lastAt = Math.max(prev.lastAt || 0, it.lastAt || 0) || null;
     prev.firstAt = prev.firstAt || it.firstAt || null;
     if (it.detail) prev.detail = it.detail;
     if (it.reasonCode) prev.reasonCode = it.reasonCode;
+    prev.displayOnly = Boolean(prev.displayOnly) && Boolean(it.displayOnly);
     if (it.source === 'bus') prev.source = 'bus';
   }
   return [...by.values()];
@@ -2087,16 +2096,22 @@ function opsState(state, now = Date.now()) {
     out.push(envelope('account_pool_empty', 'fault', 'matrix',
       `短帖通路没有可用账号：${enabled.length} 个启用号全被长文工作室占用。这正是上一轮「启用了号还是发不出」的形态。`));
   }
-  if (state.hasKey === false) out.push(envelope('square_key_missing', 'warning', 'square', '没有广场 Key —— 现在只能演练，发不出去。'));
-  if (s.autoRun === false) out.push(envelope('auto_run_off', 'warning', 'loop', '自动循环关着，系统不会自己发任何东西。'));
-  if (!tick) {
-    out.push(envelope('tick_never_ran', 'warning', 'loop', '这个进程还没跑过任何一轮 tick。'));
-  } else {
+  if (state.hasKey === false) out.push(envelope('credential_missing', 'fault', 'square', '没有广场 Key —— 现在只能演练，发不出去。', { subreason: 'square_key_missing' }));
+  // 契约 v1.1：主循环的四态折叠成一条 loop_stalled（key 固定 "loop"），只有 auto_run_off 单独出现时降 warning。
+  const loop = [];
+  if (!tick) loop.push({ subreason: 'tick_never_ran', detail: SUBREASON_CN.tick_never_ran, severity: 'fault' });
+  else {
     const ageHours = tick.at ? (now - tick.at) / HOUR : null;
-    if (ageHours != null && ageHours > 2) out.push(envelope('tick_stale', 'warning', 'loop', `最后一轮 tick 是 ${ageHours.toFixed(1)} 小时前。`));
-    if (tick.failed > 0) out.push(envelope('tick_reports_failure', 'warning', 'loop', `上一轮记了 ${tick.failed} 次失败（不等于丢帖，但一定有事）。`));
+    if (ageHours != null && ageHours > 2) loop.push({ subreason: 'tick_stale', detail: `最后一轮 tick 是 ${ageHours.toFixed(1)} 小时前 · ${SUBREASON_CN.tick_stale}`, severity: 'fault' });
+    if (tick.failed > 0) loop.push({ subreason: 'tick_reports_failure', detail: `上一轮记了 ${tick.failed} 次失败（不等于丢帖，但一定有事）。`, severity: 'fault' });
   }
-  if (state.orphanPending > 0) out.push(envelope('orphan_posts', 'warning', 'queue', `${state.orphanPending} 条草稿/已通过没有归属账号，没有号会去发它们。`));
+  if (s.autoRun === false) loop.push({ subreason: 'auto_run_off', detail: `${SUBREASON_CN.auto_run_off}，系统不会自己发任何东西。`, severity: 'warning' });
+  if (loop.length) {
+    const worstLoop = loop.reduce((w, l) => (sevRank(l.severity) > sevRank(w.severity) ? l : w), loop[0]);
+    out.push(envelope('loop_stalled', worstLoop.severity, 'loop', loop.map(l => l.detail).join('；'), { subreason: worstLoop.subreason, subreasons: loop.map(l => l.subreason) }));
+  }
+  // orphan_posts 不设总线 kind（契约 v1.1）：后端从「草稿必须挂账号」那条线消灭它，面板只展示、不驱动灯。
+  if (state.orphanPending > 0) out.push(envelope('orphan_posts', 'info', 'queue', `${state.orphanPending} 条草稿/已通过没有归属账号，没有号会去发它们。`, { displayOnly: true }));
   if (state.unused === 0) out.push(envelope('expected_gap', 'info', 'supply', '素材池没有够格的新素材 —— 这是供给不足，不是停发。', { reasonCode: 'no_material' }));
   if (s.dailyCap && (state.publishedToday || 0) >= s.dailyCap) {
     out.push(envelope('expected_gap', 'info', 'quota', `今日 ${state.publishedToday}/${s.dailyCap} 已用满。`, { reasonCode: 'quota_spent' }));
@@ -2104,9 +2119,9 @@ function opsState(state, now = Date.now()) {
 
   const all = mergeAlerts(out);
   const isPlanned = a => a.reasonCode && PLANNED_CODES.has(a.reasonCode);
-  const live = all.filter(a => !a.acked && !isPlanned(a));
+  const live = all.filter(a => !a.acked && !isPlanned(a) && !a.displayOnly);
   const worst = live.reduce((w, a) => (sevRank(a.severity) > sevRank(w) ? a.severity : w), 'info');
-  return { all, live, planned: all.filter(isPlanned), worst };
+  return { all, live, shown: all.filter(a => a.displayOnly && !a.acked), planned: all.filter(isPlanned), worst };
 }
 
 /* --------------------------------------- 可达性三件套：灯 · 图标 · 系统通知 --- */
@@ -2173,7 +2188,7 @@ async function opsView() {
   const [mark, color] = LIGHT[res.worst] || LIGHT.info;
   const sort = (a, b) => sevRank(b.severity) - sevRank(a.severity) || (b.lastAt || 0) - (a.lastAt || 0);
   const row = a => `<tr>
-      <td><span class="pill ${a.severity === 'breach' || a.severity === 'fault' ? 'bad' : a.severity === 'warning' ? 'warn' : 'plain'}">${esc(KIND_CN[a.kind] || a.kind)}</span>${a.reasonCode ? `<span class="tag">${esc(CODE_CN[a.reasonCode] || a.reasonCode)}</span>` : ''}</td>
+      <td><span class="pill ${a.severity === 'breach' || a.severity === 'fault' ? 'bad' : a.severity === 'warning' ? 'warn' : 'plain'}">${esc(KIND_CN[a.kind] || a.kind)}</span>${a.reasonCode ? `<span class="tag">${esc(CODE_CN[a.reasonCode] || a.reasonCode)}</span>` : ''}${a.subreason ? `<span class="tag">${esc(SUBREASON_CN[a.subreason] || a.subreason)}</span>` : ''}</td>
       <td class="muted">${esc(a.severity)}</td>
       <td class="muted">${a.source === 'bus' ? '总线' : '面板自算'}</td>
       <td>${esc(a.detail || '—')}</td>
@@ -2184,6 +2199,7 @@ async function opsView() {
       <td class="num">${a.acked ? '已确认' : '—'}</td>
     </tr>`;
   const live = res.live.slice().sort(sort);
+  const shown = (res.shown || []).slice().sort(sort);
   const ackedRows = res.all.filter(a => a.acked);
   const planned = res.planned.slice().sort(sort);
   let legacy = [];
@@ -2202,6 +2218,8 @@ async function opsView() {
       <tbody>${live.length ? live.map(row).join('') : '<tr><td colspan="9"><div class="empty"><b>没有未确认的故障或预警</b><span>这只说明面板能看见的那几项正常，不代表总线那几项已通过 —— 看下面那张「还没接上」的表。</span></div></td></tr>'}</tbody></table></div>
     <div class="sub" style="margin:14px 0 4px">计划内空档（有因由码，不算故障）</div>
     <div class="tw"><table><tbody>${planned.length ? planned.map(row).join('') : '<tr><td class="muted">现在没有任何带因由码的空档。</td></tr>'}</tbody></table></div>
+    ${shown.length ? `<div class="sub" style="margin:14px 0 4px">只展示 · 不驱动灯（后端从源头消灭的那类）</div>
+      <div class="tw"><table><tbody>${shown.map(row).join('')}</tbody></table></div>` : ''}
     <div class="alert" style="margin-top:14px"><svg viewBox="0 0 24 24"><path d="M12 16v-4M12 8h.01"/><circle cx="12" cy="12" r="9"/></svg>
       <div><b>这几项还没接上，界面无法代替它们变绿：</b>${notWired}。它们要等后端的期望驱动告警总线（应发 vs 实发、回执比对、缺图、降级、放大被挡）。总线一落到 <code>/api/status.alerts</code>，这一层换源、渲染不动。</div></div>
     ${ackedRows.length ? `<div class="sub" style="margin:14px 0 4px">已确认（同类 24 小时内静默）</div><div class="tw"><table><tbody>${ackedRows.map(row).join('')}</tbody></table></div>` : ''}
