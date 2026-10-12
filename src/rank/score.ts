@@ -38,6 +38,40 @@ export const MATURITY_FLOOR_MS = 24 * 3600_000;
  */
 export const allZero = (vs: number[]): boolean => vs.length > 0 && vs.every(v => v === 0);
 
+/** Metrics whose honest starting reading is zero, so «all zero» and «never measured» look alike. */
+const COUNT_METRICS: Metric[] = ['engagementPer1k', 'qualityPer1k', 'rebatePer1k'];
+const isCountMetric = (m: Metric): boolean => COUNT_METRICS.includes(m);
+
+/** Share of readings that moved away from zero. */
+export const nonzeroShare = (vs: number[]): number => (vs.length === 0 ? 0 : vs.filter(v => v !== 0).length / vs.length);
+
+/**
+ * The same share weighted by how many posts stand behind each reading.
+ *
+ * Rule text summarizes an arm as one median plus a sample count, and a lesson covering 14 posts is
+ * not the same evidence as a lesson covering 2. One post that moved cannot excuse 13 that never did.
+ */
+export const weightedNonzeroShare = (arms: { v: number; n: number }[]): number => {
+  const rows = arms.reduce((s, a) => s + a.n, 0);
+  if (rows === 0) return 0;
+  return arms.filter(a => a.v !== 0).reduce((s, a) => s + a.n, 0) / rows;
+};
+
+/**
+ * How much of a count metric must have moved before the engine is allowed to call a comparison
+ * measured. `allZero` was the first attempt and it was defeated in production by a single like: one
+ * non-zero row out of 43 was enough to make every arm read «tested, no difference». A share, not a
+ * boolean, is what the sparse case actually needs.
+ *
+ * This floor is the single definition of «the metric has started» — the verdict ladder reads it and
+ * `revokeStaleRules` reads it, so a lesson cannot be written by one rule and revoked by another.
+ */
+export const METRIC_READINESS_FLOOR = 0.2;
+
+/** The sentence the ledger and the panel show when a comparison has not been answered yet. */
+export const NOT_STARTED = (rows: number, moved: number): string =>
+  `指标还没启动：${rows} 个读数里只有 ${moved} 个非零，低于 ${(METRIC_READINESS_FLOOR * 100).toFixed(0)}% 地板。这条比较没被任何人回答过，不判高低，也不写规则。`;
+
 function outcome(row: Row, metric: Metric): number | null {
   const views = row.v24h;
   switch (metric) {
@@ -165,13 +199,12 @@ export function scoreAll(store: Store, opts: { days?: number; writeMemory?: bool
   const out: Verdict[] = [];
 
   for (const h of list) {
-    // Money replaces views as the target only for the arms we randomise; an observed comparison
-    // would just be a smaller version of the same confounding.
-    const wanted: Metric =
-      h.mode !== 'experiment' ? h.metric
-      : moneyReady ? 'rebatePer1k'
-      : opts.target === 'engagement' ? 'qualityPer1k'
-      : h.metric;
+    // What a comparison is judged by is a property of the hypothesis, not of a switch on the panel.
+    // The engagement override used to rewrite the metric of every randomised arm under itself, and a
+    // metric nobody has moved can only produce a false null. Changing the metric now means
+    // registering a new hypothesis. Money still replaces views for randomised arms, but only once a
+    // figure has actually been entered.
+    const metric: Metric = h.mode === 'experiment' && moneyReady ? 'rebatePer1k' : h.metric;
     const collect = (m: Metric): Map<string, number[]> => {
       const g = new Map<string, number[]>();
       for (const r of eligible) {
@@ -182,16 +215,16 @@ export function scoreAll(store: Store, opts: { days?: number; writeMemory?: bool
       }
       return g;
     };
-    // A target nobody has moved yet (no likes, no comments on any post) is not evidence; fall back
-    // to views for this verdict and say so, rather than calling every arm equal.
-    let metric = wanted;
-    let groups = collect(metric);
-    let fellBack = false;
-    if (metric !== 'views24h' && allZero([...groups.values()].flat())) {
-      metric = 'views24h';
-      groups = collect(metric);
-      fellBack = true;
-    }
+    const groups = collect(metric);
+    const values = [...groups.values()].flat();
+    // Below the readiness floor a count metric is «not started», not «flat». Locking the verdict to
+    // `observing` is what keeps the writer from being told a comparison was tested and found equal,
+    // and the memory write further down becomes unreachable by construction.
+    //
+    // Zero readings is a different problem — that is just «no sample yet», and the minSamples branch
+    // below says it better than a share of an empty list would.
+    const ready = !isCountMetric(metric) || values.length === 0 || nonzeroShare(values) >= METRIC_READINESS_FLOOR;
+    const moved = values.filter(v => v !== 0).length;
     const arms: ArmStat[] = h.arms.map(arm => {
       const vs = groups.get(arm) ?? [];
       return { arm, n: vs.length, median: median(vs), best: vs.length ? Math.max(...vs) : null };
@@ -199,6 +232,11 @@ export function scoreAll(store: Store, opts: { days?: number; writeMemory?: bool
     const scored = arms.filter(a => a.median != null);
     const minN = Math.min(...scored.map(a => a.n), Infinity);
     const enough = scored.length >= 2 && minN >= h.minSamples;
+    // An arm nobody ever landed in is not a small sample, it is a missing side of the comparison.
+    // Counting only the arms that have data let a one-sided hypothesis report `missing: 0` — healthy
+    // by the ledger while structurally unable to ever answer anything.
+    const oneSided = scored.length < 2;
+    const emptiest = Math.min(...arms.map(a => a.n));
 
     const ranked = [...scored].sort((a, b) => (b.median ?? 0) - (a.median ?? 0));
     const winner = ranked.length > 1 ? ranked[0]!.arm : null;
@@ -218,8 +256,14 @@ export function scoreAll(store: Store, opts: { days?: number; writeMemory?: bool
     let confidence = 0.5;
     let status: Verdict['status'] = 'observing';
     let note: string | null = null;
-    if (!enough) {
-      note = `每臂至少 ${h.minSamples} 条才能比，现在最少那臂只有 ${Number.isFinite(minN) ? minN : 0} 条。`;
+    if (!ready) {
+      note = NOT_STARTED(values.length, moved);
+    } else if (!enough) {
+      note = scored.length === 0
+        ? `${h.arms.length} 个臂都没有可用读数 —— 没有可比的行（帖子没发布满 24 小时，或没进分发台账）。`
+        : oneSided
+          ? `只有 ${scored.length} 个臂拿到过读数，另一侧一直是空的 —— 没有可比的另一方，攒多少条都判不了。`
+          : `每臂至少 ${h.minSamples} 条才能比，现在最少那臂只有 ${emptiest} 条。`;
     } else if (st.strata === 0) {
       note = '分层之后没有任何一层同时有两个臂的数据 —— 帖子太分散，比不了。';
     } else {
@@ -248,8 +292,9 @@ export function scoreAll(store: Store, opts: { days?: number; writeMemory?: bool
         note = replicated === false ? '前后两半各赢一次，赢家不一样 —— 这就是噪声，不是规则。' : confidence < CONFIDENCE_TO_ACT ? `置信 ${(confidence * 100).toFixed(0)}%，还没到 ${(CONFIDENCE_TO_ACT * 100).toFixed(0)}% 的线。` : null;
       }
     }
-    if (fellBack) note = `目标指标在所有帖子上都是 0，比不出高低，这一次按浏览量判。${note ?? ''}`;
-    const missing = enough ? 0 : Math.max(0, h.minSamples - (Number.isFinite(minN) ? minN : 0));
+    // A hypothesis with an empty side is not «a little short of data»: it needs the other side to
+    // exist at all, and `starved()` is only honest about it if the empty arm counts as missing.
+    const missing = enough ? 0 : Math.max(0, h.minSamples - emptiest);
 
     const verdict: Verdict = {
       id: h.id, claim: h.claim, metric, mode: h.mode, how: h.how, risk: h.risk,
@@ -299,17 +344,29 @@ export function revokeStaleRules(store: Store, verdicts: Verdict[], now = Date.n
       .all() as { key: string }[]).map(r => r.key),
   );
   const revoked: string[] = [];
-  // «Flat» lessons written when every arm read 0.00 came from a metric nobody had moved yet; they
-  // are not evidence of anything and must not tell the writer to stop trying.
+  // «Flat» lessons written off a count metric that had barely moved are not evidence of anything and
+  // must not tell the writer to stop trying. The share, not the boolean: one like on one post used to
+  // be enough to make such a lesson look legitimate.
+  //
+  // Weighted by rows, not by arms. The rule text carries one number per arm plus how many posts stood
+  // behind it, and the production case that mattered — «chart 34.48（1 条），text 0.00（13 条）» — reads
+  // 50% non-zero by arm and 7% by row. Counting arms would let a single post excuse thirteen.
   const zeroFlat = (store.db
     .prepare("SELECT key, text FROM brain_memory WHERE kind = 'rank-rule' AND status = 'active' AND text LIKE '%差别不大%'")
     .all() as { key: string; text: string }[])
-    .filter(r => {
-      const nums = [...r.text.matchAll(/(-?\d+(?:\.\d+)?)（\d+ 条）/g)].map(m => Number(m[1]));
-      return allZero(nums);
-    });
-  for (const { key } of zeroFlat) {
-    store.forgetMemory(key, `各臂都是 0，那不是「没差别」，是指标还没动过（${new Date(now).toISOString().slice(0, 10)}）`);
+    .map(r => ({
+      key: r.key,
+      arms: [...r.text.matchAll(/(-?\d+(?:\.\d+)?)（(\d+) 条）/g)]
+        .map(m => ({ v: Number(m[1]), n: Number(m[2]) }))
+        .filter(a => a.n > 0),
+    }))
+    .filter(r => r.arms.length > 0 && weightedNonzeroShare(r.arms) < METRIC_READINESS_FLOOR);
+  for (const { key, arms } of zeroFlat) {
+    const rows = arms.reduce((s, a) => s + a.n, 0);
+    const moved = arms.filter(a => a.v !== 0).reduce((s, a) => s + a.n, 0);
+    // The same sentence the verdict ladder writes, so the ledger and the panel describe an
+    // unstarted metric in one voice rather than two.
+    store.forgetMemory(key, `${NOT_STARTED(rows, moved)} 那条「没差别」不是测量结果（${new Date(now).toISOString().slice(0, 10)}）`);
     active.delete(key);
     revoked.push(key.replace(/^rank:/, ''));
   }
