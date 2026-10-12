@@ -1185,6 +1185,22 @@ let RANK_DAYS = 30;
 const ATTRIBUTION_WINDOW = 36;
 const setRankDays = n => { RANK_DAYS = n; render(); };
 
+/**
+ * 定稿 v1 §7.3-2：判定口径不再是面板上的可点控件。
+ * 这个页面曾经用三个按钮即时改全局 targetMetric —— 关卡 A 未过时切到互动口径，就会把
+ * 全零样本判成「测过了，差别不大」并写进长期记忆（43 帖、1 赞、0 评的那次）。控件留着，
+ * 任何一次手滑都会重演。所以这里只剩一句只读播报：改口径＝开新假设，走口径库。
+ */
+const TARGET_CN = { views: 'v24h 浏览', engagement: '每千次浏览互动质量', money: '每千次浏览返佣' };
+const targetReadout = t => {
+  const label = TARGET_CN[t] ?? '未知口径';
+  const pill = t === 'views'
+    ? '<span class="pill on">浏览量口径</span>'
+    : '<span class="pill bad">非浏览量口径</span>';
+  return `<div class="targetbar">${pill}<b>当前世代绑定口径：${esc(label)}</b>`
+    + '<span class="muted">只读 · 改口径＝开新假设（走口径库，只收紧不放宽）。面板已无切换入口。</span></div>';
+};
+
 async function saveConversion() {
   const body = {
     day: document.querySelector('#cv-day').value,
@@ -1195,15 +1211,7 @@ async function saveConversion() {
   if (!body.day) return toast('先选日期', true);
   try {
     const r = await api('/api/conversion', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body) });
-    toast(`已记录，归因到 ${r.attributed.posts} 条帖子${r.attributed.unattributed ? `（${r.attributed.unattributed} 没能分下去）` : ''}`);
-    await render();
-  } catch (e) { toast(e.message, true); }
-}
-
-async function setTarget(t) {
-  try {
-    await api('/api/conversion/target', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ target: t }) });
-    toast(t === 'money' ? '实验结论今后按「每千次浏览返佣」判定' : t === 'engagement' ? '实验结论今后按「每千次浏览的赞 + 评论×3 + 转发×4」判定' : '实验结论按浏览量判定');
+    toast(`已记入观察列（手输近似，不参与验收）：按浏览量摊到 ${r.attributed.posts} 条帖子${r.attributed.unattributed ? `（${r.attributed.unattributed} 条没能分下去）` : ''}`);
     await render();
   } catch (e) { toast(e.message, true); }
 }
@@ -1246,35 +1254,37 @@ async function rankView() {
   const per1k = cv.attributed.posts && d.curve.reduce((s, c) => s + (c.v8h ?? c.v3h ?? c.firstRead ?? 0), 0) > 0
     ? (money / d.curve.reduce((s, c) => s + (c.v8h ?? c.v3h ?? c.firstRead ?? 0), 0) * 1000) : null;
   const today = new Date(Date.now() + 8 * 3600000).toISOString().slice(0, 10);
-  const convCard = `<div class="card" style="margin-top:14px">
-    <div class="card-hd"><h3>今天从币安后台抄三个数</h3><span class="sub">广场不给点击和返佣接口，只能手填 —— 30 秒，填了系统才有资格谈"哪条内容挣钱"</span></div>
-    <div class="form-grid">
-      <div class="field"><span class="cap">日期</span><input type="date" id="cv-day" value="${today}"></div>
-      <div class="field"><span class="cap">链接点击</span><input type="number" id="cv-clicks" min="0" placeholder="0"></div>
-      <div class="field"><span class="cap">新增粉丝</span><input type="number" id="cv-followers" min="0" placeholder="0"></div>
-      <div class="field"><span class="cap">返佣（USDT）</span><input type="number" id="cv-rebate" min="0" step="0.01" placeholder="0"></div>
+  /**
+   * 定稿 v1 §7.3-1：手填彻底出局，conversion_daily 降为可选观察列。
+   * 原来这张卡直排在页面主路径上，标题写着「今天从币安后台抄三个数」，还当场回显
+   * 「归因到 N 条帖子」——把手输近似渲染得像账单。现在折叠、改名、每个归因数都带「手输近似」，
+   * 并且验收卡与标签台一律不引用它。
+   */
+  const convObs = `<details class="obs">
+    <summary>自愿记录 · 手输近似（观察列，不参与验收与判定）</summary>
+    <div class="obd">
+      <div class="form-grid">
+        <div class="field"><span class="cap">日期</span><input type="date" id="cv-day" value="${today}"></div>
+        <div class="field"><span class="cap">链接点击</span><input type="number" id="cv-clicks" min="0" placeholder="0"></div>
+        <div class="field"><span class="cap">新增粉丝</span><input type="number" id="cv-followers" min="0" placeholder="0"></div>
+        <div class="field"><span class="cap">返佣（USDT）</span><input type="number" id="cv-rebate" min="0" step="0.01" placeholder="0"></div>
+      </div>
+      <div class="row"><button class="btn" onclick="saveConversion()">记一笔</button>
+        <span class="muted">${entered ? `已录 ${entered} 天，累计返佣 ${money.toFixed(2)} USDT，每千次浏览 ${per1k == null ? '算不出（还没有可归因的帖）' : per1k.toFixed(2)} USDT —— 全部为手输近似` : '一天都还没录 —— 这一列空着不影响任何验收'}</span></div>
+      <div class="hint">这里的数全部来自人工抄录：把当天总额按各帖<b>当时已积累的浏览量</b>加权摊下去，回看窗口 ${ATTRIBUTION_WINDOW} 小时。这是近似，不是账单 —— 它假设「看得多就点得多」，而这恰恰是没验证过的东西。<b>R5 的验收不看这一列</b>：定稿写死「关注存量与帖级归因不可测；可自动读到的只有分发与回应。」判定口径由上面那一行只读播报，这里改不了。</div>
+      ${cv.days.length ? `<div class="tw" style="margin-top:10px"><table><thead><tr><th>日期</th><th class="num">点击</th><th class="num">新粉</th><th class="num">返佣</th><th>录入于</th></tr></thead><tbody>
+        ${cv.days.slice(0, 8).map(x => `<tr><td>${esc(x.day)}</td><td class="num">${x.clicks ?? '—'}</td><td class="num">${x.followers ?? '—'}</td><td class="num">${x.rebate_usd != null ? x.rebate_usd.toFixed(2) : '—'}</td><td class="muted">${ago(x.entered_at)}</td></tr>`).join('')}
+      </tbody></table></div>` : ''}
     </div>
-    <div class="row"><button class="btn primary" onclick="saveConversion()">记下</button>
-      <span class="seg">
-        <button class="${cv.target === 'views' ? 'on' : ''}" onclick="setTarget('views')">按浏览量优化</button>
-        <button class="${cv.target === 'engagement' ? 'on' : ''}" onclick="setTarget('engagement')">按互动质量优化</button>
-        <button class="${cv.target === 'money' ? 'on' : ''}" onclick="setTarget('money')">按返佣优化</button>
-      </span>
-      <span class="muted">${entered ? `已录 ${entered} 天，累计返佣 ${money.toFixed(2)} USDT，归因到 ${cv.attributed.posts} 条帖子` : '一天都还没录 —— 「按返佣优化」要等你录入至少一天'}</span></div>
-    <div class="hint">返佣是怎么分到每条帖子头上的：把当天总额按各帖<b>当时已积累的浏览量</b>加权摊下去，回看窗口 ${ATTRIBUTION_WINDOW} 小时。这是近似，不是账单 —— 它假设"看得多就点得多"，而这恰恰是待验证的东西。所以按返佣选出来的规则，要等它和按浏览量的结论对得上，才值得信。</div>
-    ${cv.days.length ? `<div class="tw" style="margin-top:10px"><table><thead><tr><th>日期</th><th class="num">点击</th><th class="num">新粉</th><th class="num">返佣</th><th>录入于</th></tr></thead><tbody>
-      ${cv.days.slice(0, 8).map(x => `<tr><td>${esc(x.day)}</td><td class="num">${x.clicks ?? '—'}</td><td class="num">${x.followers ?? '—'}</td><td class="num">${x.rebate_usd != null ? x.rebate_usd.toFixed(2) : '—'}</td><td class="muted">${ago(x.entered_at)}</td></tr>`).join('')}
-    </tbody></table></div>` : ''}
-  </div>`;
+  </details>`;
 
   const kpis = `<div class="grid gkpi">
     ${tile('已成立的规则', counts.rule, counts.rule ? '已写入长期记忆，正在影响写法' : '还没有任何一条判断攒够样本',
       d.verdicts.filter(v => v.status === 'rule').map(v => [v.id, v.arms.map(a => `${a.arm}:${a.median ?? '—'}`).join(' ')]) )}
     ${tile('正在观察', counts.observing, `另有 ${counts.leaning} 条已现倾向`, d.verdicts.filter(v => v.status === 'observing').map(v => [v.id, `还差 ${v.missing} 条`] ))}
     ${tile('已观察帖子', d.curve.length, '按 20 分钟 / 1 / 3 / 8 / 24 小时回看', null)}
-    ${tile('每千次浏览返佣', per1k == null ? '<span style="font-size:18px">还没录</span>' : `${per1k.toFixed(2)}<small> USDT</small>`,
-      per1k == null ? '录一次后台数字，系统才开始优化真正挣钱那一环' : `累计 ${money.toFixed(2)} USDT / ${entered} 天`,
-      [['累计返佣', `${money.toFixed(2)} USDT`], ['录入天数', `${entered} 天`], ['当前优化目标', d.target === 'money' ? '每千次浏览返佣' : d.target === 'engagement' ? '每千次浏览互动质量' : '浏览量'], ['归因方式', `${ATTRIBUTION_WINDOW} 小时窗口内按已积累浏览量加权`], ['提醒', '这是近似：它假设看得多就点得多，而这正是要验证的假设']])}
+    ${tile('判定口径', esc(TARGET_CN[d.target] ?? '未知'), '只读 · 改口径＝开新假设',
+      [['当前世代绑定口径', TARGET_CN[d.target] ?? String(d.target ?? '未知')], ['为什么锁着', '关卡 A 未过时按互动/返佣判定，会把全零样本判成「差别不大」并写进记忆'], ['谁能改', '口径库审批，不在面板上点'], ['手输返佣列', '已降为自愿记录观察列，不参与判定']])}
     ${tile('长期记忆', d.memory.length, '条当前生效的判断', d.memory.slice(0, 6).map(m => [m.kind, `${m.text.slice(0, 28)}… 置信 ${(m.confidence * 100).toFixed(0)}%`]))}
     ${tile('AI 大脑', d.brain ? '已接入' : '未启用', d.brain ? `${d.brain.provider} · ${d.brain.model}` : '没有大脑也照常运转：规则由测量直接得出',
       d.brain ? [['提供方', d.brain.provider], ['模型', d.brain.model], ['权限', '只改写与排序，不得新增数字或币种']] : [['状态', '未配置或已关闭'], ['影响', '自我迭代仍在工作，只是少一层归纳']] )}
@@ -1374,8 +1384,9 @@ async function rankView() {
     <div class="hint" style="margin-top:0">流程是固定的：先写下可被证伪的假设 → 机器人在发帖前按臂分配并记录 → 分档回看把浏览曲线变成分发事实 → 只有样本量和差距同时够格，才升为规则 → 规则写进长期记忆，之后每次写作前被读到。任何一条测出反果，旧结论会被新结论覆盖而不是删除，「我们曾经以为」也是要留下的。</div>
     ${acting}
     <div style="margin-top:12px">${kpis}</div>
+    ${targetReadout(d.target)}
   </div>
-  ${convCard}
+  ${convObs}
   ${selfCard}
   ${cards}
   <div class="card" style="margin-top:14px">

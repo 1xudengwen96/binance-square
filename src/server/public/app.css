@@ -298,6 +298,25 @@ td .sub { display: block; font-size: 11px; color: var(--text-3); }
 .seg button { border: 0; background: none; color: var(--text-3); padding: 6px 13px; border-radius: 7px; cursor: pointer; font: inherit; font-size: 12.5px; }
 .seg button.on { background: var(--surface); color: var(--text); font-weight: 650; box-shadow: var(--sh-1); }
 
+/* 判定口径：只读播报，不是控件（定稿 v1 §7.3-2）。刻意做成不可点的样子。 */
+.targetbar {
+  display: flex; align-items: center; gap: 9px; flex-wrap: wrap; margin-top: 12px; padding: 9px 13px;
+  border: 1px dashed var(--border-2); border-radius: var(--r-sm); background: var(--surface-2); font-size: 12.5px;
+}
+.targetbar b { font-weight: 650; }
+.targetbar .muted { font-size: 11.5px; }
+
+/* 手输观察列：折叠、次要、明确标注近似（定稿 v1 §7.3-1）。 */
+details.obs { margin-top: 14px; border: 1px solid var(--border); border-radius: var(--r); background: var(--surface); }
+details.obs > summary {
+  cursor: pointer; padding: 11px 15px; font-size: 12.5px; color: var(--text-3); list-style: none; user-select: none;
+}
+details.obs > summary::-webkit-details-marker { display: none; }
+details.obs > summary::before { content: '⌄ '; }
+details.obs[open] > summary::before { content: '⌃ '; }
+details.obs > summary:hover { color: var(--text-2); }
+details.obs .obd { padding: 2px 15px 15px; border-top: 1px solid var(--border); }
+
 .chips { display: flex; flex-wrap: wrap; gap: 6px; }
 .chip {
   display: inline-flex; align-items: center; gap: 7px; padding: 5.5px 11px; border: 1px solid var(--border);

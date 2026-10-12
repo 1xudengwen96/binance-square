@@ -208,7 +208,6 @@ function brainJobsCard(d) {
 
 function brainColumnCard(d) {
   const s = d.settings;
-  const target = ['views', 'engagement', 'money'];
   return `<div class="card" style="margin-bottom:14px">
     <div class="card-hd"><h3>栏目与实验</h3><span class="sub">开启后，账号只发固定栏目，不再发混合短帖。</span></div>
     <div class="kv" style="margin:6px 0">
@@ -217,11 +216,12 @@ function brainColumnCard(d) {
       <input type="number" min="1" max="6" id="bn-colper" style="width:70px" value="${bnum(bdv('columnPostsPerDay', s.columnPostsPerDay))}"> <span class="hint" style="margin:0">条（是上限，不是目标；市场没有够格的素材就不发）</span>
     </div>
     <div class="field"><span class="cap">实验判定指标</span>
-      <div class="seg">
-        <button class="${s.targetMode === 'auto' ? 'on' : ''}" onclick="brainTarget('auto')">自动（跟着关卡）</button>
-        ${target.map(t => `<button class="${s.targetMode === 'manual' && s.targetMetric === t ? 'on' : ''}" onclick="brainTarget('${t}')">${{ views: '浏览量', engagement: '互动质量', money: '返佣' }[t]}</button>`).join('')}
+      <div class="targetbar">
+        <span class="pill ${s.targetMode === 'auto' ? 'on' : 'warn'}">${s.targetMode === 'auto' ? '自动跟关卡' : '手动固定'}</span>
+        <b>${esc({ views: 'v24h 浏览', engagement: '每千次浏览互动质量', money: '每千次浏览返佣' }[s.targetMetric] || String(s.targetMetric ?? '未知'))}</b>
+        <span class="muted">只读 · 面板不再提供切换按钮</span>
       </div>
-      <div class="hint">自动：关卡 A 没过按浏览量，过了自动换成互动质量。手动选择会固定下来。返佣要先录入过后台数字。</div></div>
+      <div class="hint">改口径＝开新假设，走口径库审批（只收紧不放宽）；关卡 A 未过期间互动与返佣只作观察列，不参与判定。<b>这里改不了口径，是设计如此</b>：三个按钮即时改全局 targetMetric 的那条通路，正是把全零样本判成「差别不大」并写进长期记忆的复发通道。</div></div>
     <div class="hint">正在分配流量的实验：${d.settings.activeExperiments ? d.settings.activeExperiments.map(x => `<code>${esc(x)}</code>`).join(' ') : '全部已登记的'}。其余只做观察，不占样本。</div>
   </div>`;
 }
@@ -456,13 +456,6 @@ async function brainSaveNotes() {
   toast('已保存'); await render();
 }
 
-async function brainTarget(t) {
-  try {
-    await api('/api/conversion/target', bjson({ target: t }));
-    toast('已切换'); await render();
-  } catch (e) { toast(e.message, true); }
-}
-
 async function brainResetBreaker() {
   if (!confirm('确认恢复自动发布？\n\n建议先看一下上面的报告和哨兵诊断，确认原因处理过了。恢复后窗口重新起算。')) return;
   const r = await api('/api/brain/breaker/reset', bjson({}));
@@ -536,7 +529,6 @@ window.brainPreset = brainPreset;
 window.brainFetchModels = brainFetchModels;
 window.brainTest = brainTest;
 window.brainSaveNotes = brainSaveNotes;
-window.brainTarget = brainTarget;
 window.brainResetBreaker = brainResetBreaker;
 window.brainOpenReport = brainOpenReport;
 window.brainApprove = brainApprove;
