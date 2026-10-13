@@ -102,7 +102,7 @@ test('FI-5：columnCoinCooldownHours 缺键兜底 DEFAULT、非数值显式抛�
     const base: Settings = { ...DEFAULT_SETTINGS, autoPublish: true, columnPostsPerDay: 10, activeExperiments: [], activeStartHour: 0, activeEndHour: 24 };
     // 缺键 ⇒ 读到 DEFAULT_SETTINGS(24)，不抛（当前 DEFAULT 无此情形，模拟绕过合并的调用面）。
     const missing = { ...base } as Settings;
-    delete (missing as Record<string, unknown>).columnCoinCooldownHours;
+    delete (missing as unknown as Record<string, unknown>).columnCoinCooldownHours;
     await generateColumn(store, missing, a); // 不抛即通过（本轮可能因无素材 skip，但绝不因缺键崩）
     // 非数值 ⇒ 必抛，不静默。
     const bad = { ...base, columnCoinCooldownHours: Number.NaN } as Settings;
