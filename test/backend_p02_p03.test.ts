@@ -339,6 +339,7 @@ test('classifySkips: 四类计划内理由各归各码，归不上的返回 null
   assert.equal(classifySkips(['熔断：最近 20 条浏览中位数 90 < 150']), 'breaker_on');
   assert.equal(classifySkips(['forwhat 账号已停用']), 'human_pause');
   assert.equal(classifySkips(['zhang：标签人设为空：persona_json 缺失，渲染直接 fail（P0-7 闸门）']), null, '闸门拒稿不许被折成 no_material——那是把红牌伪装成安静');
+  assert.equal(classifySkips(['标签人设为空：渲染直接 fail（P0-7 闸门）', '42 条素材的保质期已过']), null, '同屏出现过期噪声时红牌仍是大声的那个');
   assert.equal(classifySkips(['某条没见过的新故障签名']), null);
 });
 

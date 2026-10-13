@@ -212,6 +212,9 @@ export function dayGapReason(store: Store, dayStart: number): { code: PlannedGap
  */
 export function classifySkips(notes: string[]): PlannedGapCode | null {
   const text = notes.join(' ');
+  // 闸门拒稿优先短路成「无码」：它必须走就地升警那一格，不许被同轮不相干的
+  // 「素材过期」类文本折成 no_material 而静默（红牌 + 安静同屏时，红牌是大声的那个）。
+  if (/P0-7 闸门/.test(text)) return null;
   if (/熔断|breaker/i.test(text)) return 'breaker_on';
   if (/停用|已暂停|账号已停用|一个启用账号/.test(text)) return 'human_pause';
   if (/额度.*(已满|用完)|待发布已有|目标，本轮不再生成|租约/.test(text)) return 'quota_spent';
