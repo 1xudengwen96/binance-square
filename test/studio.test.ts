@@ -272,6 +272,7 @@ test('every library article composes from its own material and carries no markup
       ls_ratio_is_accounts: material({ category: 'long_short', subType: 'account_ratio', symbol: 'XRP', facts: { scope: '1小时', longRatio: 2.41, longPct: 70.7, shortPct: 29.3, ratio: 2.41, funding: 0.00012, payer: '多头', quoteVolume24h: 400_000_000 } }),
       extreme_funding_not_annualized: material({ symbol: 'MINA', facts: { funding: -0.0025, intervalHours: 4, quoteVolume24h: 105_000_000, price: 0.4 } }),
       ma_is_lagging: material({ category: 'market_move', subType: 'ma_death', symbol: 'SUI', facts: { tf: '4 小时', price: 1.09, maFast: 1.168, maSlow: 1.171, fastLen: 20, slowLen: 55, gapPct: -6.29, chg24h: -2.54, dir: '下穿', cross: '死叉', quoteVolume24h: 397_000_000 } }),
+      divergence_reads: material({ category: 'market_move', subType: 'intraday_divergence', symbol: 'ENJ', facts: { price: 0.214, chg1h: -1.8, chg24h: 6.4 } }),
     };
     assert.equal(Object.keys(fixtures).length, ARTICLE_LIBRARY.length, 'every library piece needs a fixture to be tested against');
     for (const spec of ARTICLE_LIBRARY) {

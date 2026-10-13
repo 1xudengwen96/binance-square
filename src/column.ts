@@ -87,10 +87,13 @@ export async function generateColumn(
 
   // The ceiling is on posts that exist or are about to, not on what has already gone out: a draft
   // queued behind this tick is still a post the account will make today.
-  const queued = store.columnPostsSince(account.id, now - 24 * 3600_000);
+  // 定稿口径写死「每号 4 条/北京日历日」（v1.6 裁定四配套）。这里原本是滚动 24 小时——既不切 08:00
+  // 也不切 00:00，跨日的两条相邻帖会互相挡额度，而租约面（lane_leases/laneUsage）切的是北京 00:00。
+  // 两处语义现在对齐到同一个北京日历日；生效要等重启窗，中途换日界会当场重置当日额度，属发布行为变更。
+  const queued = store.columnPostsSince(account.id, beijingDayStart(now));
   if (!opts.dryRun && queued >= perDay) {
     store.log('column_funnel', { outcome: 'dropped', drop: 'queued_ceiling', queued, perDay });
-    report.skipped.push(`${COLUMN_NAME}：近 24 小时已有 ${queued} 条（上限 ${perDay}），不再生成`);
+    report.skipped.push(`${COLUMN_NAME}：今日（北京日历日）已有 ${queued} 条（上限 ${perDay}），不再生成`);
     return report;
   }
 

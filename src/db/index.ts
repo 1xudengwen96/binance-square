@@ -174,6 +174,26 @@ CREATE TABLE IF NOT EXISTS lane_leases (
 );
 CREATE INDEX IF NOT EXISTS idx_lane_day ON lane_leases(account_id, lane, day_start);
 
+/*
+ * 期号序列（定稿 v1.6 §1.4，UI 的识别带唯一硬依赖，裁定四列 P1 出口件）。
+ *
+ * 一期一号按 (label_id, column_id) 独立计数——识别带上的 NO.037 是「持续运行 R2」
+ * 在视觉层唯一能被读者直接看到的证据，也是「昨日对账」能回指的前提。规则写死在结构上：
+ *   · issue_no 在草稿**入队时**分配（不是发布成功时），单调、不复用、从 1 起（UI issueTag 拒 0/负/小数）；
+ *   · 发布失败/回滚 → state='void'：号不回收、不重发，读者看到的断点是「已让号」而不是缺号；
+ *   · 唯一约束就是主键 (label_id, column_id, issue_no)，重复分配在同事务里必然撞 PK。
+ * 表随 SCHEMA 每次 open 建（CREATE TABLE IF NOT EXISTS），存量库无需 ALTER 迁移。
+ */
+CREATE TABLE IF NOT EXISTS column_issues (
+  label_id   INTEGER NOT NULL,
+  column_id  TEXT NOT NULL,
+  issue_no   INTEGER NOT NULL,
+  state      TEXT NOT NULL DEFAULT 'issued',   -- issued | void
+  post_id    INTEGER,
+  created_at INTEGER NOT NULL,
+  PRIMARY KEY (label_id, column_id, issue_no)
+);
+
 -- Rolling attention history. This is what lets a post say "连续第 3 个小时放量"
 -- instead of only ever describing one instant.
 CREATE TABLE IF NOT EXISTS attention_samples (
