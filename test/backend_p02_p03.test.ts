@@ -13,6 +13,7 @@ import { reconcileGapDay } from '../src/daemon.ts';
 import { generate } from '../src/pipeline.ts';
 import { generateColumn } from '../src/column.ts';
 import { classifySkips, reportZeroPublish } from '../src/alerts/bus.ts';
+import { pickAvailable } from '../src/column.ts';
 import { makeMaterial } from '../src/material/types.ts';
 
 function tempStore(): { store: Store; close: () => void } {
@@ -365,4 +366,13 @@ test('reportZeroPublish: 没码的没发就地升预警；有码落账不升警�
   } finally {
     close();
   }
+});
+
+/* -------------------------------------------- 可发布形态白名单（A3-1） --- */
+
+test('白名单=3+1：pickAvailable 永不返回已停用的 ledger，空可用集落 null 由调用方拒稿', () => {
+  assert.equal(pickAvailable(['ledger'], 'ledger', 1), null, '只剩停用形态 = 没有可用形态，不许兜底发布');
+  assert.equal(pickAvailable([], 'ledger', 7), null);
+  assert.equal(pickAvailable(['ledger', 'question'], 'ledger', 3), 'question', '抽到停用臂必须回落到白名单内');
+  assert.equal(pickAvailable(['anomaly', 'recap'], 'recap', 2), 'recap');
 });

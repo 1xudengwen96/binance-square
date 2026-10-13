@@ -5,7 +5,8 @@ import { labelRenderable } from './labels.ts';
 import { ALERT_KINDS, raise as raiseAlert } from './alerts/bus.ts';
 import type { Material } from './material/types.ts';
 import type { Context, Fact, FieldValue } from './engine/types.ts';
-import { columnContext, columnTemplates, pickColumnMaterial, COLUMN_NAME } from './content/column.ts';
+import { COLUMN_NAME } from './content/column.ts';
+import { DEFAULT_SETTINGS } from './config.ts';
 import {
   activeVariants, pickVariant, seedVariants, shapeContext, shapeTemplates, shapesFor, type ColumnKind,
 } from './content/columns.ts';
@@ -56,7 +57,9 @@ export interface ColumnReport {
 /** The recap needs this many rulings before it is worth a post. */
 const RECAP_MIN_CALLS = 2;
 
-type Kind = ColumnKind | 'ledger';
+// 定稿 §2 停用「费率账独立帖（降为素材）」：可发布 kind 白名单就是 3+1 里的三个短帖形态。
+// ledger 模板与历史数据一律保留不动（不删行、不改历史帖），只是不再进可发布集合。
+type Kind = ColumnKind;
 
 export async function generateColumn(
   store: Store,
@@ -102,14 +105,28 @@ export async function generateColumn(
     return Boolean(claim && claim.account_id !== null && claim.account_id !== account.id && now - claim.claimed_at < settings.crossAccountCoinExclusionMinutes * 60_000);
   };
   // Rolling window in which the column may not name the same coin twice; the param loop may move it.
-  const coinCooldownMs = Math.max(1, settings.columnCoinCooldownHours) * 3600_000;
-  const usable = pool.filter(m => m.symbol && !claimedByOther(m.symbol) && store.coinPostsSince(account.id, m.symbol, now - coinCooldownMs) === 0);
+  // 显式兜底 + 不静默：settingsFrom 已合并 default（实测 stored 缺这个键时运行时读到 24，
+  // 从未 NaN——PM/测试的 NaN 指控经运行时探针证伪，见完成帖）；这里再写一层 ?? default 是为了
+  // 任何绕过 settingsFrom 的调用面也不许拿到 undefined。
+  const cooldownHours = settings.columnCoinCooldownHours ?? DEFAULT_SETTINGS.columnCoinCooldownHours;
+  if (!Number.isFinite(cooldownHours)) throw new Error(`columnCoinCooldownHours 读到了非数值：${String(cooldownHours)}`);
+  const coinCooldownMs = Math.max(1, cooldownHours) * 3600_000;
+  const funnel: { pool: number; noSymbol: number; claimed: number; cooldown: number; usable: number; counted: number; q: number; a: number; noneFit?: number } =
+    { pool: pool.length, noSymbol: 0, claimed: 0, cooldown: 0, usable: 0, counted: 0, q: 0, a: 0 };
+  const usable = pool.filter(m => {
+    if (!m.symbol) { funnel.noSymbol++; return false; }
+    if (claimedByOther(m.symbol)) { funnel.claimed++; return false; }
+    if (store.coinPostsSince(account.id, m.symbol, now - coinCooldownMs) > 0) { funnel.cooldown++; return false; }
+    funnel.usable++;
+    const sh = shapesFor(m);
+    if (sh.includes('question')) funnel.q++;
+    if (sh.includes('anomaly')) funnel.a++;
+    return sh.length > 0;
+  });
 
   // Candidate (material, kind) pairs. 费率账 keeps its original, stricter rule so it stays what it
   // was; the two new shapes ask different questions of the same row.
-  const ledger = pickColumnMaterial(usable);
   const pairs: { material: Material; kind: Kind }[] = [];
-  if (ledger) pairs.push({ material: ledger, kind: 'ledger' });
   for (const m of usable) for (const k of shapesFor(m)) pairs.push({ material: m, kind: k });
 
   // The recap is not about any coin: it exists when enough rulings have accumulated, and at most
@@ -128,6 +145,14 @@ export async function generateColumn(
   if (haveRecap) available.push('recap');
   const arms = planArms({ seed: hashString(`${account.id}:${Math.floor(now / 3_600_000)}:col`), verdicts, only: settings.activeExperiments });
   const kind = pickAvailable(available, arms.h_column ?? null, hashString(`${now}:${account.id}`));
+  funnel.counted = pairs.length;
+  if (kind === null) {
+    funnel.noneFit = 1;
+    store.log('column_funnel', { ...funnel, outcome: 'refused', why: '白名单内没有可用形态' });
+    report.skipped.push(`${COLUMN_NAME}：白名单（盘中一问/今日反常/昨日对账）内本轮无可用形态`);
+    return report;
+  }
+  store.log('column_funnel', { ...funnel, outcome: 'drawn', kind });
 
   const slot = nextSlotFor(store, settings, account, now, null, true);
   if (!slot.allowed) { report.skipped.push(slot.reason); return report; }
@@ -160,23 +185,15 @@ export async function generateColumn(
     if (!ofKind.length) { report.skipped.push('本轮没有适合这个栏目的币'); return report; }
     // Within a shape, the strongest candidate: the original ranking for the ledger, otherwise the
     // largest move, so the post is about the coin where the shape is most visible.
-    material = kind === 'ledger'
-      ? ofKind[0]!.material
-      : [...ofKind].sort((a, b) => Math.abs(Number(b.material.facts.chg24h ?? 0)) - Math.abs(Number(a.material.facts.chg24h ?? 0)))[0]!.material;
+    material = [...ofKind].sort((a, b) => Math.abs(Number(b.material.facts.chg24h ?? 0)) - Math.abs(Number(a.material.facts.chg24h ?? 0)))[0]!.material;
     if (!opts.dryRun && slot.at >= expiresAt(material.category, material.at)) {
       report.skipped.push(`${material.symbol}: 下一个时段已超过这条费率的保质期，不写注定作废的草稿`);
       return report;
     }
     const seed = hashString(personaSeed(material.id, account.id, slot.at));
     const base = toContext(material);
-    if (kind === 'ledger') {
-      const ctx = columnContext({ ...base, memoryLine: memoryLineFor(store, material.symbol!, seed, now) }, seed);
-      if (!ctx) { report.skipped.push(`${material.symbol}: 没有可读的组合`); return report; }
-      const tpl = columnTemplates[0]!;
-      const res = renderTemplate(tpl, ctx, { seed, bank: wordBank });
-      if (!res.ok) { report.skipped.push(`${material.symbol}: ${res.reason}`); return report; }
-      text = res.text; facts = res.facts; trace = { ...res.trace }; tplId = tpl.id;
-    } else {
+    {
+      // 旧 ledger 渲染分支已随停用形态摘除（模板与历史数据留在 content/column.ts，不删）。
       const ask = pickVariant(activeVariants(store, 'question', 'ask'), seed);
       const watch = pickVariant(activeVariants(store, 'anomaly', 'watch'), seed);
       const close = pickVariant(activeVariants(store, 'anomaly', 'close'), seed >>> 3);
@@ -290,8 +307,11 @@ export function headingOf(text: string): string | null {
 /**
  * Honour the drawn arm when that shape is available, otherwise fall back to one that is.
  */
-export function pickAvailable(available: string[], armed: string | null, seed: number): Kind {
-  if (!available.length) return 'ledger';
-  if (armed && available.includes(armed)) return armed as Kind;
-  return available[Math.abs(seed) % available.length] as Kind;
+export function pickAvailable(available: string[], armed: string | null, seed: number): Kind | null {
+  // 白名单外的 kind 不可能从这里出来；没有可用形态就返回 null，由调用方落拒稿事件——
+  // 旧代码在这里兜底 'ledger'，那正是 id=338 用已停用形态发出去的出口（口径库 A3-1）。
+  if (!available.includes('question') && !available.includes('anomaly') && !available.includes('recap')) return null;
+  const pool = available.filter(k => k === 'question' || k === 'anomaly' || k === 'recap');
+  if (armed && (pool as string[]).includes(armed)) return armed as Kind;
+  return pool[Math.abs(seed) % pool.length] as Kind;
 }
