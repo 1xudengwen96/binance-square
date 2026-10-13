@@ -23,6 +23,7 @@ import { runStudio } from './studio/runner.ts';
 import { getSecret } from './secrets.ts';
 import { backupDatabase } from './backup.ts';
 import { observeRollingSeam, ROLLING_SEAM_OBS_LIMIT } from './obs/rolling.ts';
+import { buildInfo, stampRunningBuild } from './build.ts';
 import { currentTarget, evaluateBreaker } from './rank/gates.ts';
 import { judgeCalls } from './calls.ts';
 import { runSentinel } from './brain/sentinel.ts';
@@ -65,14 +66,23 @@ export interface TickResult {
   paramsApplied: number;
   accountsRun: number;
   notes: string[];
+  /** boot 版本读数（PM seq=400-二）：本进程启动时的 commit，不是当前仓库 HEAD。 */
+  running_commit: string;
+  running_booted_at: number;
 }
 
 export async function tick(store: Store, opts: { live?: boolean; statsEveryTicks?: number; benchEveryTicks?: number; tickNo?: number } = {}): Promise<TickResult> {
   const settings = settingsFrom(store);
+  // 版本读数在 res 创建时就填：连「已暂停直接 return」的那一轮也要带得出线上跑的是哪一代码，
+  // 否则最先能反推版本的那一轮恰好是最需要它的那一轮。
+  const build = buildInfo();
   const res: TickResult = {
     at: Date.now(), collected: 0, poolCreated: 0, eventCreated: 0, published: 0, uncertain: 0, deferred: 0,
     failed: 0, statsUpdated: 0, benchmarked: 0, studioDrafted: 0, studioPublished: 0, tuned: 0, observed: 0, rules: 0, testing: 0, conversionAttributed: 0, expired: 0, reflected: 0, paramsApplied: 0, accountsRun: 0, notes: [],
+    running_commit: build.commit, running_booted_at: build.booted_at,
   };
+  // `runningBuild` 设置由面板状态页可读；同 commit + 同启动时刻不重复写。
+  stampRunningBuild(store);
 
   const pause = pauseState(store);
   if (pause.paused) {
@@ -249,14 +259,15 @@ export async function tick(store: Store, opts: { live?: boolean; statsEveryTicks
     }
   }
 
-  // 裁定八观察列 postsInRolling24h：每日一次（live 轮），读「过去 24h 实发」。日界对齐后
-  // 格子是日历日、主护栏是滚动 24h，接缝是假设待验的——读数 >4 才按护栏缺陷当场再收紧，
-  // 观察本身不碰任何额度。
+  // 裁定八观察列 postsInRolling24h：每日一次（live 轮），逐号读「过去 24h 实发 / 当日实发」。
+  // 日界对齐后格子是日历日、主护栏是滚动 24h，接缝是假设待验的——单号读数 >4 才按护栏缺陷
+  // 当场再收紧（触发线来自「每号 4 条/日」，所以必须按号算），观察本身不碰任何额度。
   if (opts.live) {
     try {
       const seam = observeRollingSeam(store, res.at);
-      if (seam) {
-        if (seam.over) res.notes.push(`观察列 postsInRolling24h=${seam.count}（>${ROLLING_SEAM_OBS_LIMIT}）：日界-滚动接缝按护栏缺陷处理，当日必须收紧`);
+      if (seam?.over_count) {
+        const bad = seam.rows.filter(r => r.over).map(r => `${r.label} rolling24h=${r.rolling24h}/当日=${r.calendar_day}`);
+        res.notes.push(`观察列 postsInRolling24h 过线：${bad.join('、')}（>${ROLLING_SEAM_OBS_LIMIT}）——日界-滚动接缝按护栏缺陷处理，当日必须收紧`);
       }
     } catch (err) {
       res.notes.push(`观察列 postsInRolling24h 失败：${String(err).slice(0, 100)}`);
