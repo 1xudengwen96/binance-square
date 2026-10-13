@@ -17,6 +17,7 @@ import { wordBank } from '../content/wordbank.ts';
 import { nextCheckDue, readPost, platformFlags } from '../stats/backfill.ts';
 import { ALERT_KINDS, raise as raiseAlert, clear as clearAlert } from '../alerts/bus.ts';
 import { laneCap, tryAcquireLaneLease } from '../lanes.ts';
+import { labelRenderable } from '../labels.ts';
 import { writingNotes } from '../brain/author.ts';
 /**
  * When may this account's next long post go out?
@@ -178,6 +179,15 @@ export async function runStudio(
     if (!account.enabled) {
       entry.skipped.push('账号已停用');
       continue;
+    }
+    // P0-7 渲染闸门也拦长文草稿；读数/回抓不受影响——拦的是出稿，不是观察。
+    {
+      const lg = labelRenderable(store);
+      if (!lg.ok) {
+        entry.skipped.push(lg.reason!);
+        raiseAlert(store, { kind: ALERT_KINDS.labelGateRefusal, severity: 'warning', key: 'long', extra: { reason: lg.reason } });
+        continue;
+      }
     }
 
     const recent = store.db

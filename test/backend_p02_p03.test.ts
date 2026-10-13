@@ -11,6 +11,8 @@ import { ALERT_KINDS, activeAlerts, dayGapReason, findActive, noteGapReason, rai
 import { platformFlags } from '../src/stats/backfill.ts';
 import { reconcileGapDay } from '../src/daemon.ts';
 import { generate } from '../src/pipeline.ts';
+import { generateColumn } from '../src/column.ts';
+import { classifySkips, reportZeroPublish } from '../src/alerts/bus.ts';
 import { makeMaterial } from '../src/material/types.ts';
 
 function tempStore(): { store: Store; close: () => void } {
@@ -234,6 +236,7 @@ test('flags: missing ≠ pass——键不在就是 NULL，绝不默认成 0/未�
 test('surge_blocked: 命中 24h symbolDailyCap 的 skip 路径同步上总线（v1.5 §7.9 同一闸门）', async () => {
   const { store, close } = tempStore();
   try {
+    store.setLabelPersona(1, { name: '测试人设', tone: '测试口径' }); // 闸门放行，才能测到 symbol 上限那一格
     const aid = store.createAccount({ label: 'cap号', enabled: true });
     const acct = store.accountById(aid)!;
     const at = Date.now();
@@ -268,6 +271,96 @@ test('surge_blocked: 命中 24h symbolDailyCap 的 skip 路径同步上总线（
     const a = findActive(store, ALERT_KINDS.surgeBlocked, `${aid}:CAPSYM`);
     assert.ok(a, '第 3 篇被 symbolDailyCap=2 拦下时必须能在灯里看见');
     assert.equal(a!.reasonCode, 'blocked_by_symbol_cap');
+  } finally {
+    close();
+  }
+});
+
+/* ------------------------------------------------- persona 渲染闸门（P0-7） --- */
+
+function fundingMat(store: Store, symbol: string, at: number) {
+  const m = makeMaterial({
+    category: 'funding', subType: 'funding_extreme', title: `${symbol} 资金费率极端`, symbol,
+    source: 'test', at, sentiment: 'bear', score: 80,
+    facts: {
+      cashtag: `$${symbol}`, funding: -0.0125, annualized: -70.2, payer: '空头', intervalHours: 8, price: 1.234,
+      longRatio: 0.83, shortRatio: 1.2, chg24h: -3.42, chg1h: -0.41, volMultiple: 2.1, oiChangePct: -8.8,
+    },
+  });
+  store.insertMaterial(m);
+  return m;
+}
+
+test('persona 空 → generate/column 直接 fail 并亮 label_gate_refusal；灌入后恢复出稿', async (t) => {
+  t.mock.timers.enable({ apis: ['Date'], now: Date.UTC(2026, 9, 12, 2, 0, 0) }); // QA-FLAKY-001 同款：钉死时钟，抽签是夹具不是彩票
+  const { store, close } = tempStore();
+  try {
+    const s = { ...DEFAULT_SETTINGS, autoPublish: true, dailyCap: 30, postsPerDay: 20, activeStartHour: 0, activeEndHour: 24 };
+    const acct = store.accountById(store.createAccount({ label: 'zhang2', enabled: true }))!;
+    fundingMat(store, 'GATET', Date.now() - 60_000);
+    const r = await generate(store, s, 3, { account: acct });
+    assert.equal(r.created.length, 0, 'persona_json=null 时必须一稿不出——首帖漏网就是这个闸门没接线的代价');
+    assert.match(r.skipped.join(' '), /渲染直接 fail（P0-7 闸门）/);
+    assert.ok(findActive(store, ALERT_KINDS.labelGateRefusal, 'short'), '拒稿必须在灯上可读');
+
+    const c = await generateColumn(store, s, acct);
+    assert.equal(c.created.length, 0);
+    assert.match(c.skipped.join(' '), /P0-7/);
+
+    store.setLabelPersona(1, { name: '反常观察', tone: '冷静的核账人：先给方向判断，再给数', allowed_verbs: ['观察', '核对'], forbidden_claims: ['第一人称持仓'] });
+    const r2 = await generate(store, s, 3, { account: acct });
+    assert.ok(r2.created.length > 0, `手册灌入即恢复产出：${r2.skipped.join(' | ')}`);
+    assert.equal(r2.created[0]!.text.length > 0, true);
+  } finally {
+    close();
+  }
+});
+
+test('闸门键名校验：name/tone 非空字符串之外不设卡（其余键由内容层校验）', async (t) => {
+  t.mock.timers.enable({ apis: ['Date'], now: Date.UTC(2026, 9, 12, 2, 0, 0) }); // QA-FLAKY-001 同款：钉死时钟，抽签是夹具不是彩票
+  const { store, close } = tempStore();
+  try {
+    store.setLabelPersona(1, { name: '反常观察', tone: '核账人' });
+    const s = { ...DEFAULT_SETTINGS, autoPublish: true, dailyCap: 30, postsPerDay: 20, activeStartHour: 0, activeEndHour: 24 };
+    const acct = store.accountById(store.createAccount({ label: 'zhang3', enabled: true }))!;
+    fundingMat(store, 'GATEY', Date.now() - 60_000);
+    const r = await generate(store, s, 3, { account: acct });
+    assert.ok(r.created.length > 0, `仅 name+tone 就应过闸：${r.skipped.join(' | ')}`);
+  } finally {
+    close();
+  }
+});
+
+/* -------------------------------------------------- 0 发轮的落码覆盖（缺陷①） --- */
+
+test('classifySkips: 四类计划内理由各归各码，归不上的返回 null', () => {
+  assert.equal(classifySkips(['STRK: 下一个可用时段已超出它的保质期（2 小时），不写注定作废的草稿']), 'no_material');
+  assert.equal(classifySkips(['zhang：今日 4 篇额度已用完']), 'quota_spent');
+  assert.equal(classifySkips(['熔断：最近 20 条浏览中位数 90 < 150']), 'breaker_on');
+  assert.equal(classifySkips(['forwhat 账号已停用']), 'human_pause');
+  assert.equal(classifySkips(['zhang：标签人设为空：persona_json 缺失，渲染直接 fail（P0-7 闸门）']), null, '闸门拒稿不许被折成 no_material——那是把红牌伪装成安静');
+  assert.equal(classifySkips(['某条没见过的新故障签名']), null);
+});
+
+test('reportZeroPublish: 没码的没发就地升预警；有码落账不升警；顺延轮沉默', () => {
+  const { store, close } = tempStore();
+  try {
+    const now = Date.UTC(2026, 9, 13, 1, 0, 0);
+    const out = reportZeroPublish(store, ['完全无法归因的一轮'], 0, now);
+    assert.equal(out, 'unmapped');
+    const w = findActive(store, ALERT_KINDS.stallWarning, 'matrix', now);
+    assert.ok(w && w.reasonCode === null, '没码=故障：不等 5h 就地亮，且带原始理由可读');
+    assert.ok((w!.extra!.notes as string[]).includes('完全无法归因的一轮'));
+
+    reportZeroPublish(store, ['zhang：素材全在保质期外，没有可写的概念'], 0, now + 60_000);
+    assert.equal(findActive(store, ALERT_KINDS.expectedGap, 'x'), null); // 落码不等于升 expected_gap（那是日终的事）
+    const rec = (store.getSetting<Record<string, { code: string }>>('gapReasons', {}))[String(Math.floor((now + 60_000 + 8 * 3600e3) / 86400e3) * 86400e3 - 8 * 3600e3)];
+    assert.equal(rec!.code, 'no_material');
+
+    const before = activeAlerts(store, now).length;
+    const out3 = reportZeroPublish(store, ['未到发布时刻，顺延到 16:00'], 3, now + 120_000);
+    assert.equal(out3, 'deferred');
+    assert.equal(activeAlerts(store, now + 120_000).length, before, '健康队列等分钟不落码不升警');
   } finally {
     close();
   }

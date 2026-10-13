@@ -859,6 +859,12 @@ export class Store {
       | undefined;
   }
 
+  /** 标签手册灌入走 API：留审计事件，和账号 enabled 同一条“人写的动作可追溯”规矩。 */
+  setLabelPersona(id: number, persona: unknown): boolean {
+    const hit = this.db.prepare('UPDATE labels SET persona_json = ? WHERE id = ?').run(JSON.stringify(persona), id);
+    return hit.changes > 0;
+  }
+
   /* ----------------------------------------------------------------- lanes */
 
   /** Drafts made today (any non-rejected status) on one lane of one account. */

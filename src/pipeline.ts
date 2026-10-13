@@ -34,6 +34,7 @@ import type { Settings } from './config.ts';
 import { matrixEligibleAccounts } from './studio/lock.ts';
 import { beijingDayStart } from './schedule.ts';
 import { ALERT_KINDS, raise as raiseAlert } from './alerts/bus.ts';
+import { labelRenderable } from './labels.ts';
 import { exploreRepeat, planArms, recordArms } from './rank/experiments.ts';
 import { playbook, type Playbook } from './rank/playbook.ts';
 import { followCta, stanceLine, tensionLine } from './content/voice.ts';
@@ -347,6 +348,7 @@ export async function generate(
     report.skipped.push('草稿必须挂账号：无账号的生成路径已废弃（P0-2），拒写注定没人能发的草稿');
     return report;
   }
+
   // Scored once per pass: every draft in a tick should see the same beliefs, and scoring is a
   // table scan, not something to repeat per post.
   const rankVerdicts: Verdict[] = scoreAll(store, { writeMemory: false });
@@ -364,6 +366,16 @@ export async function generate(
       return report;
     }
     want = Math.min(want, room);
+  }
+  // P0-7 渲染闸门：persona 核心字段为空 → 直接 fail，不出稿。上一轮的根病是无定位发帖；
+  // 灯上写明拒稿原因，运营的标签手册灌入即恢复。dryRun 预览不受闸门影响。
+  if (!opts.dryRun) {
+    const lg = labelRenderable(store);
+    if (!lg.ok) {
+      report.skipped.push(lg.reason!);
+      raiseAlert(store, { kind: ALERT_KINDS.labelGateRefusal, severity: 'warning', key: 'short', extra: { reason: lg.reason } });
+      return report;
+    }
   }
   const pool = selectBalanced(store.unusedMaterials(want * 4), want * 2, settings.categoryWeights).filter(
     m => !account || materialAllowedForAccount(m, account),

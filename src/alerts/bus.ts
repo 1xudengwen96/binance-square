@@ -179,6 +179,7 @@ export const ALERT_KINDS = {
   surgeBlocked: 'surge_blocked',
   loopStalled: 'loop_stalled',
   credentialMissing: 'credential_missing',
+  labelGateRefusal: 'label_gate_refusal',
 } as const;
 
 export const PLANNED_GAP_CODES = ['no_material', 'quota_spent', 'breaker_on', 'human_pause'] as const;
@@ -199,4 +200,43 @@ export function noteGapReason(store: Store, dayStart: number, code: PlannedGapCo
 
 export function dayGapReason(store: Store, dayStart: number): { code: PlannedGapCode; samples: number; at: number } | undefined {
   return store.getSetting<Record<string, { code: PlannedGapCode; samples: number; at: number }>>('gapReasons', {})[String(dayStart)];
+}
+
+/* ------------------------------------------------------- 0 发轮的落码覆盖 --- */
+
+/**
+ * 每轮 live+autoPublish 而 0 发布时，把当轮 skip 理由折成计划内因由码。
+ * 定稿 §2：计划内空档必须落码 + 窗内样本数；无因由码的「没发」本身即故障——
+ * 所以映射不上的那一条不是沉默，是立即的 publish_stall_warning（不等 5h 盲区，
+ * 5h 阶梯照旧负责「什么都不说也什么都不发」的持续升级）。
+ */
+export function classifySkips(notes: string[]): PlannedGapCode | null {
+  const text = notes.join(' ');
+  if (/熔断|breaker/i.test(text)) return 'breaker_on';
+  if (/停用|已暂停|账号已停用|一个启用账号/.test(text)) return 'human_pause';
+  if (/额度.*(已满|用完)|待发布已有|目标，本轮不再生成|租约/.test(text)) return 'quota_spent';
+  if (/保质期|没有可写|无对应素材|无成熟标的|素材.*(过期|安静)|栏目.*没有/.test(text)) return 'no_material';
+  // 渲染闸门拒稿不归任何计划内码：label_gate_refusal 自己就是可读的因；
+  // 把它折成 no_material 会伪装成「市场安静」，而 13:09 判据要的 publish_stall 也必须在
+  // 这种「没码的没发」时亮——留给 unmapped 分支就地升警。
+  return null;
+}
+
+/** 一轮 0 发的落账：顺延轮不算停发（队列在等合法分钟）；有码落码；没码就地升预警。 */
+export function reportZeroPublish(store: Store, notes: string[], deferred: number, now = Date.now()): 'deferred' | PlannedGapCode | 'unmapped' {
+  if (deferred > 0) return 'deferred'; // 号在合法间隔/窗内排队——这是健康队列，不是空档
+  const code = classifySkips(notes);
+  if (code) {
+    noteGapReason(store, beijingDayStartOf(now), code, 1);
+    return code;
+  }
+  raise(store, {
+    kind: ALERT_KINDS.stallWarning, severity: 'warning', key: 'matrix', reasonCode: null,
+    samplesInWindow: 0, now, extra: { immediate: true, notes: notes.slice(0, 3) },
+  });
+  return 'unmapped';
+}
+
+function beijingDayStartOf(ms: number): number {
+  return Math.floor((ms + 8 * 3_600_000) / 86_400_000) * 86_400_000 - 8 * 3_600_000;
 }

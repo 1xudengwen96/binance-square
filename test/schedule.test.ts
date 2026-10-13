@@ -116,6 +116,7 @@ test('a draft is not written when its slot lands after the material expires', as
   try {
     const s = { ...DEFAULT_SETTINGS, autoPublish: true, dailyCap: 30, postsPerDay: 20, activeStartHour: 0, activeEndHour: 24 };
     const acct = store.accountById(makeAcct(store))!; // 先有主人，approve 的排队分钟才算进同一条队列
+    store.setLabelPersona(1, { name: '测试人设', tone: '测试口径' }); // 过 P0-7 闸门：本测试测的是保质期背压
     const funding = (symbol: string, occurredAt: number) => store.insertMaterial(makeMaterial({
       category: 'funding', subType: 'funding_extreme', title: `${symbol} 资金费率极端`, symbol,
       source: 'test', at: occurredAt, sentiment: 'bear', score: 80,

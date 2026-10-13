@@ -18,7 +18,7 @@ import { matrixEligibleAccounts } from './studio/lock.ts';
 import type { Settings } from './config.ts';
 import { beijingDayStart } from './schedule.ts';
 import { laneCap } from './lanes.ts';
-import { ALERT_KINDS, noteGapReason, dayGapReason, raise as raiseAlert, clear as clearAlert, hasActiveUnacked } from './alerts/bus.ts';
+import { ALERT_KINDS, noteGapReason, dayGapReason, raise as raiseAlert, clear as clearAlert, hasActiveUnacked, reportZeroPublish } from './alerts/bus.ts';
 import { runStudio } from './studio/runner.ts';
 import { getSecret } from './secrets.ts';
 import { backupDatabase } from './backup.ts';
@@ -222,6 +222,12 @@ export async function tick(store: Store, opts: { live?: boolean; statsEveryTicks
   // 期望驱动的停摆阶梯（定稿 §2）：应发（有素材·有可用账号·配额未满）而未发，5h 预警、
   // 12h 故障、24h 违约。有计划内因由码的空档走 gapReason 记账，不进阶梯。
   if (opts.live && settings.autoPublish) {
+    // 定稿 §2：计划内空档必须落因由码——每轮 0 发先给这一轮的 skip 理由落码；
+    // 映射不上就是「没码的没发」，就地升 publish_stall_warning，不等 5h 盲区。
+    if (res.published === 0) {
+      const outcome = reportZeroPublish(store, res.notes, res.deferred, res.at);
+      if (outcome === 'unmapped') res.notes.push('本轮 0 发且无可归因由码——publish_stall_warning 就地亮起（不等 5h）');
+    }
     const lastOk = store.getSetting<number>('lastPublishOkAt', 0);
     if (res.published > 0) {
       store.setSetting('lastPublishOkAt', res.at);

@@ -31,6 +31,11 @@ const SYMBOLS = ['BWET', 'ORDI', 'MINA', 'MET', 'NEAR', 'OGN'];
 
 // P0-2「草稿必须挂账号」: generate refuses to draft for nobody. These tests are about arms
 // bookkeeping, not account binding, so every store gets one plain enabled account.
+
+function seedPersona(store: Store): void {
+  // 闸门校验的最小 persona（name/tone）——这些测试测的不是闸门，出稿路径需要先放行。
+  store.setLabelPersona(1, { name: '测试人设', tone: '测试口径' });
+}
 function oneAccount(store: Store) {
   const id = store.createAccount({ label: '实验号', enabled: true });
   return store.accountById(id)!;
@@ -41,6 +46,7 @@ test('a generated draft carries the arms it was written under', async () => {
   // every comparison downstream silently becomes folklore about posts nobody labelled.
   const dir = mkdtempSync(join(tmpdir(), 'sf-arms-'));
   const store = Store.open(join(dir, 't.db'));
+  seedPersona(store);
   try {
     // null = every registered experiment, the behaviour before the active set existed.
     const s = { ...ALWAYS_OPEN, autoPublish: true, dailyCap: 30, postsPerDay: 20, activeExperiments: null };
@@ -77,6 +83,7 @@ test('every recorded arm is one of the arms the hypothesis declares', async () =
   // label written down is a label the scorer knows.
   const dir = mkdtempSync(join(tmpdir(), 'sf-arms2-'));
   const store = Store.open(join(dir, 't.db'));
+  seedPersona(store);
   try {
     for (const [i, sym] of SYMBOLS.entries()) fundingMaterial(store, sym, Date.now() - i * 1000);
     const r = await generate(store, { ...ALWAYS_OPEN, autoPublish: true, activeExperiments: null }, 4, { account: oneAccount(store) });
@@ -114,6 +121,7 @@ test('the repeat-interval probe is deterministic and spends the share it declare
 test('only the active experiments draw arms, and a column-only hypothesis never reaches another lane', async () => {
   const dir = mkdtempSync(join(tmpdir(), 'sf-arms3-'));
   const store = Store.open(join(dir, 't.db'));
+  seedPersona(store);
   try {
     for (const [i, sym] of SYMBOLS.entries()) fundingMaterial(store, sym, Date.now() - i * 1000);
     const r = await generate(store, { ...ALWAYS_OPEN, autoPublish: true, dailyCap: 30, postsPerDay: 20, activeExperiments: ['h_chart', 'h_column'] }, 4, { account: oneAccount(store) });

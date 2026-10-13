@@ -207,6 +207,7 @@ test('every voice line lands above the disclaimer, which stays last', () => {
 test('the voice knobs are off by default, so an unearned belief changes nothing', () => {
   const dir = mkdtempSync(join(tmpdir(), 'sf-voice-'));
   const store = Store.open(join(dir, 't.db'));
+  seedPersona(store);
   try {
     const pb = playbook(store, { verdicts: [] });
     assert.equal(pb.hook, 'data');
@@ -271,6 +272,7 @@ test('one coin cannot be posted eight times a day under different headings', asy
   // is about the cap, not about template eligibility.
   const dir = mkdtempSync(join(tmpdir(), 'sf-cap-'));
   const store = Store.open(join(dir, 't.db'));
+  seedPersona(store);
   // P0-2 草稿必须挂账号：the cap lives per account now, and the planted posts belong to this one.
   const capAcct = store.accountById(store.createAccount({ label: '上限号', enabled: true }))!;
   try {
@@ -306,4 +308,8 @@ test('one coin cannot be posted eight times a day under different headings', asy
     store.close();
     rmSync(dir, { recursive: true, force: true });
   }
-});
+});function seedPersona(store: Store): void {
+  store.setLabelPersona(1, { name: '测试人设', tone: '测试口径' });
+}
+
+

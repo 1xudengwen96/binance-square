@@ -5,6 +5,7 @@ import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { Store } from '../db/index.ts';
 import { ALERT_KINDS, activeAlerts, ack as ackAlert, clear as clearAlert, dayGapReason, raise as raiseAlert, type AlertEnvelope } from '../alerts/bus.ts';
+import { labelRenderable } from '../labels.ts';
 import { collect, generate, generateFromPool, publishDue, pauseState, reroll } from '../pipeline.ts';
 import { pool, refreshPool } from '../hot/pool.ts';
 import { nextSlot, nextSlotFor, settingsFrom, saveSettings, beijingDayStart } from '../schedule.ts';
@@ -152,6 +153,26 @@ function loopScan(store: Store, s: Settings, now = Date.now()): void {
   // 这里只在三种故障都不成立时清掉整个 loop 条目。
   if (s.autoRun && !stale && !failing && lastTickAt > 0) clearAlert(store, ALERT_KINDS.loopStalled, 'loop');
 }
+
+/* 标签台（P0-2/P0-7）：persona 灌入必须走这里——和账号 enabled 同一条规矩，
+   * 人写的动作留审计事件，不绕 API 直改库。 */
+app.get('/api/labels', (_req, reply) => reply.send({ labels: store.listLabels() }));
+
+app.post('/api/labels/:id/persona', (req, reply) => {
+  const id = Number((req.params as { id: string }).id);
+  const persona = req.body as Record<string, unknown>;
+  if (!Number.isInteger(id) || !persona || typeof persona !== 'object' || Array.isArray(persona)) {
+    return reply.code(400).send({ error: '需要数字 id 与 persona 对象（标签手册正文走 JSON，不走字符串）' });
+  }
+  if (typeof persona.name !== 'string' || !persona.name.trim() || typeof persona.tone !== 'string' || !persona.tone.trim()) {
+    return reply.code(400).send({ error: '闸门校验的键名：name 与 tone 必须是非空字符串（其余键由内容层校验，闸门不拦）' });
+  }
+  if (!store.setLabelPersona(id, persona)) return reply.code(404).send({ error: '标签不存在' });
+  store.log('label_persona_update', { labelId: id, keys: Object.keys(persona) });
+  const lg = labelRenderable(store);
+  if (lg.ok) clearAlert(store, ALERT_KINDS.labelGateRefusal, 'short'), clearAlert(store, ALERT_KINDS.labelGateRefusal, 'long');
+  return reply.send({ ok: true, gateOpen: lg.ok, labels: store.listLabels() });
+});
 
 app.post('/api/alerts/ack', (req, reply) => {
   const body = req.body as { kind?: string; key?: string; by?: string };

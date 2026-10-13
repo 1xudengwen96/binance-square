@@ -1,6 +1,8 @@
 import type { AccountRow, Store } from './db/index.ts';
 import type { Settings } from './config.ts';
 import { beijingDayStart } from './schedule.ts';
+import { labelRenderable } from './labels.ts';
+import { ALERT_KINDS, raise as raiseAlert } from './alerts/bus.ts';
 import type { Material } from './material/types.ts';
 import type { Context, Fact, FieldValue } from './engine/types.ts';
 import { columnContext, columnTemplates, pickColumnMaterial, COLUMN_NAME } from './content/column.ts';
@@ -64,6 +66,15 @@ export async function generateColumn(
 ): Promise<ColumnReport> {
   const report: ColumnReport = { created: [], skipped: [] };
   const now = opts.now ?? Date.now();
+  // P0-7 渲染闸门（同 generate）：栏目是账号的定位本身，人设空着出的栏目帖仍是无定位发帖。
+  if (!opts.dryRun) {
+    const lg = labelRenderable(store);
+    if (!lg.ok) {
+      report.skipped.push(lg.reason!);
+      raiseAlert(store, { kind: ALERT_KINDS.labelGateRefusal, severity: 'warning', key: 'short', extra: { reason: lg.reason } });
+      return report;
+    }
+  }
   const eff = settingsForAccount(settings, account);
   const perDay = Math.max(1, settings.columnPostsPerDay);
   seedVariants(store, now);
