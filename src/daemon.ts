@@ -22,6 +22,7 @@ import { ALERT_KINDS, noteGapReason, dayGapReason, raise as raiseAlert, clear as
 import { runStudio } from './studio/runner.ts';
 import { getSecret } from './secrets.ts';
 import { backupDatabase } from './backup.ts';
+import { observeRollingSeam, ROLLING_SEAM_OBS_LIMIT } from './obs/rolling.ts';
 import { currentTarget, evaluateBreaker } from './rank/gates.ts';
 import { judgeCalls } from './calls.ts';
 import { runSentinel } from './brain/sentinel.ts';
@@ -245,6 +246,20 @@ export async function tick(store: Store, opts: { live?: boolean; statsEveryTicks
         const code = breakerNow.tripped || busBreaker ? 'breaker_on' : !hasMat ? 'no_material' : 'quota_spent';
         noteGapReason(store, beijingDayStart(res.at), code, res.deferred);
       }
+    }
+  }
+
+  // 裁定八观察列 postsInRolling24h：每日一次（live 轮），读「过去 24h 实发」。日界对齐后
+  // 格子是日历日、主护栏是滚动 24h，接缝是假设待验的——读数 >4 才按护栏缺陷当场再收紧，
+  // 观察本身不碰任何额度。
+  if (opts.live) {
+    try {
+      const seam = observeRollingSeam(store, res.at);
+      if (seam) {
+        if (seam.over) res.notes.push(`观察列 postsInRolling24h=${seam.count}（>${ROLLING_SEAM_OBS_LIMIT}）：日界-滚动接缝按护栏缺陷处理，当日必须收紧`);
+      }
+    } catch (err) {
+      res.notes.push(`观察列 postsInRolling24h 失败：${String(err).slice(0, 100)}`);
     }
   }
 
