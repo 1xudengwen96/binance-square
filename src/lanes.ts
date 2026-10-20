@@ -1,4 +1,4 @@
-import type { Store } from './db/index.ts';
+import type { AccountRow, Store } from './db/index.ts';
 import type { Settings } from './config.ts';
 import { beijingDayStart } from './schedule.ts';
 import { trackById } from './studio/tracks.ts';
@@ -75,6 +75,38 @@ export function tryAcquireLaneLease(
  */
 export function laneEligibleAccounts(store: Store, settings: Settings, now = Date.now()) {
   return store.activeAccounts(now).filter(a => laneRoom(store, settings, a.id, 'short', now) > 0);
+}
+
+/** Fill quiet-market slots fairly, including when an account cannot produce a draft. */
+export function allocateEventFallback(
+  store: Store, settings: Settings, accounts: AccountRow[], want: number, now = Date.now(),
+): Map<number, number> {
+  const shares = new Map<number, number>();
+  const day = beijingDayStart(now);
+  const candidates = accounts.map(account => {
+    const cap = laneCap(store, settings, account.id, 'short');
+    const used = store.laneUsage(account.id, 'short', day);
+    return {
+      id: account.id, cap, used, assigned: 0,
+      room: Math.min(cap - used, cap - store.pendingQueueCount(account.id)),
+    };
+  }).filter(account => account.cap > 0 && account.room > 0);
+  let cursor = store.getSetting<number>('eventFallbackCursor', 0);
+  const budget = Number.isFinite(want) ? Math.max(0, Math.floor(want)) : 0;
+  for (let i = 0; i < budget; i++) {
+    const target = candidates.filter(account => account.room > 0).sort((a, b) => {
+      const load = (a.used + a.assigned) / a.cap - (b.used + b.assigned) / b.cap;
+      // At equal load, continue after the last account attempted, even if it yielded nothing.
+      return load || Number(a.id <= cursor) - Number(b.id <= cursor) || a.id - b.id;
+    })[0];
+    if (!target) break;
+    target.assigned++;
+    target.room--;
+    shares.set(target.id, target.assigned);
+    cursor = target.id;
+  }
+  if (shares.size) store.setSetting('eventFallbackCursor', cursor);
+  return shares;
 }
 
 /**

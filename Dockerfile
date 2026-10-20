@@ -1,7 +1,17 @@
-# node:24-bookworm-slim, deliberately NOT alpine.
-# sharp and better-sqlite3 both ship glibc/linux-x64 prebuilds; on musl they fall back
-# to a source build that needs python3 + a compiler toolchain in the image.
-FROM node:24-bookworm-slim
+# Native SQLite binaries may be unavailable for a Node version / CPU architecture.
+# Keep the fallback compiler toolchain out of the runtime image.
+FROM node:24-bookworm-slim AS dependencies
+
+WORKDIR /app
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends python3 make g++ \
+ && rm -rf /var/lib/apt/lists/*
+
+# tsx is needed at runtime because the application runs TypeScript directly.
+COPY package.json package-lock.json ./
+RUN npm ci --include=dev
+
+FROM node:24-bookworm-slim AS runtime
 
 ENV NODE_ENV=production \
     HOST=0.0.0.0 \
@@ -11,12 +21,12 @@ ENV NODE_ENV=production \
 
 WORKDIR /app
 
-# Dependencies first so a source edit does not reinstall the world.
-# devDependencies stay on purpose: the sources import each other with explicit `.ts`
-# extensions (allowImportingTsExtensions), and TypeScript refuses to emit under that
-# flag — there is no compiled build to copy out, so tsx is a runtime requirement.
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends fontconfig fonts-noto-cjk fonts-dejavu-core \
+ && rm -rf /var/lib/apt/lists/*
+
 COPY package.json package-lock.json ./
-RUN npm ci --include=dev
+COPY --from=dependencies /app/node_modules ./node_modules
 
 COPY tsconfig.json ./
 COPY src ./src

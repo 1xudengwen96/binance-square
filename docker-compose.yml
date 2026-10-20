@@ -6,21 +6,20 @@ services:
     restart: unless-stopped
     init: true
 
-    # Bound to the host's loopback on purpose. The panel has no login — it only checks
-    # Host / Origin / a custom header — so exposing 0.0.0.0:8787 would let anything that
-    # can reach the port flip schedules, overwrite keys, or publish to your Square
-    # accounts. With this binding the reachability is the same as running it natively:
-    # open http://127.0.0.1:8787 on this machine only.
+    # Public deployment: the application also permits same-origin remote mutations.
     ports:
-      - "127.0.0.1:8787:8787"
+      - "0.0.0.0:8787:8787"
 
     volumes:
-      # Holds squareforge.db (with the posting keys) plus data/charts. Keep this
-      # directory off any shared/synced path.
-      - ./data:/app/data
+      # A fresh named volume inherits the image directory's non-root ownership.
+      # Holds the SQLite database, posting keys, backups and chart images.
+      - squareforge-data:/app/data
 
     environment:
       HOST: 0.0.0.0
+      ALLOW_REMOTE_ACCESS: "true"
+      PUBLIC_AUTH_USERNAME: ${PUBLIC_AUTH_USERNAME:-admin}
+      PUBLIC_AUTH_PASSWORD: ${PUBLIC_AUTH_PASSWORD:?Set PUBLIC_AUTH_PASSWORD in .env}
       PORT: "8787"
       DB_PATH: /app/data/squareforge.db
       TZ: Asia/Shanghai
@@ -34,3 +33,6 @@ services:
       timeout: 6s
       start_period: 30s
       retries: 3
+
+volumes:
+  squareforge-data:

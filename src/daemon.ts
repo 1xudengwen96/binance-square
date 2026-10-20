@@ -17,7 +17,7 @@ import { retire } from './lifecycle.ts';
 import { matrixEligibleAccounts } from './studio/lock.ts';
 import type { Settings } from './config.ts';
 import { beijingDayStart } from './schedule.ts';
-import { laneCap } from './lanes.ts';
+import { allocateEventFallback, laneCap } from './lanes.ts';
 import { ALERT_KINDS, noteGapReason, dayGapReason, raise as raiseAlert, clear as clearAlert, hasActiveUnacked, reportZeroPublish } from './alerts/bus.ts';
 import { runStudio } from './studio/runner.ts';
 import { getSecret } from './secrets.ts';
@@ -172,11 +172,7 @@ export async function tick(store: Store, opts: { live?: boolean; statsEveryTicks
       // 草稿从写下第一行起就有主人——没有 owners 就没有这个循环，env 兜底路径已废弃。
       const want = Math.max(0, Math.ceil(settings.postsPerDay / 4) - res.poolCreated);
       if (want > 0) {
-        const shares = new Map<number, number>();
-        for (let i = 0; i < want; i++) {
-          const key = accounts[i % accounts.length]!.id;
-          shares.set(key, (shares.get(key) ?? 0) + 1);
-        }
+        const shares = allocateEventFallback(store, settings, accounts, want, res.at);
         for (const [accountId, n] of shares) {
           const a = accounts.find(x => x.id === accountId);
           const g = await generate(store, settings, n, { account: a });

@@ -9,8 +9,23 @@ async function api(path, opts = {}) {
   if (o.method && o.method !== 'GET') o.headers = { 'x-squareforge': 'ui', ...(o.headers || {}) };
   const r = await fetch(path, o);
   const j = await r.json().catch(() => ({}));
+  if (r.status === 401 && j.loginRequired) {
+    location.replace('/login' + location.hash);
+    throw new Error('登录已过期，请重新登录');
+  }
   if (!r.ok) throw new Error(j.error || r.status);
   return j;
+}
+async function logout() {
+  const button = $('#logoutBtn');
+  button.disabled = true;
+  try {
+    await api('/api/auth/logout', { method: 'POST' });
+    location.replace('/login');
+  } catch (error) {
+    toast(error.message, true);
+    button.disabled = false;
+  }
 }
 function toast(msg, bad) {
   const t = $('#toast');
@@ -2978,6 +2993,9 @@ async function opsView() {
 }
 
 document.documentElement.dataset.theme = localStorage.getItem('sf-theme') || 'dark';
+api('/api/auth/session').then(session => {
+  $('#logoutBtn').hidden = !session.enabled;
+}).catch(() => {});
 {
   const fromHash = location.hash.replace('#', '');
   if (NAV_FLAT.some(([k]) => k === fromHash)) TAB = fromHash;

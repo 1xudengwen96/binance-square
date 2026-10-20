@@ -10,7 +10,7 @@ import { laneCap, laneRoom, tryAcquireLaneLease, poolEmptyReason } from '../src/
 import { ALERT_KINDS, activeAlerts, dayGapReason, findActive, noteGapReason, raise, clear, ack } from '../src/alerts/bus.ts';
 import { platformFlags } from '../src/stats/backfill.ts';
 import { reconcileGapDay } from '../src/daemon.ts';
-import { generate } from '../src/pipeline.ts';
+import { generate, publishDue } from '../src/pipeline.ts';
 import { generateColumn } from '../src/column.ts';
 import { classifySkips, reportZeroPublish } from '../src/alerts/bus.ts';
 import { pickAvailable } from '../src/column.ts';
@@ -366,6 +366,25 @@ test('reportZeroPublish: 没码的没发就地升预警；有码落账不升警�
   } finally {
     close();
   }
+});
+
+test('future approved posts count as waiting, without publishing early or raising a stall', async () => {
+  const { store, close } = tempStore();
+  try {
+    const aid = store.createAccount({ label: 'waiting', enabled: true });
+    const pid = store.addPost({ accountId: aid, materialId: null, templateId: null, text: '排期中的稿件', status: 'approved', scheduledAt: Date.now() + 3600_000 });
+    const other = store.createAccount({ label: 'empty', enabled: true });
+    const report = await publishDue(store, DEFAULT_SETTINGS, { live: true, apiKey: 'test-key', account: store.accountById(aid)! });
+    const deferred = report.failed.filter(f => /未到发布时刻/.test(f.label)).length;
+    assert.equal(deferred, 1);
+    assert.equal(report.attempted, 0);
+    assert.deepEqual(report.published, []);
+    assert.equal(store.postById(pid)!.status, 'approved');
+    assert.equal(reportZeroPublish(store, [], deferred), 'deferred');
+    assert.equal(findActive(store, ALERT_KINDS.stallWarning, 'matrix'), null);
+    const empty = await publishDue(store, DEFAULT_SETTINGS, { live: true, apiKey: 'test-key', account: store.accountById(other)! });
+    assert.deepEqual(empty.failed, [], 'another account’s queue must not conceal an empty account');
+  } finally { close(); }
 });
 
 /* -------------------------------------------- 可发布形态白名单（A3-1） --- */

@@ -4,6 +4,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>squareforge · 广场内容工厂</title>
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
 <link rel="stylesheet" href="/app.css?v=1019f">
 </head>
 <body>
@@ -29,6 +30,7 @@
       <span class="top-spacer"></span>
       <div class="kv" id="topStatus"></div>
       <div class="top-actions">
+        <button class="btn ghost" id="logoutBtn" onclick="logout()" hidden>退出登录</button>
         <button class="btn" onclick="act('collect')">抓取素材</button>
         <button class="btn" onclick="act('generate')">生成草稿</button>
         <button class="btn primary" id="pubBtn" onclick="publish()">发布</button>

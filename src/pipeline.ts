@@ -648,13 +648,19 @@ export async function publishDue(
   }
 
   const client = new SquareClient({ apiKey, dryRun: !opts.live, proxyUrl: acct?.proxy_url ?? '' });
-  const due = (acct ? store.approvedForAccount(acct.id, 20) : store.postsByStatus('approved', 20))
-    .filter(p => (p.scheduled_at ?? 0) <= Date.now())
+  const queued = acct ? store.approvedForAccount(acct.id, 20) : store.postsByStatus('approved', 20);
+  const due = queued.filter(p => (p.scheduled_at ?? 0) <= Date.now())
     // Oldest first. The account path already returns rows in schedule order, but the
     // no-account path comes back newest-first, and a defer-then-break loop over that looks
     // at the newest post, finds four siblings already claiming its minute, defers it — and
     // never reaches the one that was genuinely due.
     .sort((a, b) => (a.scheduled_at ?? a.created_at) - (b.scheduled_at ?? b.created_at) || a.id - b.id);
+  // Future approved drafts are a healthy waiting queue. Surface that wait to the daemon
+  // even when no draft entered the due loop, so it does not report an unexplained stall.
+  if (!due.length && queued.length) {
+    const at = Math.min(...queued.map(p => p.scheduled_at!));
+    report.failed.push({ id: 0, label: `未到发布时刻，顺延到 ${new Date(at + 8 * 3600_000).toISOString().slice(5, 16).replace('T', ' ')} 北京（已排期）` });
+  }
   // Posts queued in the same run must not duplicate each other either.
   const justSent: string[] = [];
   const freshenFor = opts.live || opts.quote ? { quote: opts.quote } : null;

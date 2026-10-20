@@ -1,0 +1,96 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="dark">
+  <meta name="theme-color" content="#101110">
+  <title>登录 · squareforge</title>
+  <link rel="icon" href="/favicon.svg" type="image/svg+xml">
+  <link rel="stylesheet" href="/login.css?v=1020">
+  <script src="/login.js?v=1020" defer></script>
+</head>
+<body>
+  <div class="page">
+    <header class="page-header">
+      <a class="brand" href="/login" aria-label="squareforge 登录页">
+        <img src="/favicon.svg" alt="" width="38" height="38">
+        <span>squareforge<span class="brand-divider"></span><small>广场内容工作台</small></span>
+      </a>
+      <span class="private-label"><span></span> 专属工作空间</span>
+    </header>
+
+    <main class="login-shell">
+      <section class="intro" aria-labelledby="intro-title">
+        <div class="intro-top"><span class="eyebrow"><i></i> BUILT FOR CREATORS</span><span class="edition">SQUAREFORGE / 01</span></div>
+        <div class="intro-copy">
+          <p class="intro-kicker">捕捉信号，创造价值。</p>
+          <h1 id="intro-title">让每一次发声，<br>都更有<span class="gold-word">分量<svg viewBox="0 0 180 15" aria-hidden="true"><path d="M3 11Q83-3 176 7"/></svg></span>。</h1>
+          <p class="intro-description">把市场洞察变成优质内容。<br>让创作、管理与发布，在这里有序发生。</p>
+        </div>
+
+        <div class="engine-visual" aria-hidden="true">
+          <div class="visual-header"><span><i></i> CONTENT ENGINE</span><span class="visual-spark">✦</span></div>
+          <div class="signal-chart">
+            <div class="chart-grid"></div>
+            <svg viewBox="0 0 540 145" preserveAspectRatio="none">
+              <defs><linearGradient id="chart-fill" x1="0" y1="0" x2="0" y2="1"><stop stop-color="#eac45e" stop-opacity=".17"/><stop offset="1" stop-color="#eac45e" stop-opacity="0"/></linearGradient></defs>
+              <path class="chart-area" d="M0 125L35 114L62 121L94 92L123 100L151 84L174 93L207 60L236 72L267 49L292 62L321 39L349 51L380 23L411 36L443 16L472 25L505 6L540 15V145H0Z"/>
+              <path class="chart-line" d="M0 125L35 114L62 121L94 92L123 100L151 84L174 93L207 60L236 72L267 49L292 62L321 39L349 51L380 23L411 36L443 16L472 25L505 6L540 15"/>
+            </svg>
+            <div class="signal-tag"><span>✦</span> 灵感，从信号中浮现</div>
+          </div>
+          <div class="workflow">
+            <div><span class="step-icon"><svg viewBox="0 0 24 24"><path d="M4 18V9m5 9V5m5 13v-6m5 6V3"/></svg></span><span>素材洞察<small>DISCOVER</small></span></div>
+            <span class="step-arrow">↗</span>
+            <div><span class="step-icon"><svg viewBox="0 0 24 24"><path d="m12 3 2.5 6.5L21 12l-6.5 2.5L12 21l-2.5-6.5L3 12l6.5-2.5Z"/></svg></span><span>AI 创作<small>CREATE</small></span></div>
+            <span class="step-arrow">↗</span>
+            <div><span class="step-icon"><svg viewBox="0 0 24 24"><path d="m4 11 16-7-7 16-2-7Zm7 2 9-9"/></svg></span><span>内容发布<small>PUBLISH</small></span></div>
+          </div>
+        </div>
+        <div class="intro-bottom"><span class="bottom-line"></span><span>专注好内容，剩下的交给工作流。</span><span class="four-squares">▪▪<br>▪▪</span></div>
+      </section>
+
+      <section class="form-panel" aria-labelledby="login-title">
+        <div class="form-content">
+          <div class="welcome-icon" aria-hidden="true"><svg viewBox="0 0 24 24"><rect x="5" y="10" width="14" height="11" rx="3"/><path d="M8 10V7a4 4 0 0 1 8 0v3m-4 5v2"/></svg></div>
+          <p class="eyebrow form-eyebrow">YOUR CREATIVE SPACE</p>
+          <h2 id="login-title">欢迎回来<span>。</span></h2>
+          <p class="form-description">登录工作台，继续你的创作。</p>
+
+          <form id="login-form" method="post" action="/api/auth/login">
+            <div class="field">
+              <label for="username">账号</label>
+              <div class="input-wrap">
+                <svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="8" r="3.5"/><path d="M5 20v-2a5 5 0 0 1 5-5h4a5 5 0 0 1 5 5v2"/></svg>
+                <input id="username" name="username" autocomplete="username" autocapitalize="none" spellcheck="false" placeholder="请输入登录账号" maxlength="256" required>
+              </div>
+            </div>
+            <div class="field">
+              <label for="password">密码</label>
+              <div class="input-wrap">
+                <svg viewBox="0 0 24 24" aria-hidden="true"><rect x="5" y="10" width="14" height="10" rx="2"/><path d="M8 10V7a4 4 0 0 1 8 0v3m-4 5v1"/></svg>
+                <input id="password" name="password" type="password" autocomplete="current-password" placeholder="请输入登录密码" maxlength="1024" required>
+                <button class="password-toggle" id="password-toggle" type="button" aria-label="显示密码" aria-pressed="false"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M2 12s3.5-7 10-7 10 7 10 7-3.5 7-10 7S2 12 2 12Z"/><circle cx="12" cy="12" r="3"/><path class="eye-slash" d="m3 3 18 18"/></svg></button>
+              </div>
+              <p class="caps-warning" id="caps-warning" hidden>大写锁定已开启</p>
+            </div>
+            <div class="form-options">
+              <label class="remember"><input id="remember" name="remember" type="checkbox"><span>保持登录 7 天</span></label>
+              <button class="help-toggle" id="help-toggle" type="button" aria-expanded="false" aria-controls="login-help">忘记密码？</button>
+            </div>
+            <p class="help-message" id="login-help" hidden>请联系面板管理员重置登录密码。</p>
+            <div class="error-message" id="login-error" role="alert" aria-live="polite"></div>
+            <button class="submit-button" id="submit-button" type="submit"><span id="submit-label">登录工作台</span><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 12h15m-6-6 6 6-6 6"/></svg><span class="spinner" aria-hidden="true"></span></button>
+            <noscript><p class="help-message">请启用 JavaScript 后登录工作台。</p></noscript>
+          </form>
+          <div class="form-footer"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="m12 3 8 3v6c0 5-8 9-8 9s-8-4-8-9V6Z"/><path d="m8 12 3 3 5-6"/></svg><span>私人工作台 · 仅限授权访问</span></div>
+        </div>
+        <span class="panel-corner" aria-hidden="true">✳</span>
+      </section>
+    </main>
+
+    <footer class="page-footer"><span>© <span id="year">2026</span> squareforge</span><span>灵感有迹可循，创作自有节奏。</span><span>CRAFTED FOR YOUR NEXT IDEA <i>↗</i></span></footer>
+  </div>
+</body>
+</html>

@@ -2,7 +2,7 @@
 
 本地单用户的币安广场（Binance Square）内容工厂：**采集市场与广场热度 → 用模版生成带事实校验的帖子 → 配合约 K 线图 → 人工审核或按节奏自动发布 → 回抓效果调模版权重**。
 
-只跑在你自己的机器上，监听 `127.0.0.1`，没有多用户、没有配额系统。
+单用户面板，没有多用户、没有配额系统。直接运行默认监听 `127.0.0.1`，Docker Compose 默认开放公网端口 `8787`。
 
 > 这套系统在优化什么、怎么运作、接下来做什么 —— 见 **[体系与路线图](docs/体系与路线图.md)**。
 > AI 大脑现在接在哪、该接在哪 —— 见 **[AI 大脑的定位](docs/AI大脑的定位.md)**。
@@ -34,26 +34,37 @@ npx tsx src/cli.ts daemon 15 --live   # 配合设置里的「自动发布」才�
 ## Docker 部署
 
 ```bash
+# 先在 .env 中设置 PUBLIC_AUTH_USERNAME=admin 和 PUBLIC_AUTH_PASSWORD=你的强密码
 docker compose up -d --build      # 构建并后台启动
 docker compose logs -f            # 看调度日志
-docker compose down               # 停止（数据留在 ./data）
+docker compose ps                 # 查看容器与健康状态
+docker compose down               # 停止（数据保留在 Docker 数据卷）
 ```
 
-然后打开 http://127.0.0.1:8787。
+然后打开 `http://服务器公网IP:8787`（本机也可访问 http://127.0.0.1:8787）。服务器的云安全组和防火墙需允许 TCP 8787 入站。
+
+Compose 设置 `ALLOW_REMOTE_ACCESS=true`，允许公网 IP / 域名下的页面保存设置和执行操作；首次访问会进入独立登录页，输入 `.env` 中的 `PUBLIC_AUTH_USERNAME` 和 `PUBLIC_AUTH_PASSWORD`。登录成功后使用 HttpOnly 会话 Cookie，默认有效 12 小时，勾选「保持登录 7 天」后可持续 7 天；支持从面板退出登录。登录页资源与健康接口公开，其余页面和 API 均要求验证，写请求还须同源并携带 `X-Squareforge: ui`。连续登录失败 8 次后，该 IP 暂停尝试 15 分钟。直接运行时，只要配置了密码也会启用登录。修改 `.env` 后重新执行 `docker compose up -d --build`；服务重启会使已有会话失效。需要恢复本机访问时，将端口映射改为 `127.0.0.1:8787:8787`，并将 `ALLOW_REMOTE_ACCESS` 改为 `"false"`。
+
+数据库、账号密钥、自动备份和图表保存在 `squareforge-data` 命名卷中（默认完整名称为 `binance-square_squareforge-data`）。`docker compose down` 不会删除数据；**不要执行 `docker compose down -v`，它会删除数据卷**。已有本地 `./data` 不会自动导入。
+
+需要导出时先 `docker compose stop`，执行 `docker compose cp squareforge:/app/data ./data-backup`，再 `docker compose start`；导出的目录同样包含密钥，请妥善保存。
 
 **几个刻意的决定：**
 
 | 决定 | 原因 |
 |---|---|
-| 基础镜像用 `bookworm-slim`，不用 Alpine | `sharp` 和 `better-sqlite3` 提供 glibc 预编译包；musl 上会退化成源码编译，得往镜像里塞 python3 + 编译器 |
-| 端口只映射到 `127.0.0.1:8787` | 面板**没有登录**，只校验 Host / Origin / 自定义头。映射成 `0.0.0.0` 等于让任何能连到这个端口的主机改你的排期、覆盖你的 Key、往你账号发帖。这样绑之后可达范围和本地直接跑是一样的 |
-| 容器内 `HOST=0.0.0.0` | 容器里的 loopback 宿主进不去，必须监听所有网卡；对外隔离靠上面那条端口映射 |
+| 基础镜像用 `bookworm-slim`，分阶段构建 | 构建阶段安装 Python 和 C++ 工具链，在没有原生预编译包时编译 SQLite；运行镜像不包含工具链 |
+| 端口映射到 `0.0.0.0:8787` | 可通过服务器公网 IP 直接访问，云安全组需允许 TCP 8787 入站 |
+| `HOST=0.0.0.0`、`ALLOW_REMOTE_ACCESS=true` | 容器监听所有网卡，并允许公网页面的同源写请求 |
 | `devDependencies` 留在镜像里 | 源码之间用显式 `.ts` 后缀互相 import，而 `allowImportingTsExtensions` 要求 `noEmit` —— 没有编译产物可拷，`tsx` 是运行时依赖 |
-| `./data` 挂出来 | SQLite 里存着广场发帖 Key 和 K 线 PNG。**别把这个目录放在网盘/同步盘上** |
+| 命名卷挂载到 `/app/data` | 持久保存 SQLite、密钥、备份和 K 线 PNG，首次创建时继承容器内目录权限，非 root 用户可直接写入 |
 | `.dockerignore` 排除 `data/`、`.env` | 否则凭据会被烧进镜像层，任何能 pull 镜像的人都拿得走 |
 | 非 root 用户运行 | 镜像里 `USER squareforge` |
+| 运行镜像包含 Fontconfig、Noto CJK 和 DejaVu 字体 | 服务端生成的 K 线图和封面可以正确显示中文与数字 |
 
-**验证状态（要说清楚）**：本机没有 Docker，所以**镜像没有被构建和运行过**。已经验证的是：`node --import tsx src/server/app.ts` 这个入口命令可用、`/healthz` 真实返回 200、healthcheck 那条 node 单行命令实测退出码 0、compose YAML 能被 js-yaml 正常解析、Dockerfile 里 `COPY` 的四个路径都存在、空卷下 `data/charts` 会被自动创建。**没有验证的是**：`npm ci` 在 linux/amd64 上能否顺利装上 sharp 与 better-sqlite3 的预编译包。第一次 `docker compose build` 请盯着看，如果报的是这两个包，就需要在镜像里补构建工具链。
+部署后通过 `docker compose ps` 确认状态为 `healthy`，并访问 `http://127.0.0.1:8787/healthz`，预期返回包含 `"ok":true` 的 JSON。首次构建可能需要编译 `better-sqlite3`，耗时会比后续构建长。
+
+已在 Linux ARM64 / Node 24 环境完成实际构建和启动验证：首页与静态资源、健康检查、SQLite 查询、sharp PNG 生成，以及非 root 用户的数据卷写权限均通过。
 
 ---
 
@@ -109,7 +120,7 @@ docker compose down               # 停止（数据留在 ./data）
 
 - **广场 Key 只需要发帖权限。** 绝不要把交易所 API Key / Secret 填进来——那种能碰钱。写接口鉴权只有一个 header（`X-Square-OpenAPI-Key`），没有签名步骤，与"只能发帖"的说法一致。
 - **Key 存在本机 SQLite**（`data/`，已 gitignore），接口永不回传明文，面板只显示 `sk-••••abcd`。
-- **面板有跨站防护**：写操作要求 Host 是本机回环、Origin 不是外站、且必须带自定义头 `X-Squareforge: ui`。缺任意一条返回 403。这是为了防止你开着面板浏览网页时，别的页面向本地端口发请求改设置或触发发布。
+- **面板有跨站防护**：写操作必须带自定义头 `X-Squareforge: ui`。默认仅允许本机 Host / Origin；启用 `ALLOW_REMOTE_ACCESS=true` 后允许远程 Host，但浏览器 Origin 必须和请求地址同源。不符合要求的请求返回 403。配置访问密码后，面板与 API 还要求登录会话（显式 HTTP Basic 请求头仍可用于脚本调用）。
 - **默认人工审核**。`autoPublish` 关着，`publish` 不加 `--live` 只演练。
 - **`content/add` 返回 504/502/503 时绝不自动重试**。这个响应意味着"帖子很可能已经发出去了，只是没拿到 ID"，重试就是重复发帖。这类帖子被标成 `uncertain`，需要你去广场人工确认。
 - **账号被限制或 Key 失效时自动暂停**并记录原因，`resume` 才会继续。

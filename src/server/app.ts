@@ -38,18 +38,14 @@ import { nextArticleSlot, polishArticleDraft, runStudio } from '../studio/runner
 import { SquareClient } from '../publisher/square.ts';
 import { accountSecretView, getAccountSecret, getSecret, secretViews, setAccountSecret, setSecret, SECRET_NAMES, type SecretName } from '../secrets.ts';
 import { DEFAULT_BASE, listModels, testChat, type LlmConfig, type ProviderKind } from '../llm/providers.ts';
+import { LOOPBACK, registerAccessGuard } from './access.ts';
 
 const here = dirname(fileURLToPath(import.meta.url));
 const DB_PATH = process.env.DB_PATH ?? './data/squareforge.db';
 const PORT = Number(process.env.PORT ?? 8787);
-/**
- * Loopback by default: this panel holds posting credentials and can push content to a
- * live account. In a container the loopback address is unreachable from outside, so the
- * image sets HOST=0.0.0.0 — and docker-compose then publishes to 127.0.0.1:<port> only,
- * which keeps the exposure identical to running it on the host. Widening that mapping is
- * a deliberate decision, so it announces itself in the log.
- */
+/** Native runs default to loopback; Docker enables public access explicitly. */
 const HOST = process.env.HOST ?? '127.0.0.1';
+const ALLOW_REMOTE_ACCESS = process.env.ALLOW_REMOTE_ACCESS === 'true';
 
 const store = Store.open(DB_PATH);
 store.syncTemplates(builtinTemplates);
@@ -57,34 +53,9 @@ store.syncTemplates(builtinTemplates);
 const app = Fastify({ logger: false });
 const ui = readFileSync(join(here, 'public', 'index.html'), 'utf8');
 
-/**
- * The panel binds to loopback only, but that alone is not enough: any page the user
- * visits could POST to 127.0.0.1:8787 and, say, flip autoPublish or overwrite a key.
- * Loopback hosts must be explicit, cross-origin mutations are refused, and every
- * mutation carries a custom header — which a browser cannot forge cross-origin
- * without a CORS preflight this server never grants.
- */
-const LOOPBACK = new Set(['127.0.0.1', 'localhost', '[::1]', '::1']);
-
-app.addHook('preHandler', (req, reply, done) => {
-  if (req.method === 'GET' || req.method === 'HEAD') return done();
-
-  const host = ((req.headers.host ?? '').split(':')[0] ?? '').toLowerCase().replace(/^\[|\]$/g, '');
-  if (!LOOPBACK.has(host)) return reply.code(403).send({ error: '只允许从本机访问' });
-
-  const origin = req.headers.origin;
-  if (origin) {
-    let oh = '';
-    try {
-      oh = new URL(origin).hostname.toLowerCase();
-    } catch {
-      return reply.code(400).send({ error: 'bad origin' });
-    }
-    if (!LOOPBACK.has(oh)) return reply.code(403).send({ error: '跨站请求被拒绝' });
-  }
-
-  if (req.headers['x-squareforge'] !== 'ui') return reply.code(403).send({ error: '缺少 X-Squareforge: ui 请求头' });
-  done();
+registerAccessGuard(app, ALLOW_REMOTE_ACCESS, {
+  username: process.env.PUBLIC_AUTH_USERNAME ?? 'admin',
+  password: process.env.PUBLIC_AUTH_PASSWORD ?? '',
 });
 
 function llmConfigFrom(s: Settings, override?: Partial<LlmConfig>): LlmConfig {
@@ -101,17 +72,22 @@ function llmConfigFrom(s: Settings, override?: Partial<LlmConfig>): LlmConfig {
 }
 
 app.get('/', (_req, reply) => reply.type('text/html').header('cache-control', 'no-cache').send(ui));
+const login = readFileSync(join(here, 'public', 'login.html'), 'utf8');
+app.get('/login', (_req, reply) => reply.type('text/html').header('cache-control', 'no-store').send(login));
 
 /**
  * Stylesheet and script, read once at boot like the HTML. An allowlist rather than a static
  * handler: this directory also sits next to nothing user-supplied, but a route that resolves a
  * caller-provided filename inside a folder holding the posting keys is a mistake waiting to be
- * found, and there are exactly two files to serve.
+ * found. Serve only explicitly listed assets.
  */
 const ASSETS: Record<string, { file: string; type: string }> = {
   '/app.css': { file: 'app.css', type: 'text/css; charset=utf-8' },
   '/app.js': { file: 'app.js', type: 'text/javascript; charset=utf-8' },
   '/brain.js': { file: 'brain.js', type: 'text/javascript; charset=utf-8' },
+  '/login.css': { file: 'login.css', type: 'text/css; charset=utf-8' },
+  '/login.js': { file: 'login.js', type: 'text/javascript; charset=utf-8' },
+  '/favicon.svg': { file: 'favicon.svg', type: 'image/svg+xml' },
 };
 for (const [route, a] of Object.entries(ASSETS)) {
   const body = readFileSync(join(here, 'public', a.file), 'utf8');
@@ -1003,7 +979,9 @@ app
   .listen({ port: PORT, host: HOST })
   .then(() => {
     console.log(`\n  squareforge 本地面板  →  http://${HOST === '0.0.0.0' ? '127.0.0.1' : HOST}:${PORT}\n`);
-    if (!LOOPBACK.has(HOST)) {
+    if (ALLOW_REMOTE_ACCESS) {
+      console.log(`  公网访问已启用：打开 http://服务器公网IP:${PORT}，使用访问账号和密码登录。\n`);
+    } else if (!LOOPBACK.has(HOST)) {
       console.log(
         `  ⚠ 正在监听 ${HOST}：任何能访问到这个端口的主机都能操作面板（改排期、覆盖 Key、触发发布）。\n` +
           '    面板只校验 Host / Origin / 自定义头，没有登录。若必须跨机访问，请只映射到宿主 127.0.0.1，或挡一层反代。\n',
