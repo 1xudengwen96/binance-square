@@ -30,3 +30,8 @@ _tick.json
 
 # UI audit screenshots: they show the live panel (account labels, masked keys, real counts).
 /shots/
+
+# Pre-rework snapshot of the panel frontend, kept on disk as a rollback reference.
+# It is a copy of committed code under another name; publishing it only adds a second,
+# stale truth for the same files.
+/src/server/public.bak-*/
