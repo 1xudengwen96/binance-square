@@ -5,7 +5,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { Store } from '../src/db/index.ts';
 import { DEFAULT_SETTINGS } from '../src/config.ts';
-import { beijingDayStart, nextSlot } from '../src/schedule.ts';
+import { beijingDayStart, nextSlot, nextSlotFor, reachablePostsPerDay, settingsForAccount } from '../src/schedule.ts';
 import { generate } from '../src/pipeline.ts';
 import { makeMaterial } from '../src/material/types.ts';
 import { ttlFor } from '../src/lifecycle.ts';
@@ -41,6 +41,15 @@ function approve(store: Store, at: number, i: number): void {
 
 function makeAcct(store: Store): number {
   return store.createAccount({ label: '调度号', enabled: true });
+}
+
+/** A published post on this account's own ledger, for the per-account ceiling tests. */
+function publishFor(store: Store, accountId: number, at: number, i: number): void {
+  const id = store.addPost({
+    materialId: null, templateId: null, text: `$T${i} 1小时多空比 2.10，多头占 60.9%。测试正文。`,
+    status: 'published', scheduledAt: at, accountId,
+  });
+  store.updatePost(id, { status: 'published', publishedAt: at });
 }
 
 test('drafts reserved one at a time never share a minute', () => {
@@ -167,6 +176,49 @@ test('an article spends the same daily ceiling as a post', () => {
     approve(store, now, 0);
     store.db.prepare("UPDATE posts SET status = 'published', published_at = ? WHERE id = (SELECT MAX(id) FROM posts)").run(now);
     assert.equal(store.publishedToday(now - 3600_000), 2, 'one article and one post must both count');
+  } finally {
+    close();
+  }
+});
+
+test('the reachable quota is the window divided by the floor, not a number anyone typed', () => {
+  // 8:00–24:00 is 960 minutes, so a 45-minute floor fits 21 posts and no more. The panel used to
+  // offer 24 as a preset and then advertise «one every 40 minutes» for it — tighter than the
+  // minimum interval it was itself enforcing, i.e. a cadence that could never happen.
+  const s = { ...DEFAULT_SETTINGS, activeStartHour: 8, activeEndHour: 24, minIntervalMinutes: 45 };
+  assert.equal(reachablePostsPerDay(s), 21);
+  assert.equal(reachablePostsPerDay({ ...s, minIntervalMinutes: 30 }), 32);
+  // A window that wraps past midnight is still measured by its own length.
+  assert.equal(reachablePostsPerDay({ ...s, activeStartHour: 22, activeEndHour: 2, minIntervalMinutes: 60 }), 4);
+});
+
+test('an account target and the global cap are two numbers, and each says its own name', () => {
+  // `dailyCap` used to be overwritten by the account's `posts_per_day`, so one figure meant two
+  // things: the panel showed «今日 7 / 30» at the top and 「上限 24」 on the account card, and both
+  // read as that account's quota.
+  const { store, close } = tempStore();
+  try {
+    const base = { ...ALWAYS_OPEN, dailyCap: 30, postsPerDay: 4, minIntervalMinutes: 45 };
+    const a = store.accountById(store.createAccount({ label: '目标号', enabled: true, postsPerDay: 24 }))!;
+    const eff = settingsForAccount(base, a);
+    assert.equal(eff.postsPerDay, 24, 'the target stays the account\'s own number');
+    assert.equal(eff.dailyCap, 30, 'the cap stays the global one instead of being replaced');
+
+    const now = Date.now();
+    // Anchor to the Beijing day rather than to `now - i minutes`, or a run shortly after midnight
+    // would file the older posts under yesterday and the ceiling would never be reached.
+    const dayStart = beijingDayStart(now);
+    for (let i = 0; i < 24; i++) publishFor(store, a.id, dayStart + i * 60_000, i);
+    const atTarget = nextSlotFor(store, base, a, now);
+    assert.equal(atTarget.allowed, false);
+    assert.match(atTarget.reason, /目标帖数/, 'reaching your own target is not the same sentence as hitting a ceiling');
+
+    // A target above the shared cap is stopped by the cap, and the reason says so.
+    const greedy = store.accountById(store.createAccount({ label: '超额号', enabled: true, postsPerDay: 40 }))!;
+    for (let i = 0; i < 30; i++) publishFor(store, greedy.id, dayStart + i * 60_000, i);
+    const atCap = nextSlotFor(store, base, greedy, now);
+    assert.equal(atCap.allowed, false);
+    assert.match(atCap.reason, /硬上限/);
   } finally {
     close();
   }

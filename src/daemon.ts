@@ -221,6 +221,9 @@ export async function tick(store: Store, opts: { live?: boolean; statsEveryTicks
         res.deferred += deferred;
         res.failed += p.failed.length - deferred;
         if (p.uncertain.length) res.notes.push(`${p.uncertain.length} 条状态未知，需人工到广场确认`);
+        // The pre-publish check: rewritten with live figures, or dropped as no longer true.
+        for (const n of p.notes) if (/发布前按最新行情/.test(n)) res.notes.push(`${t.account.label}：${n}`);
+        for (const d of p.dropped) res.notes.push(`${t.account.label}：#${d.id} 发布前复核作废——${d.label}`);
         if (p.paused) res.notes.push(`${t.account.label}已自动暂停`);
       } catch (err) {
         res.notes.push(`publish 失败：${String(err).slice(0, 100)}`);

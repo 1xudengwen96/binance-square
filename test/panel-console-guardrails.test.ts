@@ -26,7 +26,7 @@ test('no panel code may write the judgment metric', () => {
 
 test('the metric is announced as read-only on both pages that show it', () => {
   assert.match(appJs, /function|const\s+targetReadout/);
-  assert.match(appJs, /当前世代绑定口径/);
+  assert.match(appJs, /只读 · 改口径走口径库/);
   assert.match(appJs, /改口径＝开新假设/);
   assert.match(brainJs, /实验判定指标[\s\S]{0,600}只读/);
 });

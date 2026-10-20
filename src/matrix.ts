@@ -92,22 +92,31 @@ export function allocate<T extends SymbolCandidate>(
   // Pinned accounts pick first. Otherwise an unpinned account evaluated earlier in the
   // round would hand itself the coin a pinned account exists to cover, and the pinned
   // account would end the pass with nothing.
-  const order = [...accounts].sort((x, y) => (pinned.get(y.id)!.size ? 1 : 0) - (pinned.get(x.id)!.size ? 1 : 0));
+  const pinnedFirst = accounts.filter(a => pinned.get(a.id)!.size > 0);
+  const rotating = accounts.filter(a => pinned.get(a.id)!.size === 0);
 
-  const maxWant = Math.max(1, ...accounts.map(a => a.posts_per_day ?? settings.postsPerDay));
+  const want = (a: AccountRow): number => a.posts_per_day ?? settings.postsPerDay;
+  const maxWant = Math.max(1, ...accounts.map(want));
   for (let round = 0; round < maxWant; round++) {
     let anyoneMoved = false;
+    // Unpinned accounts rotate the first pick. A fixed order let whichever account sat first
+    // take the strongest material every round, and the rounds are numbered by the *largest*
+    // quota — with 24 against 4 that is 24 passes of one account picking first and the other
+    // taking what was left, for four of them. Rotating keeps exclusivity (a coin still goes to
+    // exactly one account) without making quota size decide who gets the good board.
+    const turn = rotating.length ? round % rotating.length : 0;
+    const order = [...pinnedFirst, ...rotating.slice(turn), ...rotating.slice(0, turn)];
     for (const a of order) {
       const bucket = out.get(a.id)!;
-      if (bucket.length >= (a.posts_per_day ?? settings.postsPerDay)) continue;
-      const want = pinned.get(a.id);
+      if (bucket.length >= want(a)) continue;
+      const wantCoins = pinned.get(a.id);
       const deny = blocked.get(a.id)!;
 
       const pick = candidates.find(c => {
         const key = c.symbol.toUpperCase();
         if (deny.has(key)) return false;
         if (givenAway.has(key)) return false;
-        if (want?.size && !want.has(key)) return false;
+        if (wantCoins?.size && !wantCoins.has(key)) return false;
         return !heldByOther(key, a.id);
       });
       if (!pick) continue;

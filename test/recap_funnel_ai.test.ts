@@ -7,7 +7,7 @@ import { Store } from '../src/db/index.ts';
 import { DEFAULT_SETTINGS } from '../src/config.ts';
 import type { Settings } from '../src/config.ts';
 import { generateColumn } from '../src/column.ts';
-import { chat, LlmError } from '../src/llm/providers.ts';
+import { chat, chatTimeoutMs, LlmError } from '../src/llm/providers.ts';
 
 function tempStore(): { store: Store; close: () => void } {
   const dir = mkdtempSync(join(tmpdir(), 'sf-recap-'));
@@ -63,6 +63,50 @@ test('昨日对账终于出稿：recap 的 $币种 补登 facts 后过审计，�
     assert.ok(drawn!.slot_at && drawn!.slot_at > 0, 'drawn 必须带 slot_at（裁定二：同小时不再被记 4 次抽中）');
     const gen = f.find(x => x.outcome === 'generated');
     assert.ok(gen && gen.post_id === r.created[0]!.id, '出稿也要落 generated(post_id)，把 drawn→出稿串成一条');
+  } finally {
+    close();
+  }
+});
+
+test('对账一币一行：同币多条判断只写一句并一起结清；不再报成立率；带币种与话题标签', async (t) => {
+  t.mock.timers.enable({ apis: ['Date'], now: FIXED });
+  const { store, close } = tempStore();
+  try {
+    seedPersona(store);
+    const a = acct(store);
+    seedOwedCalls(store, FIXED - 2 * 3600_000);
+    const ins = store.db.prepare(
+      `INSERT INTO column_calls (post_id, symbol, kind, reading, payer, rate_at, annualized_at, interval_hours, price_at, check_at, status, outcome, rate_after, judged_at)
+       VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+    );
+    for (let i = 0; i < 2; i++) ins.run(10 + i, 'AAA', 'funding_persists', 'anomaly', '空头', -0.01 - i * 0.001, -10, 8, 1, FIXED, 'failed', 'faded', -0.0005, FIXED - 3 * 3600_000 - i);
+    const s: Settings = { ...DEFAULT_SETTINGS, autoPublish: true, columnPostsPerDay: 10, activeExperiments: [], activeStartHour: 0, activeEndHour: 24 };
+    const r = await generateColumn(store, s, a);
+    assert.equal(r.created.length, 1, r.skipped.join(' | '));
+    const text = store.postById(r.created[0]!.id)!.text;
+    assert.equal((text.match(/\$AAA/g) ?? []).length, 1, text);
+    assert.match(text, /\$BBB/);
+    assert.doesNotMatch(text, /核对|成立|【/);
+    assert.match(text, /^#(AAA|BBB) #(AAA|BBB) #资金费率$/m);
+    const open = (store.db.prepare("SELECT COUNT(*) n FROM column_calls WHERE symbol = 'AAA' AND recapped_in IS NULL").get() as { n: number }).n;
+    assert.equal(open, 0, 'every call on a recapped coin is closed with it');
+  } finally {
+    close();
+  }
+});
+
+test('同角度限流的计数：老的今日反常算付费方角度，新帖按 trace.angle 计', () => {
+  const { store, close } = tempStore();
+  try {
+    seedPersona(store);
+    const a = acct(store);
+    const now = Date.now();
+    store.addPost({ materialId: null, templateId: 'column.anomaly', text: '旧反常 $AAA。不构成投资建议。', status: 'published', scheduledAt: now, accountId: a.id });
+    store.addPost({ materialId: null, templateId: 'column.anomaly', text: '持仓背离 $BBB。不构成投资建议。', status: 'approved', scheduledAt: now, accountId: a.id, trace: { angle: 'oi' } });
+    store.addPost({ materialId: null, templateId: 'column.question', text: '五五开 $CCC。不构成投资建议。', status: 'approved', scheduledAt: now, accountId: a.id, trace: { angle: 'split' } });
+    assert.equal(store.columnAngleSince(a.id, 'payer', now - 3600_000), 1);
+    assert.equal(store.columnAngleSince(a.id, 'oi', now - 3600_000), 1);
+    assert.equal(store.columnAngleSince(a.id, 'split', now - 3600_000), 1);
   } finally {
     close();
   }
@@ -164,6 +208,40 @@ test('非「temperature」类 400 不触发重试，原样抛出（判据只认�
     const cfg = { provider: 'anthropic' as const, baseUrl: 'https://relay.test/v1', model: 'other-model', apiKey: 'k', temperature: 0.7 };
     await assert.rejects(() => chat(cfg, [{ role: 'user', content: 'x' }]), (e: unknown) => e instanceof LlmError);
     assert.equal(n, 1, '别的 400 只打一次，不做无谓重试');
+  } finally {
+    globalThis.fetch = realFetch;
+  }
+});
+
+test('中转临时故障（503 没有可用账号）重试一次；OpenAI 形态同样自愈 temperature 400；超时预算随 maxTokens 放大', async () => {
+  const realFetch = globalThis.fetch;
+  try {
+    let n = 0;
+    globalThis.fetch = (async () => {
+      n++;
+      if (n === 1) return { ok: false, status: 503, text: async () => JSON.stringify({ error: { message: 'No available accounts' } }) } as unknown as Response;
+      return { ok: true, status: 200, text: async () => JSON.stringify({ choices: [{ message: { content: '收到' } }] }) } as unknown as Response;
+    }) as typeof fetch;
+    const cfg = { provider: 'openai' as const, baseUrl: 'https://relay.test/v1', model: 'gpt-probe', apiKey: 'k', temperature: 0.2 };
+    assert.equal(await chat(cfg, [{ role: 'user', content: 'x' }]), '收到');
+    assert.equal(n, 2, '503 是中转的临时状态，再试一次');
+
+    const bodies: Record<string, unknown>[] = [];
+    globalThis.fetch = (async (_u: unknown, init: { body?: string }) => {
+      const b = JSON.parse(String(init?.body ?? '{}')) as Record<string, unknown>;
+      bodies.push(b);
+      if ('temperature' in b) {
+        return { ok: false, status: 400, text: async () => JSON.stringify({ error: { message: 'claude-sonnet-5-5 does not support non-default temperature' } }) } as unknown as Response;
+      }
+      return { ok: true, status: 200, text: async () => JSON.stringify({ choices: [{ message: { content: '好' } }] }) } as unknown as Response;
+    }) as typeof fetch;
+    const relay = { provider: 'openai' as const, baseUrl: 'https://relay.test/v1', model: 'openai-shaped-nontemp', apiKey: 'k', temperature: 0.2 };
+    assert.equal(await chat(relay, [{ role: 'user', content: 'x' }]), '好');
+    assert.equal(bodies.length, 2);
+    assert.ok(!('temperature' in bodies[1]!));
+
+    assert.ok(chatTimeoutMs(2500) >= 120_000, 'the weekly review asks for 2,500 tokens and must not die at 30 s');
+    assert.equal(chatTimeoutMs(0), 30_000);
   } finally {
     globalThis.fetch = realFetch;
   }

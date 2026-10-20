@@ -49,7 +49,9 @@ export const DIMENSIONS: Record<Dimension, DimensionSpec> = {
   hook_form: { kind: 'knob', label: '首句形态', arms: ['data', 'tension'] },
   stance: { kind: 'knob', label: '有无观点句', arms: ['none', 'read'] },
   follow_cta: { kind: 'knob', label: '结尾是否求关注', arms: ['none', 'follow'] },
-  column: { kind: 'knob', label: '栏目形态', arms: ['ledger', 'question', 'anomaly', 'recap'] },
+  // ledger 已停用（column.ts 的白名单只放盘中一问/今日反常/昨日对账）。臂表必须和写作层能
+  // 实际写出的形态一致，否则「最少那臂」永远是一条写不出来的形态，missing 也就永远降不到 0。
+  column: { kind: 'knob', label: '栏目形态', arms: ['question', 'anomaly', 'recap'] },
   polish: { kind: 'knob', label: '栏目是否经 AI 改写措辞', arms: ['raw', 'polished'] },
   length_band: { kind: 'observed', label: '正文字数带', arms: ['short', 'mid', 'long'] },
   hour_band: { kind: 'observed', label: '发帖时段带', arms: ['morning', 'midday', 'afternoon', 'evening', 'late'] },
@@ -78,13 +80,13 @@ export interface Hypothesis {
 export const HYPOTHESES: Hypothesis[] = [
   {
     id: 'h_column',
-    claim: '不同的固定栏目（费率账 / 盘中一问 / 今日反常 / 昨日对账）换来的回应不一样',
+    claim: '不同的固定栏目（盘中一问 / 今日反常 / 昨日对账）换来的回应不一样',
     mode: 'experiment',
     dimension: 'column',
-    arms: ['ledger', 'question', 'anomaly', 'recap'],
+    arms: ['question', 'anomaly', 'recap'],
     metric: 'views24h',
     minSamples: 10,
-    how: '栏目形态在当次可用的形态里随机抽取，抽签先于发帖并落库；比较各形态的 24 小时浏览，达标后改比互动质量。',
+    how: '栏目形态在当次可用的形态里按样本最少的优先抽取，抽签先于发帖并落库；比较各形态的 24 小时浏览，达标后改比互动质量。',
     risk: '被抽到的形态可能比其余的差；这是回答「读者要什么」的唯一办法。',
   },
   {

@@ -13,6 +13,7 @@ import { effectiveTarget, evaluateBreaker, gateReport, resetBreaker, GATE_LINES,
 import { BUILTIN_VARIANTS, isSafeVariant, seedVariants } from '../content/columns.ts';
 import { boardComposition } from '../stats/benchmarks.ts';
 import { tally } from '../calls.ts';
+import { UPGRADE_AREAS, listUpgrades, resolveUpgrade, upgradesMarkdown, type UpgradeStatus } from '../brain/upgrades.ts';
 
 /**
  * Everything the 「AI 大脑」 page talks to.
@@ -134,6 +135,7 @@ export function registerBrainRoutes(app: FastifyInstance, store: Store): void {
       variants: store.db.prepare('SELECT id, kind, slot, text, status, origin, off_reason FROM column_variants ORDER BY kind, slot, id').all(),
       calls_ledger: { tally: tally(store), recent: store.db.prepare('SELECT id, symbol, payer, rate_at, rate_after, outcome, status, check_at, judged_at FROM column_calls ORDER BY id DESC LIMIT 15').all() },
       benchmark: { composition: boardComposition(store), byLang: store.boardCountByLang() },
+      upgrades: { rows: listUpgrades(store, { limit: 40 }), areas: UPGRADE_AREAS },
       notes: store.getSetting<string>('brainNotes', ''),
       prompts: { rules: BRAIN_RULES, weekly: WEEKLY_SYSTEM, sentinel: SENTINEL_SYSTEM },
     });
@@ -210,6 +212,21 @@ export function registerBrainRoutes(app: FastifyInstance, store: Store): void {
   app.post('/api/brain/reports/:id/dismiss', (req, reply) => {
     const ok = dismissReport(store, Number((req.params as { id: string }).id));
     reply.code(ok ? 200 : 400).send({ ok });
+  });
+
+  /** Move an upgrade request along; done and refused need a sentence the brain will read next time. */
+  app.post('/api/brain/upgrades/:id', (req, reply) => {
+    const id = Number((req.params as { id: string }).id);
+    const b = (req.body ?? {}) as { status?: string; note?: string };
+    const r = resolveUpgrade(store, id, String(b.status ?? '') as UpgradeStatus, String(b.note ?? ''));
+    reply.code(r.ok ? 200 : 400).send(r);
+  });
+
+  /** The open list as a markdown brief, to paste into a chat with whoever writes the code. */
+  app.get('/api/brain/upgrades.md', (req, reply) => {
+    const q = (req.query ?? {}) as { ids?: string };
+    const ids = String(q.ids ?? '').split(',').map(Number).filter(n => Number.isInteger(n) && n > 0);
+    reply.type('text/markdown; charset=utf-8').send(upgradesMarkdown(store, ids));
   });
 
   app.post('/api/brain/notes', (req, reply) => {

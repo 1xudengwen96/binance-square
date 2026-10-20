@@ -248,7 +248,7 @@ switch (cmd) {
     const { renderKlinePng } = await import('./chart/kline.ts');
     const { mkdirSync } = await import('node:fs');
 
-    let k = await binance.futuresKlines(symbol, '1h', 72).catch(async () => binance.klines(symbol, '1h', 72));
+    let k = await binance.futuresKlines(symbol, '1h', 98).catch(async () => binance.klines(symbol, '1h', 98));
     const closed = k.slice(0, -1);
     if (closed.length < 3) {
       console.log(`没有 ${symbol} 的 K 线数据`);
@@ -264,8 +264,11 @@ switch (cmd) {
     const oiChg = oi.length > 1 ? ((Number(oi[oi.length - 1]!.sumOpenInterestValue) - Number(oi[0]!.sumOpenInterestValue)) / Number(oi[0]!.sumOpenInterestValue)) * 100 : null;
     const ls = await binance.globalLongShort(symbol, '1h', 1).catch(() => []);
 
+    // The 24h chip must be a real 24h figure — the header percentage covers the whole window.
+    const tick = await binance.futuresTickers().catch(() => []);
+    const chg24 = Number(tick.find(t => t.symbol === symbol)?.priceChangePercent ?? NaN);
     const chips = [
-      `24h ${chg >= 0 ? '+' : ''}${chg.toFixed(2)}%`,
+      Number.isFinite(chg24) ? `24h ${chg24 >= 0 ? '+' : ''}${chg24.toFixed(2)}%` : null,
       fund ? `Funding ${(Number(fund) * 100).toFixed(3)}%` : null,
       oiChg !== null ? `OI 24h ${oiChg >= 0 ? '+' : ''}${oiChg.toFixed(1)}%` : null,
       ls[0] ? `L/S ${Number(ls[0].longShortRatio).toFixed(2)}` : null,

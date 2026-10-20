@@ -12,7 +12,8 @@ import { DEFAULT_SETTINGS } from '../src/config.ts';
 const ALWAYS_OPEN = { ...DEFAULT_SETTINGS, activeStartHour: 0, activeEndHour: 24 };
 import { generate } from '../src/pipeline.ts';
 import { HYPOTHESES } from '../src/rank/hypotheses.ts';
-import { exploreRepeat, REPEAT_EXPLORE_SHARE } from '../src/rank/experiments.ts';
+import { exploreRepeat, planArms, REPEAT_EXPLORE_SHARE } from '../src/rank/experiments.ts';
+import type { Verdict } from '../src/rank/score.ts';
 import { makeMaterial } from '../src/material/types.ts';
 
 /** Exactly the fact set `collectors/detectors.ts` puts on a funding material, plus the enriched fields. */
@@ -132,4 +133,43 @@ test('only the active experiments draw arms, and a column-only hypothesis never 
     store.close();
     rmSync(dir, { recursive: true, force: true });
   }
+});
+
+/** A verdict that has recorded `arms` samples per arm and no winner yet. */
+function verdict(id: string, arms: [string, number][], status: Verdict['status'] = 'observing'): Verdict {
+  return {
+    id, claim: 'c', metric: 'views24h', mode: 'experiment', how: '', risk: '',
+    arms: arms.map(([arm, n]) => ({ arm, n, median: 1, best: 1 })),
+    winner: null, loser: null, effect: 0,
+    stratified: { gap: null, rel: null, strata: 0, dropped: 0, winner: null, agree: 0, detail: [] },
+    replicated: null, confidence: 0, status, action: null, note: null, missing: 0,
+  };
+}
+
+test('the arm with the fewest samples is drawn until the comparison is level', () => {
+  // The live ledger read 22 raw against 6 polished and 15 anomaly against 3 recap: a uniform draw
+  // is balanced in expectation, and at ten posts a side the expectation is not what happened. The
+  // starved arm must be the only one that can be drawn while it lags.
+  const lagging = verdict('h_polish', [['raw', 22], ['polished', 6]]);
+  for (let seed = 0; seed < 60; seed++) {
+    assert.equal(planArms({ seed, verdicts: [lagging] }).h_polish, 'polished', `seed ${seed} drew the arm that was already ahead`);
+  }
+
+  // Level arms stay a random choice, so an arm is still decided before the post exists.
+  const level = verdict('h_level', [['a', 5], ['b', 5]]);
+  const seen = new Set<string>();
+  for (let seed = 0; seed < 80; seed++) seen.add(planArms({ seed, verdicts: [level] }).h_level!);
+  assert.deepEqual([...seen].sort(), ['a', 'b'], 'ties must still be random');
+});
+
+test('a shape the lane cannot write is never drawn, and an empty allow list records nothing', () => {
+  // recap is only available when yesterday's rulings can be reviewed; drawing it otherwise spends
+  // a "sample" the comparison never gets. The lane passes what it can actually write.
+  const column = verdict('h_column', [['question', 30], ['anomaly', 30], ['recap', 0]]);
+  for (let seed = 0; seed < 40; seed++) {
+    const arm = planArms({ seed, verdicts: [column], allow: { h_column: ['question', 'anomaly'] } }).h_column;
+    assert.ok(arm === 'question' || arm === 'anomaly', `seed ${seed} drew ${arm}`);
+  }
+  const none = planArms({ seed: 1, verdicts: [column], allow: { h_column: [] } });
+  assert.equal(none.h_column, undefined, 'no writable shape means no arm on record');
 });

@@ -94,8 +94,10 @@ export class SquareClient {
 
   private get fetchImpl(): typeof fetch {
     // An injected impl always wins so tests stay offline; otherwise honour the proxy.
+    // An account-level proxy beats the machine-wide one; with neither set, direct.
     if (this.opts.fetchImpl) return this.opts.fetchImpl;
-    return hasProxy(this.opts.proxyUrl) ? proxiedFetch(this.opts.proxyUrl!) : fetch;
+    const egress = this.opts.proxyUrl?.trim() || (process.env.HTTPS_PROXY ?? process.env.HTTP_PROXY ?? '').trim();
+    return hasProxy(egress) ? proxiedFetch(egress) : fetch;
   }
 
   private headers(json = true): Record<string, string> {

@@ -1,7 +1,7 @@
 import { mkdirSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { binance } from '../collectors/binance.ts';
-import { renderKlinePng } from './kline.ts';
+import { renderCardPng, renderKlinePng } from './kline.ts';
 
 /**
  * Build the chart that goes with a post.
@@ -22,11 +22,40 @@ export interface ChartSubject {
 
 export interface BuiltChart {
   path: string;
+  /** Feed-card cover drawn from the same candles. Goes first when present. */
+  card?: string;
   chips: string[];
   changePct: number;
 }
 
-const BARS = 72;
+/**
+ * What the card needs beyond the candles.
+ *
+ * The annotation is the post's own first sentence: the copy has already been through the fact
+ * check and the voice gates, so a cover that quotes it cannot claim anything the body does not.
+ * A hand-written or model-written line here would be a number with no ledger behind it.
+ */
+export interface ChartCard {
+  column?: string;
+  annotation?: string | null;
+  watermark?: string;
+}
+
+/**
+ * The first line of the post that is actually a sentence. Emoji are stripped — the rasteriser
+ * has no glyph for them and prints tofu boxes — and hashtag/cashtag lines are skipped, because
+ * a tag is not a claim worth printing large.
+ */
+export function cardAnnotation(text: string): string | null {
+  for (const raw of text.split('\n')) {
+    const line = raw.replace(/[\u{1F000}-\u{1FAFF}\u{2190}-\u{27BF}\u{2B00}-\u{2BFF}\u{FE0F}]/gu, '').trim();
+    if (!line || line.startsWith('#') || line.startsWith('$')) continue;
+    return line;
+  }
+  return null;
+}
+
+const BARS = 96;
 
 export type Interval = '1h' | '4h' | '1d';
 
@@ -34,10 +63,14 @@ function signed(v: number, digits: number, suffix = '%'): string {
   return `${v >= 0 ? '+' : ''}${v.toFixed(digits)}${suffix}`;
 }
 
-export async function buildChartFor(s: ChartSubject, outDir = 'data/charts', interval: Interval = '1h'): Promise<BuiltChart | null> {
+export async function buildChartFor(s: ChartSubject, outDir = 'data/charts', interval: Interval = '1h', card?: ChartCard): Promise<BuiltChart | null> {
   const pair = `${s.symbol.toUpperCase()}USDT`;
-  let k = await binance.futuresKlines(pair, interval, 74).catch(() => null);
-  if (!k || k.length < 4) k = await binance.klines(pair, interval as '1h' | '4h' | '1d', 74).catch(() => null);
+  let fromFutures = true;
+  let k = await binance.futuresKlines(pair, interval, BARS + 2).catch(() => null);
+  if (!k || k.length < 4) {
+    k = await binance.klines(pair, interval as '1h' | '4h' | '1d', BARS + 2).catch(() => null);
+    fromFutures = false;
+  }
   if (!k || k.length < 4) return null;
 
   // Drop the still-forming candle, then keep exactly the bars the renderer draws, so the header
@@ -74,5 +107,30 @@ export async function buildChartFor(s: ChartSubject, outDir = 'data/charts', int
   mkdirSync(outDir, { recursive: true });
   const path = join(outDir, `${s.symbol.toUpperCase()}-${interval}-${Date.now()}.png`);
   writeFileSync(path, png);
-  return { path, chips, changePct };
+
+  // The card is the cover, the candles are the evidence: both come from the same `closed`
+  // window, so the big sentence and the bars cannot disagree about which hours they cover.
+  let cardPath: string | undefined;
+  const annotation = card?.annotation?.trim();
+  if (card && annotation) {
+    const cardPng = await renderCardPng(closed, {
+      column: card.column ?? '行情异动',
+      title: s.symbol.toUpperCase(),
+      market: fromFutures ? '永续' : '现货',
+      lastPrice: last,
+      // The badge says 24 小时, so it must carry the audited 24h figure when we have one;
+      // the window change under a 24h label is exactly the confusion the chips rule forbids.
+      changePct: s.chg24h ?? changePct,
+      changeLabel: s.chg24h != null ? '24 小时' : changeLabel,
+      annotation,
+      source: fromFutures ? '币安合约行情' : '币安现货行情',
+      watermark: card.watermark,
+      bars: 18,
+    }).catch(() => null);
+    if (cardPng) {
+      cardPath = join(outDir, `${s.symbol.toUpperCase()}-card-${Date.now()}.png`);
+      writeFileSync(cardPath, cardPng);
+    }
+  }
+  return { path, card: cardPath, chips, changePct };
 }

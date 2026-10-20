@@ -226,8 +226,52 @@ function brainColumnCard(d) {
   </div>`;
 }
 const PURPOSE_CN = { reflect: '每日反思', sentinel: '哨兵', weekly: '周复盘', test: '测试' };
+const UPG_STATUS = { open: ['gold', '待处理'], doing: ['info', '处理中'], done: ['on', '已完成'], wontfix: ['plain', '不做'] };
+const UPG_SOURCE = { weekly: '周复盘', sentinel: '哨兵', reflect: '每日反思', operator: '手动' };
+
+function upgradeRow(u, areas) {
+  const [cls, label] = UPG_STATUS[u.status] || ['plain', u.status];
+  const btn = (status, text, primary) => `<button class="btn sm${primary ? ' primary' : ''}" onclick="brainUpgrade(${u.id}, '${status}')">${text}</button>`;
+  const actions = u.status === 'open' ? `${btn('doing', '开始做')}${btn('done', '已完成', true)}${btn('wontfix', '不做')}`
+    : u.status === 'doing' ? `${btn('done', '已完成', true)}${btn('wontfix', '不做')}${btn('open', '退回')}`
+    : btn('open', '重新打开');
+  return `<tr>
+    <td class="num">${u.id}</td>
+    <td style="white-space:nowrap"><span class="tag">${esc(areas[u.area] || u.area)}</span></td>
+    <td><b>${esc(u.title)}</b>
+      <details class="src"><summary>证据 · ${esc(UPG_SOURCE[u.source] || u.source)}${u.report_id ? ` #${u.report_id}` : ''}</summary><span>${esc(u.why)}${u.resolution ? `<br><b>处理说明：</b>${esc(u.resolution)}` : ''}</span></details></td>
+    <td class="num">${u.times > 1 ? `<span class="pill warn">${u.times} 次</span>` : '1 次'}</td>
+    <td><span class="pill ${cls}">${label}</span><span class="sub" style="display:block">${esc(fmtTs(u.last_seen_at))}</span></td>
+    <td style="white-space:nowrap"><div class="kv" style="flex-wrap:nowrap">${actions}</div></td>
+  </tr>`;
+}
+
+function brainUpgradesCard(d) {
+  const rows = d.upgrades.rows;
+  const live = rows.filter(u => u.status === 'open' || u.status === 'doing');
+  const closed = rows.filter(u => u.status === 'done' || u.status === 'wontfix');
+  const count = s => rows.filter(u => u.status === s).length;
+  const head = '<thead><tr><th class="num">#</th><th>领域</th><th>需求</th><th class="num">被提出</th><th>状态</th><th></th></tr></thead>';
+  return `<div class="card" style="margin-bottom:14px">
+    <div class="card-hd"><h3>要改代码的事</h3>
+      <span class="sub">大脑发现了、但它自己改不了的问题。做完标「已完成」并写一句做了什么，下次复盘它会检查改了有没有用；标「不做」它就不再提。</span>
+      <span class="right">${live.length ? '<button class="btn sm primary" onclick="brainCopyUpgrades()">复制给开发</button>' : ''}</span></div>
+    <div class="kv" style="margin:6px 0">
+      <span class="pill gold">待处理 ${count('open')}</span><span class="pill info">处理中 ${count('doing')}</span>
+      <span class="pill on">已完成 ${count('done')}</span><span class="pill plain">不做 ${count('wontfix')}</span>
+    </div>
+    ${live.length ? `<div class="tablewrap"><table>${head}<tbody>${live.map(u => upgradeRow(u, d.upgrades.areas)).join('')}</tbody></table></div>`
+      : '<div class="empty"><b>没有待处理的需求</b><span>周复盘、哨兵、每日反思发现只有改代码才能解决的问题时，会登记在这里。</span></div>'}
+    ${closed.length ? `<details class="src" style="margin-top:8px"><summary>已处理 ${closed.length} 条 · 展开</summary>
+      <div class="tablewrap"><table>${head}<tbody>${closed.map(u => upgradeRow(u, d.upgrades.areas)).join('')}</tbody></table></div></details>` : ''}
+    <div class="result" id="bn-upgrade-result"></div>
+  </div>`;
+}
 const STATUS_CN = { pending: '待审阅', approved: '已批准', dismissed: '已忽略', failed: '批准后全被拒' };
-const ALARM_CN = { breaker: '熔断', no_comments: '无评论', outlier_good: '异常好', gate_a_cleared: '关卡 A 过线', calls_failing: '判断不成立', no_posts: '停发', brain_failing: '大脑调用失败', stats_stalled: '回抓停了' };
+const ALARM_CN = { breaker: '熔断（浏览量低于线）', no_comments: '无评论', outlier_good: '异常好', gate_a_cleared: '关卡 A 过线', calls_failing: '判断不成立', no_posts: '停发', brain_failing: '大脑调用失败', stats_stalled: '回抓停了' };
+// 裁定八十六 §二：旧码面这枚 breaker 与发布门里那枚 busBreaker 只是同名（谓词＝sentinel.ts:29-34），
+// 页面上必须说清，否则"签它"会被当成能解除发布门。
+const ALARM_GATE_NOTE = '这枚 breaker 不是发布门那枚：谓词＝浏览中位数低于 floor（sentinel.ts:29-34）。发布门的熔断残量看运行台的总线台账。';
 
 function brainReportsCard(d) {
   const rows = d.reports.map(r => `<tr>
@@ -266,12 +310,13 @@ function actionText(a) {
 }
 
 function brainAlarmsCard(d) {
-  const rows = d.alarms.map(a => `<tr><td>${esc(fmtTs(a.at))}</td><td><span class="pill ${a.code === 'breaker' ? 'bad' : 'info'}">${esc(ALARM_CN[a.code] || a.code)}</span></td><td>${esc(a.detail)}</td>
+  const rows = d.alarms.map(a => `<tr><td>${esc(fmtTs(a.at))}</td><td><span class="pill ${a.code === 'breaker' ? 'bad' : 'info'}">${esc(ALARM_CN[a.code] || a.code)}</span>${a.code === 'breaker' ? '<span class="tag">≠ 发布门那枚</span>' : ''}</td><td>${esc(a.detail)}</td>
     <td>${a.woke ? '<span class="pill gold">叫了大脑</span>' : '<span class="pill plain">只记录</span>'}</td></tr>`).join('');
   return `<div class="card" style="margin-bottom:14px">
-    <div class="card-hd"><h3>哨兵警报</h3><span class="sub">由代码判定。同一种警报 20 小时内不重复。</span>
+    <div class="card-hd"><h3>哨兵警报</h3><span class="sub">由代码判定。同一种警报 20 小时内不重复。母体＝brain_alarms 最近 20 行。</span>
       <span class="right"><button class="btn sm" onclick="brainRunSentinel()">现在检查一次</button></span></div>
-    ${rows ? `<div class="tablewrap"><table><thead><tr><th>时间</th><th>警报</th><th>内容</th><th></th></tr></thead><tbody>${rows}</tbody></table></div>` : '<div class="empty"><b>没有警报</b><span>多数日子什么都没发生，这是正常的。</span></div>'}
+    ${rows ? `<div class="tablewrap"><table><thead><tr><th>时间</th><th>警报</th><th>内容</th><th></th></tr></thead><tbody>${rows}</tbody></table></div>` : '<div class="empty"><b>这一轮读到 0 条警报</b><span>多数日子什么都没发生；但这是"读到空集"，不等于没有东西挡着发布 —— 挡止面看运行台的三分出处。</span></div>'}
+    <div class="hint">${esc(ALARM_GATE_NOTE)}</div>
     <div class="result" id="bn-sentinel-result"></div>
   </div>`;
 }
@@ -332,6 +377,7 @@ async function brainView() {
   const d = BRAIN;
   return `
     ${brainGateCards(d)}
+    ${brainUpgradesCard(d)}
     ${brainConnectionCard(d)}
     ${brainJobsCard(d)}
     ${brainColumnCard(d)}
@@ -518,7 +564,38 @@ async function brainToggleVariant(id) {
   await render();
 }
 
+async function brainUpgrade(id, status) {
+  let note = '';
+  if (status === 'done') {
+    note = prompt('做了什么？一句话就行。\n（大脑下次复盘会读到它，判断改动有没有用）', '') ?? '';
+    if (!note.trim()) return;
+  } else if (status === 'wontfix') {
+    note = prompt('为什么不做？一句话就行。\n（大脑读到后就不再提这条）', '') ?? '';
+    if (!note.trim()) return;
+  }
+  try {
+    await api(`/api/brain/upgrades/${id}`, bjson({ status, note }));
+    toast({ doing: '已标为处理中', done: '已完成', wontfix: '已标为不做', open: '已退回待处理' }[status] || '已更新');
+    await render();
+  } catch (e) { toast(e.message, true); }
+}
+
+async function brainCopyUpgrades() {
+  try {
+    const r = await fetch('/api/brain/upgrades.md');
+    const md = await r.text();
+    try {
+      await navigator.clipboard.writeText(md);
+      toast('已复制，粘贴给开发（或 Qoder）就能开工');
+    } catch {
+      brainResult('bn-upgrade-result', 'good', `<textarea rows="10" style="width:100%" readonly>${esc(md)}</textarea><div class="hint">浏览器不让自动复制，请手动全选复制。</div>`);
+    }
+  } catch (e) { toast(e.message, true); }
+}
+
 window.brainView = brainView;
+window.brainUpgrade = brainUpgrade;
+window.brainCopyUpgrades = brainCopyUpgrades;
 window.brainSave = brainSave;
 window.brainSaveKey = brainSaveKey;
 window.brainClearKey = brainClearKey;

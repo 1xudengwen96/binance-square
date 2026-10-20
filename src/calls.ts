@@ -14,11 +14,18 @@ import { binance } from './collectors/binance.ts';
  *   faded    same side still pays, but under half — the cost of the position has largely gone
  *   flipped  the other side pays now (or the rate is zero)
  *   void     the contract no longer lists a rate, or the check is older than three days
+ *
+ * That is the original `funding_persists` rule, and it was the wrong question: funding rates
+ * revert by construction, so «still at least half a day later» held 3 times in 22 — and the
+ * posts quoted that tally. What a post actually says is «this side is paying», so calls
+ * registered from now on are `payer_persists`: held when the same side is still paying, flipped
+ * when it is not. Rows already judged keep the rule they were registered under.
  */
 
 export const CHECK_AFTER_MS = 24 * 3600_000;
 export const VOID_AFTER_MS = 72 * 3600_000;
 export const HOLD_FRACTION = 0.5;
+export const PAYER_PERSISTS = 'payer_persists';
 
 export interface CallInput {
   postId: number;
@@ -40,7 +47,7 @@ export function registerCall(store: Store, c: CallInput): number | null {
       `INSERT INTO column_calls (post_id, symbol, kind, reading, payer, rate_at, annualized_at, interval_hours, price_at, check_at)
        VALUES (?,?,?,?,?,?,?,?,?,?)`,
     )
-    .run(c.postId, c.symbol, 'funding_persists', c.reading, c.payer, c.rate, c.annualized, c.intervalHours, c.price, now + CHECK_AFTER_MS);
+    .run(c.postId, c.symbol, PAYER_PERSISTS, c.reading, c.payer, c.rate, c.annualized, c.intervalHours, c.price, now + CHECK_AFTER_MS);
   return Number(res.lastInsertRowid);
 }
 
@@ -50,6 +57,12 @@ export type Verdict = 'held' | 'faded' | 'flipped';
 export function ruling(rateAt: number, rateAfter: number): Verdict {
   if (!Number.isFinite(rateAfter) || rateAfter === 0 || Math.sign(rateAfter) !== Math.sign(rateAt)) return 'flipped';
   return Math.abs(rateAfter) >= Math.abs(rateAt) * HOLD_FRACTION ? 'held' : 'faded';
+}
+
+/** The ruling for a row, under the rule it was registered with. */
+export function rulingFor(kind: string, rateAt: number, rateAfter: number): Verdict {
+  const v = ruling(rateAt, rateAfter);
+  return kind === PAYER_PERSISTS && v === 'faded' ? 'held' : v;
 }
 
 export interface RateBook {
@@ -88,8 +101,8 @@ export async function judgeCalls(
   const now = opts.now ?? Date.now();
   const report: JudgeReport = { judged: 0, held: 0, faded: 0, flipped: 0, voided: 0 };
   const due = store.db
-    .prepare("SELECT id, symbol, rate_at, check_at FROM column_calls WHERE status = 'open' AND check_at <= ?")
-    .all(now) as { id: number; symbol: string; rate_at: number; check_at: number }[];
+    .prepare("SELECT id, symbol, kind, rate_at, check_at FROM column_calls WHERE status = 'open' AND check_at <= ?")
+    .all(now) as { id: number; symbol: string; kind: string; rate_at: number; check_at: number }[];
   if (!due.length) return report;
 
   let book: RateBook;
@@ -115,7 +128,7 @@ export async function judgeCalls(
       report.voided++;
       continue;
     }
-    const v = ruling(c.rate_at, now_.rate);
+    const v = rulingFor(c.kind, c.rate_at, now_.rate);
     upd.run(v === 'held' ? 'held' : 'failed', v, now_.rate, now_.price, now, c.id);
     report[v]++;
     report.judged++;
@@ -175,44 +188,47 @@ export function markRecapped(store: Store, callIds: number[], postId: number): v
 /**
  * One line that lets a post refer back to the record, so the column reads as something that has
  * been watching rather than something that fires fresh every time. Facts only: the coin's last
- * ruling if it has one, otherwise now and then the running tally. No cashtag and no first person;
- * every figure comes from a ledger row.
+ * ruling if it has one, otherwise nothing. No cashtag; every figure comes from a ledger row.
+ *
+ * It used to fall back to the running tally (「核对过 22 条，成立 3 条」) on a third of posts, which
+ * put the column's hit rate under every reading it made.
  */
-export function memoryLineFor(store: Store, symbol: string, seed: number, now = Date.now()): string {
+export function memoryLineFor(store: Store, symbol: string, _seed: number, now = Date.now()): string {
   const last = store.db
     .prepare(
       `SELECT payer, outcome, check_at FROM column_calls
        WHERE symbol = ? AND outcome IN ('held','faded','flipped') ORDER BY judged_at DESC LIMIT 1`,
     )
     .get(symbol.toUpperCase()) as { payer: '多头' | '空头'; outcome: Verdict; check_at: number } | undefined;
-  if (last) {
-    const days = Math.max(1, Math.round((now - (last.check_at - CHECK_AFTER_MS)) / 86_400_000));
-    const other = last.payer === '多头' ? '空头' : '多头';
-    const tail =
-      last.outcome === 'held'
-        ? `隔天仍是${last.payer}在付，当时的判断成立`
-        : last.outcome === 'faded'
-          ? `隔天费率只剩不到一半，按不成立记`
-          : `隔天已经换成${other}在付，按不成立记`;
-    return `上一次提到它是 ${days} 天前，当时${last.payer}在付；${tail}。`;
-  }
-  const t = tally(store);
-  if (t.total >= 3 && Math.abs(seed) % 3 === 0) {
-    return `这个栏目到目前核对过 ${t.total} 条判断，成立 ${t.held} 条。`;
-  }
-  return '';
+  if (!last) return '';
+  const days = Math.max(1, Math.round((now - (last.check_at - CHECK_AFTER_MS)) / 86_400_000));
+  const other = last.payer === '多头' ? '空头' : '多头';
+  const tail =
+    last.outcome === 'held'
+      ? `第二天还是${last.payer}在付`
+      : last.outcome === 'faded'
+        ? '第二天费率就降下来了'
+        : `第二天就换成${other}在付了`;
+  return `${days} 天前也聊过它，那时就是${last.payer}在付；${tail}。`;
 }
 
-const pct = (r: number): string => `${r >= 0 ? '' : '-'}${Math.abs(r * 100).toFixed(3)}%`;
+/** A rate as a bare magnitude, the way the column posts say it; who pays is in the words. */
+const hr = (r: number): string => {
+  const p = Math.abs(r * 100);
+  return `${p >= 0.1 ? p.toFixed(2) : p.toFixed(3)}%`;
+};
 
-/** One line per call. Words are fixed; every number comes from the row. No first person. */
+/** One line per coin. Words are fixed; every number comes from the row. */
 export function recapLineFor(c: Unrecapped): string {
   const other = c.payer === '多头' ? '空头' : '多头';
+  const shrank = Math.abs(c.rate_after) < Math.abs(c.rate_at) * HOLD_FRACTION;
   const tail =
-    c.outcome === 'held'
-      ? `仍是${c.payer}在付，费率 ${pct(c.rate_after)}，成立`
-      : c.outcome === 'faded'
-        ? `还是${c.payer}在付，但费率只剩 ${pct(c.rate_after)}，不足一半，按不成立记`
-        : `已经变成${other}在付，费率 ${pct(c.rate_after)}，不成立`;
-  return `$${c.symbol}：当时${c.payer}在付，费率 ${pct(c.rate_at)}；隔天${tail}。`;
+    c.rate_after === 0
+      ? '第二天费率就回到了零，没人再付'
+      : c.outcome === 'flipped'
+        ? `第二天就换成${other}在付了，${hr(c.rate_after)}，风向变了`
+        : shrank
+          ? `第二天还是${c.payer}在付，不过只剩 ${hr(c.rate_after)}，压力基本散了`
+          : `第二天还是${c.payer}在付，${hr(c.rate_after)}，没怎么松`;
+  return `$${c.symbol}：当时${c.payer}在付 ${hr(c.rate_at)}，${tail}。`;
 }

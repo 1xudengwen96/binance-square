@@ -68,20 +68,52 @@ test('今日反常 renders in all three layouts, for both funding and open-inter
   const funding = { cashtag: '$CKB', symbol: 'CKB', payer: '空头', chg24h: 46.26, funding: -0.00131, annualized: -143, oiChangePct: 46.2, quoteVolume24h: 5e7 };
   const oi = { cashtag: '$WAL', symbol: 'WAL', payer: '', chg24h: 5, oiChangePct: -12, quoteVolume24h: 5e7 };
   const tpl = shapeTemplates.find(t => t.id === 'column.anomaly')!;
-  const shapes = new Set<string>();
+  const openings = new Set<string>();
   for (const f of [funding, oi]) {
     for (const s of SEEDS) {
-      const ctx = shapeContext('anomaly', { ...f }, { watch: '往后看哪个先让步', close: '你怎么读这组数？' }, s);
+      const ctx = shapeContext('anomaly', { ...f }, { watch: '往后看哪个先让步', close: '留言说说你的读法' }, s);
       assert.ok(ctx, 'anomaly applies');
       const r = renderTemplate(tpl, ctx!, { seed: s, bank: wordBank });
       assert.ok(r.ok, r.ok ? '' : r.reason);
       if (!r.ok) continue;
       assert.ok(auditAgainstFacts(r.text, r.facts).ok, r.text);
-      assert.match(r.text, /^【今日反常】/);
-      shapes.add(/^【今日反常】\$/.test(r.text) ? 'coin-first' : /^【今日反常】[^\n]*：\$/.test(r.text) ? 'headline-colon' : 'figures-or-other');
+      // No bracket heading, no +/− figure dump: the move is said in words, the numbers rounded.
+      assert.doesNotMatch(r.text, /^【/);
+      assert.doesNotMatch(r.text, /（空头付）|\+46\.26%|-0\.131%/);
+      assert.match(r.text, /涨了 46%|涨了 5%/);
+      assert.match(r.text, /留言说说你的读法。$/, 'a close without punctuation gets one');
+      openings.add(r.text.slice(0, 4));
     }
   }
-  assert.ok(shapes.size >= 2, `layouts seen: ${[...shapes]}`);
+  assert.ok(openings.size >= 3, `openings seen: ${[...openings]}`);
+});
+
+test('盘中一问 says the split in words and rotates its skeleton', () => {
+  const f = { cashtag: '$RSR', symbol: 'RSR', payer: '空头', chg24h: 2.72, funding: -0.00268, annualized: -290, longRatio: 1.31, quoteVolume24h: 5e7 };
+  const tpl = shapeTemplates.find(t => t.id === 'column.question')!;
+  const firstLines = new Set<string>();
+  for (const s of SEEDS) {
+    const ctx = shapeContext('question', { ...f }, { ask: '你更信价格，还是更信费率？' }, s);
+    assert.ok(ctx);
+    const r = renderTemplate(tpl, ctx!, { seed: s, bank: wordBank });
+    assert.ok(r.ok, r.ok ? '' : r.reason);
+    if (!r.ok) continue;
+    assert.ok(auditAgainstFacts(r.text, r.facts).ok, r.text);
+    assert.match(r.text, /涨了 2\.7%/);
+    assert.match(r.text, /0\.27%/);
+    assert.match(r.text, /做多的账户略多/);
+    firstLines.add(r.text.split('\n')[0]!.replace(/\$RSR.*/, ''));
+  }
+  assert.ok(firstLines.size >= 3, `skeletons: ${[...firstLines]}`);
+});
+
+test('first person may describe watching, never a position', () => {
+  for (const ok of ['我更在意费率，你呢？', '我会先盯下一次结算的费率', '评论区聊聊，我在看大家怎么想。']) {
+    assert.deepEqual(isSafeVariant(ok), { ok: true }, ok);
+  }
+  for (const bad of ['我已经上车了', '我的仓位还在', '我更在意我的空单', '我刚开了多单', '我买了一点']) {
+    assert.equal(isSafeVariant(bad).ok, false, bad);
+  }
 });
 
 test('the memory line cites only ledger rows, and says nothing when there is nothing to cite', async () => {
@@ -98,9 +130,9 @@ test('the memory line cites only ledger rows, and says nothing when there is not
     const rep = await judgeCalls(store, { now: t0 + DAY + 1000, book });
     assert.equal(rep.held, 1);
     const line = memoryLineFor(store, 'ERA', 1, t0 + DAY + 2000);
-    assert.match(line, /上一次提到它是 \d+ 天前，当时空头在付；隔天仍是空头在付，当时的判断成立。/);
+    assert.match(line, /^\d+ 天前也聊过它，那时就是空头在付；第二天还是空头在付。$/);
     assert.equal(memoryLineFor(store, 'OTHER', 1), '', 'a coin with no ruling gets no personal history');
-    assert.doesNotMatch(line, /我|\$/);
+    assert.doesNotMatch(line, /我|\$|成立/);
   } finally {
     store.close();
     rmSync(dir, { recursive: true, force: true });

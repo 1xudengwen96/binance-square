@@ -8,7 +8,7 @@ import type { Context, Fact, FieldValue } from './engine/types.ts';
 import { COLUMN_NAME } from './content/column.ts';
 import { DEFAULT_SETTINGS } from './config.ts';
 import {
-  activeVariants, pickVariant, seedVariants, shapeContext, shapeTemplates, shapesFor, type ColumnKind,
+  activeVariants, angleOf, COLUMN_KINDS, pickVariant, seedVariants, shapeContext, shapeTemplates, shapesFor, type ColumnAngle, type ColumnKind,
 } from './content/columns.ts';
 import { renderTemplate } from './engine/render.ts';
 import { auditAgainstFacts } from './engine/verify.ts';
@@ -19,13 +19,13 @@ import { expiresAt } from './lifecycle.ts';
 import { nextSlotFor, settingsForAccount } from './schedule.ts';
 import { personaSeed } from './matrix.ts';
 import { applyPolish, carriesDisclaimer, withHashtags } from './pipeline.ts';
-import { buildChartFor } from './chart/forSymbol.ts';
+import { buildChartFor, cardAnnotation } from './chart/forSymbol.ts';
 import { toContext } from './material/types.ts';
 import { enrichWithMarketContext } from './material/enrich.ts';
 import { scoreAll } from './rank/score.ts';
-import { planArms, recordArms } from './rank/experiments.ts';
+import { planArms, recordArms, type ArmPlan } from './rank/experiments.ts';
 import { playbook } from './rank/playbook.ts';
-import { markRecapped, memoryLineFor, recapLineFor, registerCall, tally, unrecapped } from './calls.ts';
+import { markRecapped, memoryLineFor, recapLineFor, registerCall, unrecapped } from './calls.ts';
 import { currentTarget } from './rank/gates.ts';
 
 /**
@@ -56,6 +56,11 @@ export interface ColumnReport {
 
 /** The recap needs this many rulings before it is worth a post. */
 const RECAP_MIN_CALLS = 2;
+/**
+ * Paying-side readings per account per Beijing day. It is the column's strongest story and it was
+ * nine of twelve posts in a row — the same sentence with a different ticker is what reads as a bot.
+ */
+const PAYER_ANGLE_PER_DAY = 1;
 
 // 定稿 §2 停用「费率账独立帖（降为素材）」：可发布 kind 白名单就是 3+1 里的三个短帖形态。
 // ledger 模板与历史数据一律保留不动（不删行、不改历史帖），只是不再进可发布集合。
@@ -118,8 +123,8 @@ export async function generateColumn(
   const cooldownHours = settings.columnCoinCooldownHours ?? DEFAULT_SETTINGS.columnCoinCooldownHours;
   if (!Number.isFinite(cooldownHours)) throw new Error(`columnCoinCooldownHours 读到了非数值：${String(cooldownHours)}`);
   const coinCooldownMs = Math.max(1, cooldownHours) * 3600_000;
-  const funnel: { pool: number; noSymbol: number; claimed: number; cooldown: number; usable: number; counted: number; q: number; a: number; noneFit?: number } =
-    { pool: pool.length, noSymbol: 0, claimed: 0, cooldown: 0, usable: 0, counted: 0, q: 0, a: 0 };
+  const funnel: { pool: number; noSymbol: number; claimed: number; cooldown: number; usable: number; counted: number; q: number; a: number; angleCapped: number; noneFit?: number } =
+    { pool: pool.length, noSymbol: 0, claimed: 0, cooldown: 0, usable: 0, counted: 0, q: 0, a: 0, angleCapped: 0 };
   const usable = pool.filter(m => {
     if (!m.symbol) { funnel.noSymbol++; return false; }
     if (claimedByOther(m.symbol)) { funnel.claimed++; return false; }
@@ -132,13 +137,25 @@ export async function generateColumn(
   });
 
   // Candidate (material, kind) pairs. 费率账 keeps its original, stricter rule so it stays what it
-  // was; the two new shapes ask different questions of the same row.
+  // was; the two new shapes ask different questions of the same row. Once today's paying-side
+  // reading is spent, that angle drops out and the lane shows another one or stays quiet — a
+  // quiet column hands the slot to the mixed lane, which is the rotation across categories.
+  const payerCapped = store.columnAngleSince(account.id, 'payer', beijingDayStart(now)) >= PAYER_ANGLE_PER_DAY;
   const pairs: { material: Material; kind: Kind }[] = [];
-  for (const m of usable) for (const k of shapesFor(m)) pairs.push({ material: m, kind: k });
+  for (const m of usable) {
+    for (const k of shapesFor(m)) {
+      if (payerCapped && angleOf(k, m.facts) === 'payer') { funnel.angleCapped++; continue; }
+      pairs.push({ material: m, kind: k });
+    }
+  }
 
   // The recap is not about any coin: it exists when enough rulings have accumulated, and at most
-  // once a day, and each ruling is recapped once.
-  const owed = unrecapped(store, 3);
+  // once a day, and each ruling is recapped once. One line per coin — three calls on the same coin
+  // used to print the same sentence three times — and every call on a recapped coin is closed with it.
+  const owedRaw = unrecapped(store, 12);
+  const owed: typeof owedRaw = [];
+  for (const c of owedRaw) if (owed.length < 3 && !owed.some(o => o.symbol === c.symbol)) owed.push(c);
+  const owedIds = owedRaw.filter(c => owed.some(o => o.symbol === c.symbol)).map(c => c.id);
   const recapIn20h = store.columnKindSince(account.id, 'column.recap', now - 20 * 3600_000);
   const haveRecap = owed.length >= RECAP_MIN_CALLS && recapIn20h === 0;
 
@@ -166,8 +183,15 @@ export async function generateColumn(
   const verdicts = scoreAll(store, { writeMemory: false, target: currentTarget(store, settings, now) });
   const available: string[] = [...new Set(pairs.map(p => p.kind))];
   if (haveRecap) available.push('recap');
+  // The draw may only spend a sample on a shape this round can actually write. A recap that is
+  // drawn and then falls back is not a recap sample, and repeatedly drawing it is how the recap
+  // arm stayed three posts behind while its comparison never filled up.
+  const drawable = available.filter(k => k === 'question' || k === 'anomaly' || k === 'recap');
   // seed 跟着发帖槽走：同一槽位上的抽签（含臂分配）是同一决定，不同槽位才是不同的抽签。
-  const arms = planArms({ seed: hashString(`${account.id}:${Math.floor(slot.at / 3_600_000)}:col`), verdicts, only: settings.activeExperiments });
+  const arms = planArms({
+    seed: hashString(`${account.id}:${Math.floor(slot.at / 3_600_000)}:col`),
+    verdicts, only: settings.activeExperiments, allow: { h_column: drawable },
+  });
   const kind = pickAvailable(available, arms.h_column ?? null, hashString(`${slot.at}:${account.id}`));
   funnel.counted = pairs.length;
   if (kind === null) {
@@ -185,13 +209,13 @@ export async function generateColumn(
   let tplId = '';
   let usedCalls: number[] = [];
   let variantIds: number[] = [];
+  let angle: ColumnAngle = 'recap';
 
   if (kind === 'recap') {
     const lines = owed.map(recapLineFor).join('\n');
-    const t = tally(store);
     const close = pickVariant(activeVariants(store, 'recap', 'close'), hashString(`${now}:recap`));
     const tpl = shapeTemplates.find(x => x.id === 'column.recap')!;
-    const ctx: Context = { recapHeld: t.held, recapTotal: t.total, recapLine: lines, variantClose: close?.text ?? '' };
+    const ctx: Context = { recapLine: lines, variantClose: close?.text ?? '' };
     const res = renderTemplate(tpl, ctx, { seed: hashString(`${account.id}:${now}:recap`), bank: wordBank });
     if (!res.ok) {
       store.log('column_funnel', { ...funnel, outcome: 'dropped', drop: 'render_refused', kind, slot_at: slot.at, why: res.reason });
@@ -204,7 +228,7 @@ export async function generateColumn(
     // 表面登记进 facts，$ 币种没有；auditAgainstFacts 按 inventedSymbols 拒稿，而旧消息只打印
     // inventedNumbers，看起来像空拒绝。把每行币种补登为 symbol fact，审计才看得见它们是事实。
     for (const c of owed) facts.push({ surface: `$${c.symbol}`, value: null, field: 'recap.symbol', kind: 'symbol' });
-    usedCalls = owed.map(o => o.id);
+    usedCalls = owedIds;
     variantIds = close ? [close.id] : [];
   } else {
     const ofKind = pairs.filter(p => p.kind === kind);
@@ -222,26 +246,19 @@ export async function generateColumn(
       return report;
     }
     const seed = hashString(personaSeed(material.id, account.id, slot.at));
-    const base = toContext(material);
     {
       // 旧 ledger 渲染分支已随停用形态摘除（模板与历史数据留在 content/column.ts，不删）。
       const ask = pickVariant(activeVariants(store, 'question', 'ask'), seed);
       const watch = pickVariant(activeVariants(store, 'anomaly', 'watch'), seed);
       const close = pickVariant(activeVariants(store, 'anomaly', 'close'), seed >>> 3);
-      const ctx = shapeContext(kind, { ...base, memoryLine: kind === 'anomaly' ? memoryLineFor(store, material.symbol!, seed, now) : '' }, { ask: ask?.text, watch: watch?.text, close: close?.text }, seed);
-      if (!ctx) {
-        store.log('column_funnel', { ...funnel, outcome: 'dropped', drop: 'no_material_fit', kind, slot_at: slot.at, symbol: material.symbol, why: '没有可读的组合' });
-        report.skipped.push(`${material.symbol}: 没有可读的组合`);
-        return report;
-      }
-      const tpl = shapeTemplates.find(x => x.id === `column.${kind}`)!;
-      const res = renderTemplate(tpl, ctx, { seed, bank: wordBank });
+      const res = renderShape(store, kind, material, seed, { ask: ask?.text, watch: watch?.text, close: close?.text }, now);
       if (!res.ok) {
-        store.log('column_funnel', { ...funnel, outcome: 'dropped', drop: 'render_refused', kind, slot_at: slot.at, symbol: material.symbol, why: res.reason });
-        report.skipped.push(`${material.symbol}: ${res.reason}`);
+        store.log('column_funnel', { ...funnel, outcome: 'dropped', drop: res.drop, kind, slot_at: slot.at, symbol: material.symbol, why: res.why });
+        report.skipped.push(`${material.symbol}: ${res.why}`);
         return report;
       }
-      text = res.text; facts = res.facts; trace = { ...res.trace }; tplId = tpl.id;
+      text = res.text; facts = res.facts; trace = res.trace; tplId = `column.${kind}`;
+      angle = angleOf(kind, material.facts);
       variantIds = kind === 'question' ? (ask ? [ask.id] : []) : [watch?.id, close?.id].filter((x): x is number => typeof x === 'number');
     }
   }
@@ -266,14 +283,14 @@ export async function generateColumn(
   }
 
   // Half the column is handed to the rewriter, as the h_column_polish arm, so «does the AI make it
-  // read less mechanical» is answered by views rather than by taste. The heading is the column's
-  // identity and must survive; a rewrite that drops it, or fails the fact audit, is discarded and
-  // the post is recorded under the arm it actually ran.
+  // read less mechanical» is answered by views rather than by taste. The rewriter runs in voice mode:
+  // it may re-break the lines and speak as someone watching, under the same number and position
+  // checks. A rewrite that fails them is discarded and the post is recorded under the arm it ran.
   let polishArm: 'raw' | 'polished' | null = arms.h_column_polish === 'polished' || arms.h_column_polish === 'raw' ? arms.h_column_polish : null;
   let polishNote: string | undefined;
   if (polishArm === 'polished' && !opts.dryRun) {
     const p = await applyPolish(store, eff, text, facts, account.persona_note ?? '', {
-      category: material?.category, subType: material?.subType ?? null, symbol: material?.symbol ?? null, verdicts,
+      category: material?.category, subType: material?.subType ?? null, symbol: material?.symbol ?? null, verdicts, voice: true,
     });
     const heading = headingOf(text);
     if (p.text !== text && (!heading || p.text.trimStart().startsWith(heading))) text = p.text;
@@ -281,9 +298,8 @@ export async function generateColumn(
     polishNote ??= p.note;
   }
 
-  // One disclaimer, at the bottom, once.
-  if (eff.appendDisclaimer && !carriesDisclaimer(text)) text = `${text}\n${wordBank['disclaimer.soft']}`;
-  if (material && eff.appendHashtags) text = withHashtags(text, material, 1);
+  // Coin tag plus topic tags, then one disclaimer at the bottom, worded differently post to post.
+  text = closeColumnText(eff, text, { material, recapSymbols: owed.map(c => c.symbol), accountId: account.id, slotAt: slot.at });
 
   // The chart goes through the same playbook as every other post, so the h_chart arm decides it
   // and the comparison is not contaminated by this lane always attaching one.
@@ -296,8 +312,14 @@ export async function generateColumn(
       const built = await buildChartFor({
         symbol: material.symbol, chg24h: pick('chg24h'), volMultiple: pick('volMultiple'),
         funding: pick('funding'), oiChangePct: pick('oiChangePct'), longRatio: pick('longRatio'),
+      }, undefined, undefined, {
+        column: COLUMN_KINDS[kind].label,
+        annotation: cardAnnotation(text),
+        watermark: `@ ${account.label}`,
       });
-      if (built) images = [built.path];
+      // Card first, candles second: the cover is what the feed shrinks, the bars are what a
+      // reader opens the post to check the sentence against.
+      if (built) images = built.card ? [built.card, built.path] : [built.path];
     } catch (err) {
       report.skipped.push(`${material.symbol}: 图表失败 ${String(err).slice(0, 60)}`);
     }
@@ -315,7 +337,7 @@ export async function generateColumn(
     status: eff.autoPublish ? 'approved' : 'draft',
     scheduledAt: slot.at,
     facts,
-    trace: { ...trace, lane: 'column', kind, variants: variantIds, account: account.label, ...(polishNote ? { polish: polishNote } : {}) },
+    trace: { ...trace, lane: 'column', kind, angle, variants: variantIds, account: account.label, ...(polishNote ? { polish: polishNote } : {}) },
     images,
     // P0-2: bound at the write, not in a follow-up update; label_id defaults to the primary
     // label inside addPost and refuses the insert if none is active. Column posts spend the
@@ -325,7 +347,8 @@ export async function generateColumn(
   store.recordLaneLease(account.id, 'short', beijingDayStart(Date.now()), slot.at, 'matrix');
   // The arm on record is the shape that actually ran, not the one drawn: a draw that had to fall
   // back must not be counted under an arm the post did not carry.
-  recordArms(store, id, { ...arms, h_column: kind, ...(polishArm ? { h_column_polish: polishArm } : {}) });
+  const drawn: ArmPlan = { ...arms, h_column: kind, ...(polishArm ? { h_column_polish: polishArm } : {}) };
+  recordArms(store, id, images.length === 0 && drawn.h_chart === 'chart' ? { ...drawn, h_chart: 'text' } : drawn);
 
   if (material) {
     store.markMaterialUsed(material.id);
@@ -355,6 +378,50 @@ export async function generateColumn(
 /** The fixed 【栏目】 heading a column post opens with, if any. */
 export function headingOf(text: string): string | null {
   return /^\s*(【[^】]{1,8}】)/.exec(text)?.[1] ?? null;
+}
+
+/**
+ * A question or anomaly shape rendered against one material with its phrases already chosen.
+ * Shared by drafting and by the pre-publish refresh, so a post re-rendered at its minute reads
+ * exactly as it would have if it had been drafted then.
+ */
+export function renderShape(
+  store: Store,
+  kind: 'question' | 'anomaly',
+  material: Material,
+  seed: number,
+  picks: { ask?: string; watch?: string; close?: string },
+  now = Date.now(),
+): { ok: true; text: string; facts: Fact[]; trace: Record<string, unknown> } | { ok: false; why: string; drop: 'no_material_fit' | 'render_refused' } {
+  const memoryLine = kind === 'anomaly' ? memoryLineFor(store, material.symbol!, seed, now) : '';
+  const ctx = shapeContext(kind, { ...toContext(material), memoryLine }, picks, seed);
+  if (!ctx) return { ok: false, why: '没有可读的组合', drop: 'no_material_fit' };
+  const tpl = shapeTemplates.find(x => x.id === `column.${kind}`)!;
+  const res = renderTemplate(tpl, ctx, { seed, bank: wordBank });
+  if (!res.ok) return { ok: false, why: res.reason ?? '渲染被拒', drop: 'render_refused' };
+  return { ok: true, text: res.text, facts: res.facts, trace: { ...res.trace } };
+}
+
+/**
+ * The last two things a column post gets: tags (coin plus topic, because the topic pages are where
+ * a small account actually gets placed; the recap names several coins and tags them itself), and
+ * one compliance line at the bottom, rotated so it is not the same sentence under every post.
+ */
+export function closeColumnText(
+  eff: Settings,
+  text: string,
+  o: { material: Material | null; recapSymbols?: string[]; accountId: number; slotAt: number },
+): string {
+  let out = text;
+  if (!o.material && eff.appendHashtags && o.recapSymbols?.length) {
+    out = `${out}\n\n${[...o.recapSymbols.map(s => `#${s}`), '#资金费率'].join(' ')}`;
+  }
+  if (eff.appendDisclaimer && !carriesDisclaimer(out)) {
+    const lines = wordBank['disclaimer.column']!.slice(1, -1).split('|');
+    out = `${out}\n${lines[Math.abs(hashString(`${o.accountId}:${o.slotAt}:disclaimer`)) % lines.length] ?? wordBank['disclaimer.soft']}`;
+  }
+  if (o.material && eff.appendHashtags) out = withHashtags(out, o.material, 3);
+  return out;
 }
 
 /**

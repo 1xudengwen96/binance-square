@@ -55,6 +55,37 @@ function isTempRejection(err: unknown): boolean {
   return err instanceof LlmError && err.status === 400 && /non-default temperature/i.test(err.message);
 }
 
+/**
+ * Relay hiccups worth exactly one more try: overloaded or out of upstream accounts (429/502/503/504),
+ * an HTML error page served with a 200, a dropped connection. Measured on the live ledger: 15 of 25
+ * failed brain calls were one of these. A timeout is not retried — the wait has already been paid.
+ */
+function isTransient(err: unknown): boolean {
+  if (!(err instanceof LlmError)) return false;
+  if (err.status !== undefined) return [429, 502, 503, 504].includes(err.status);
+  return /返回的不是 JSON|fetch failed|ECONNRESET|socket hang up/i.test(err.message);
+}
+
+const RETRY_DELAY_MS = 1500;
+
+async function withRetry<T>(fn: () => Promise<T>): Promise<T> {
+  try {
+    return await fn();
+  } catch (err) {
+    if (!isTransient(err)) throw err;
+    await new Promise(r => setTimeout(r, RETRY_DELAY_MS));
+    return fn();
+  }
+}
+
+/**
+ * A completion's wall time grows with its length. The weekly review asks for 2,500 tokens and
+ * timed out at a flat 30 s on every attempt, so the budget scales with what was asked for.
+ */
+export function chatTimeoutMs(maxTokens: number | undefined): number {
+  return 30_000 + Math.min(4096, Math.max(0, maxTokens ?? 1024)) * 40;
+}
+
 function join(base: string, path: string): string {
   const clean = base.trim().replace(/\/+$/, '');
   if (!/^https?:\/\//i.test(clean)) throw new LlmError(`baseUrl 必须是 http(s) 地址，收到 "${base}"`);
@@ -131,6 +162,7 @@ function extractText(cfg: LlmConfig, payload: unknown): string {
 export async function chat(cfg: LlmConfig, messages: ChatMessage[]): Promise<string> {
   if (!cfg.apiKey) throw new LlmError('还没有填写 API Key');
   if (!cfg.model) throw new LlmError('还没有选择模型');
+  const timeout = chatTimeoutMs(cfg.maxTokens);
 
   if (cfg.provider === 'anthropic') {
     const system = messages.filter(m => m.role === 'system').map(m => m.content).join('\n\n');
@@ -142,7 +174,7 @@ export async function chat(cfg: LlmConfig, messages: ChatMessage[]): Promise<str
       messages: messages.filter(m => m.role !== 'system').map(m => ({ role: m.role, content: m.content })),
     });
     const post = (body: unknown) =>
-      callJson<unknown>(join(cfg.baseUrl, 'messages'), { method: 'POST', headers: authHeaders(cfg), body: JSON.stringify(body) });
+      withRetry(() => callJson<unknown>(join(cfg.baseUrl, 'messages'), { method: 'POST', headers: authHeaders(cfg), body: JSON.stringify(body) }, timeout));
     let payload: unknown;
     try {
       payload = await post(mkBody(!tempUnsupported.has(cfg.model)));
@@ -159,17 +191,28 @@ export async function chat(cfg: LlmConfig, messages: ChatMessage[]): Promise<str
     return extractText(cfg, payload);
   }
 
-  const body = {
+  // OpenAI-shaped relays front the same models, so the same temperature refusal shows up here
+  // (claude-sonnet-5-5 behind a /chat/completions gateway): same cure, same per-model memo.
+  const mkBody = (withTemperature: boolean) => ({
     model: cfg.model,
     max_tokens: cfg.maxTokens ?? 1024,
-    temperature: cfg.temperature ?? 0.7,
+    ...(withTemperature ? { temperature: cfg.temperature ?? 0.7 } : {}),
     messages: messages.map(m => ({ role: m.role, content: m.content })),
-  };
-  const payload = await callJson<unknown>(join(cfg.baseUrl, 'chat/completions'), {
-    method: 'POST',
-    headers: authHeaders(cfg),
-    body: JSON.stringify(body),
   });
+  const post = (body: unknown) =>
+    withRetry(() => callJson<unknown>(join(cfg.baseUrl, 'chat/completions'), {
+      method: 'POST',
+      headers: authHeaders(cfg),
+      body: JSON.stringify(body),
+    }, timeout));
+  let payload: unknown;
+  try {
+    payload = await post(mkBody(!tempUnsupported.has(cfg.model)));
+  } catch (err) {
+    if (tempUnsupported.has(cfg.model) || !isTempRejection(err)) throw err;
+    tempUnsupported.add(cfg.model);
+    payload = await post(mkBody(false));
+  }
   return extractText(cfg, payload);
 }
 

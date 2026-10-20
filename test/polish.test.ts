@@ -125,6 +125,22 @@ test('polish falls back when the provider call fails', async () => {
   }
 });
 
+test('voice mode may re-break the lines, but not invent a trade the account never made', () => {
+  const facts: Fact[] = [
+    { surface: '22', value: 22, field: 'moveAbs', kind: 'number' },
+    { surface: '0.35', value: 0.35, field: 'rateAbs', kind: 'number' },
+    { surface: '$GTC', value: null, field: 'cashtag', kind: 'symbol' },
+  ];
+  const src = '$GTC 价格在涨，空头却还在交钱。\n一天涨了 22%，空头在付 0.35% 的费率。\n谁先让步，后面的走势就偏向谁。留言说说你的读法。';
+  const merged = '$GTC 一天涨了 22%，可付费的还是空头，0.35% 一次。我更在意谁先让步，留言说说你的读法。';
+  assert.equal(polishAcceptable(src, merged, facts, 'strict').ok, false, 'strict keeps the line skeleton');
+  assert.equal(polishAcceptable(src, merged, facts, 'voice').ok, true, 'voice may merge lines');
+  const fake = '$GTC 一天涨了 22%，空头还在付 0.35%。我刚开了空单，留言说说你的读法。';
+  const v = polishAcceptable(src, fake, facts, 'voice');
+  assert.equal(v.ok, false);
+  assert.match(v.reason ?? '', /交易动作或持仓/);
+});
+
 test('facts ledger is what makes the gate work, not string matching', () => {
   const facts: Fact[] = [
     { surface: '83877.1', value: 83877.1, field: 'price', kind: 'number' },

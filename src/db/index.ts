@@ -582,6 +582,30 @@ CREATE TABLE IF NOT EXISTS column_variants (
   off_at     INTEGER,
   UNIQUE (kind, slot, text)
 );
+
+/*
+ * Things the brain found that need a code change — which it cannot make. The brain's permissions stop
+ * at the gates (registry, knob whitelist, variants); anything past them used to be a sentence in a
+ * report nobody re-read. Here it becomes a row the operator can pick up, mark done or refuse, and
+ * the next snapshot carries the row back, so the brain neither re-files a solved problem nor keeps
+ * asking for something the operator already said no to.
+ */
+CREATE TABLE IF NOT EXISTS upgrade_requests (
+  id           INTEGER PRIMARY KEY AUTOINCREMENT,
+  key          TEXT NOT NULL UNIQUE,      -- normalised title, the dedupe identity
+  area         TEXT NOT NULL,             -- data | experiment | content | publish | panel | other
+  title        TEXT NOT NULL,
+  why          TEXT NOT NULL,             -- the latest evidence the brain gave
+  source       TEXT NOT NULL,             -- weekly | sentinel | reflect | operator
+  report_id    INTEGER,
+  status       TEXT NOT NULL DEFAULT 'open',   -- open | doing | done | wontfix
+  times        INTEGER NOT NULL DEFAULT 1,     -- how many times it was raised
+  created_at   INTEGER NOT NULL,
+  last_seen_at INTEGER NOT NULL,
+  resolved_at  INTEGER,
+  resolution   TEXT
+);
+CREATE INDEX IF NOT EXISTS upgrade_requests_status ON upgrade_requests(status, last_seen_at DESC);
 `;
 
 export class Store {
@@ -1857,6 +1881,25 @@ export class Store {
     ).n;
   }
 
+  /**
+   * Column posts on one angle (see `angleOf`). Anomaly posts written before the angle was recorded
+   * were all of the paying-side kind, so they count as `payer`.
+   */
+  columnAngleSince(accountId: number, angle: string, sinceMs: number): number {
+    return (
+      this.db
+        .prepare(
+          `SELECT COUNT(*) AS n FROM posts
+           WHERE account_id = @a AND template_id LIKE 'column.%'
+             AND status IN ('draft','approved','published','uncertain')
+             AND COALESCE(published_at, created_at) >= @s
+             AND (json_extract(trace_json, '$.angle') = @g
+                  OR (@g = 'payer' AND template_id = 'column.anomaly' AND json_extract(trace_json, '$.angle') IS NULL))`,
+        )
+        .get({ a: accountId, g: angle, s: sinceMs }) as { n: number }
+    ).n;
+  }
+
   recentCoinSignal(accountId: number | null, symbol: string, category: string, sinceMs: number): number {
     const scope = accountId === null ? 'p.account_id IS NULL' : 'p.account_id = @a';
     return (
@@ -1975,7 +2018,8 @@ export interface PlatformFlags {
 export interface StatSample {
   views: number;
   likes: number;
-  comments: number;
+  /** NULL = the read route did not return commentCount. «读不到» must not be stored as 0. */
+  comments: number | null;
   shares?: number | null;
   reactions?: number | null;
   flags?: PlatformFlags | null;

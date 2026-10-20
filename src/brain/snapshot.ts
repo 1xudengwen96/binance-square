@@ -1,11 +1,12 @@
 import type { Store } from '../db/index.ts';
 import type { Settings } from '../config.ts';
 import { breaker, currentTarget, evaluateBreaker, gateReport, GATE_LINES, type BreakerStatus, type GateReport } from '../rank/gates.ts';
-import { scoreAll, type Verdict } from '../rank/score.ts';
+import { scoreAll, heatProfile, MATURITY_FLOOR_MS, type Verdict } from '../rank/score.ts';
 import { changeLedger, liveKnobs, currentKnob } from '../rank/params.ts';
 import { settingsFrom } from '../schedule.ts';
 import { boardComposition, type BoardComposition } from '../stats/benchmarks.ts';
 import { tally, type CallTally } from '../calls.ts';
+import { upgradesForSnapshot } from './upgrades.ts';
 
 /**
  * Everything the brain is allowed to know, in one fixed shape.
@@ -34,6 +35,8 @@ export interface WindowStats {
 export interface ColumnStats {
   kind: string;
   posts: number;
+  /** Published, a day old and read at 24 hours — the same rows an experiment arm counts. */
+  matured: number;
   medianViews: number | null;
   commentsPer1k: number | null;
 }
@@ -51,6 +54,8 @@ export interface BrainSnapshot {
   hypotheses: {
     id: string; mode: string; metric: string; status: string; claim: string;
     arms: { arm: string; n: number; median: number | null }[]; missing: number; active: boolean;
+    /** The same comparison inside (category × heat band) strata; `agree` of `strata` went the same way. */
+    stratified: { strata: number; agree: number; winner: string | null; rel: number | null; detail: Verdict['stratified']['detail'] };
   }[];
   paramChanges: { key: string; from: number; to: number; status: string; reason: string; rejectReason: string | null }[];
   knobs: { key: string; label: string; current: number | null; judgedBy: string }[];
@@ -58,6 +63,12 @@ export interface BrainSnapshot {
   benchmark: { zh: BoardComposition; poolZh: number; poolOther: number };
   calls: CallTally;
   alerts: { code: string; detail: string; at: number }[];
+  /** What the brain already filed as needing a code change, and what the operator did with it. */
+  upgrades: ReturnType<typeof upgradesForSnapshot>;
+  /** How much the coin's heat and the account move views on their own — the size of the confound. */
+  heat: ReturnType<typeof heatProfile>;
+  /** What each count above counts, so two numbers that differ by design are not read as a contradiction. */
+  definitions: string[];
   /** Plain statements about what the brain is NOT being shown, so it does not infer from absence. */
   unknowns: string[];
 }
@@ -95,23 +106,32 @@ function postRows(store: Store, since: number): Row[] {
 }
 
 const reading = (r: Row): number | null => r.v24h ?? r.views;
+/** The verdicts' rule: a day old and read at 24 hours. Anything looser and two tables disagree. */
+const matured = (r: Row, now: number): boolean => r.v24h != null && now - r.published_at >= MATURITY_FLOOR_MS;
 
 function windowStats(rows: Row[], days: number, now: number): WindowStats {
   const inWin = rows.filter(r => r.published_at >= now - days * DAY);
   const measured = inWin.filter(r => reading(r) != null);
   const views = measured.reduce((s, r) => s + (reading(r) ?? 0), 0);
   const sum = (f: (r: Row) => number | null): number => measured.reduce((s, r) => s + (f(r) ?? 0), 0);
+  // A null comment counter is «not read», not «zero comments»: pooling it as zero is how two weeks
+  // of missing data read as a comment rate of 0 and got filed as a finding of its own. The rate is
+  // over the rows that actually carried a reading; no reading at all means null, not 0.
+  const withComments = measured.filter(r => r.comments != null);
+  const commentViews = withComments.reduce((s, r) => s + (reading(r) ?? 0), 0);
   return {
     days,
     posts: inWin.length,
     measured: measured.length,
     medianViews: median(measured.map(r => reading(r)!)),
-    commentsPer1k: views > 0 ? Number(((sum(r => r.comments) / views) * 1000).toFixed(2)) : null,
+    commentsPer1k: commentViews > 0
+      ? Number(((withComments.reduce((s, r) => s + (r.comments ?? 0), 0) / commentViews) * 1000).toFixed(2))
+      : null,
     likesPer1k: views > 0 ? Number(((sum(r => r.likes) / views) * 1000).toFixed(2)) : null,
   };
 }
 
-function columnStats(rows: Row[]): ColumnStats[] {
+function columnStats(rows: Row[], now: number): ColumnStats[] {
   const by = new Map<string, Row[]>();
   for (const r of rows) {
     const k = r.template_id?.startsWith('column.') ? r.template_id.slice('column.'.length) : null;
@@ -119,16 +139,37 @@ function columnStats(rows: Row[]): ColumnStats[] {
     (by.get(k) ?? by.set(k, []).get(k)!).push(r);
   }
   return [...by].map(([kind, list]) => {
-    const m = list.filter(r => reading(r) != null);
-    const v = m.reduce((s, r) => s + (reading(r) ?? 0), 0);
+    const m = list.filter(r => matured(r, now));
+    const withComments = m.filter(r => r.comments != null);
+    const commentViews = withComments.reduce((s, r) => s + (r.v24h ?? 0), 0);
     return {
       kind,
       posts: list.length,
-      medianViews: median(m.map(r => reading(r)!)),
-      commentsPer1k: v > 0 ? Number(((m.reduce((s, r) => s + (r.comments ?? 0), 0) / v) * 1000).toFixed(2)) : null,
+      matured: m.length,
+      medianViews: median(m.map(r => r.v24h!)),
+      commentsPer1k: commentViews > 0
+        ? Number(((withComments.reduce((s, r) => s + (r.comments ?? 0), 0) / commentViews) * 1000).toFixed(2))
+        : null,
     };
   });
 }
+
+/**
+ * What each count counts. The first weekly review found three pairs of numbers that disagreed —
+ * column posts 7 vs arm rows 5, chart 20 vs 19, «53 with readings» vs 57 published — and every
+ * pair was two definitions, not a bug. The tables that could share one rule now do (a day old, read
+ * at 24 hours); the rest are said here so the model reads the difference as designed.
+ */
+const DEFINITIONS = [
+  'account.wN.posts：窗口内发布的帖子数；measured：其中已读到浏览数的（含未满 24 小时的，用最新读数）；medianViews 也是这批。',
+  'account.publishedTotal：有史以来全部已发布条数，不限窗口。',
+  'columns[].posts：近 30 天该栏目发布条数；matured：其中满 24 小时且有 24h 读数的；medianViews、commentsPer1k 只算 matured。',
+  'hypotheses[].arms[].n：近 30 天、满 24 小时、有 24h 读数、且登记了这个实验臂的帖子；和 columns.matured、chart 同一口径，只是没登记臂的帖子不算。',
+  'chart：与 h_chart 同口径（满 24 小时、有 24h 读数）。',
+  'hypotheses[].stratified：在同一素材类别、同一成交额档（见 heat.bands）内比较；strata 是两边都有数据的层数，agree 是领先那一臂在几层里排第一，detail 是每层各臂的样本数和中位数。没有成交额的素材退回用采集评分分档（档名以「评分」开头）。',
+  'heat：各成交额档、各账号的 24h 浏览中位数，同上口径。档与档差得越多，不分层的比较越不可信；差得少，热度就不是主要干扰。',
+  'alerts 里的条数是哨兵触发当时的计数，可能比现在的少。',
+];
 
 export function buildSnapshot(store: Store, settings: Settings, now = Date.now()): BrainSnapshot {
   const target = currentTarget(store, settings, now);
@@ -138,15 +179,14 @@ export function buildSnapshot(store: Store, settings: Settings, now = Date.now()
 
   const armRows = store.db
     .prepare(
-      `SELECT a.arm, s.views, d.v24h FROM post_arms a
+      `SELECT a.arm, d.v24h FROM post_arms a
        JOIN posts p ON p.id = a.post_id AND p.status = 'published'
-       LEFT JOIN post_stats s ON s.post_id = a.post_id
        LEFT JOIN post_distribution d ON d.post_id = a.post_id
-       WHERE a.experiment = 'h_chart' AND a.assigned_at >= ?`,
+       WHERE a.experiment = 'h_chart' AND p.published_at >= ? AND p.published_at <= ?`,
     )
-    .all(now - 30 * DAY) as { arm: string; views: number | null; v24h: number | null }[];
+    .all(now - 30 * DAY, now - MATURITY_FLOOR_MS) as { arm: string; v24h: number | null }[];
   const chartOf = (arm: string) => {
-    const xs = armRows.filter(r => r.arm === arm).map(r => r.v24h ?? r.views).filter((x): x is number => x != null);
+    const xs = armRows.filter(r => r.arm === arm).map(r => r.v24h).filter((x): x is number => x != null);
     return { n: xs.length, medianViews: median(xs) };
   };
   const missingImage = (store.db.prepare("SELECT COUNT(*) AS n FROM events WHERE kind = 'image_missing' AND at >= ?").get(now - 30 * DAY) as { n: number }).n;
@@ -182,13 +222,14 @@ export function buildSnapshot(store: Store, settings: Settings, now = Date.now()
       w30: windowStats(rows, 30, now),
       publishedTotal: (store.db.prepare("SELECT COUNT(*) AS n FROM posts WHERE status = 'published'").get() as { n: number }).n,
     },
-    columns: columnStats(rows),
+    columns: columnStats(rows, now),
     chart: armRows.length ? { chart: chartOf('chart'), text: chartOf('text'), missingImage } : null,
     hypotheses: verdicts.map(v => ({
       id: v.id, mode: v.mode, metric: v.metric, status: v.status, claim: v.claim,
       arms: v.arms.map(a => ({ arm: a.arm, n: a.n, median: a.median == null ? null : Number(a.median.toFixed(2)) })),
       missing: v.missing,
       active: v.mode !== 'experiment' ? false : active == null || active.includes(v.id),
+      stratified: { strata: v.stratified.strata, agree: v.stratified.agree, winner: v.stratified.winner, rel: v.stratified.rel, detail: v.stratified.detail.slice(0, 6) },
     })),
     paramChanges: changeLedger(store, 5).map(c => ({
       key: c.key, from: c.from_value, to: c.to_value, status: c.status, reason: c.reason, rejectReason: c.reject_reason,
@@ -200,6 +241,9 @@ export function buildSnapshot(store: Store, settings: Settings, now = Date.now()
     benchmark: { zh: comp, poolZh: by.zh, poolOther: by.other },
     calls: tally(store),
     alerts: (store.db.prepare('SELECT at, code, detail FROM brain_alarms WHERE at >= ? ORDER BY at DESC LIMIT 12').all(now - 7 * DAY) as { at: number; code: string; detail: string }[]),
+    upgrades: upgradesForSnapshot(store, now),
+    heat: heatProfile(store, { now }),
+    definitions: DEFINITIONS,
     unknowns,
   };
 }

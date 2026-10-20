@@ -136,7 +136,10 @@ export async function backfillStats(store: Store): Promise<BackfillReport> {
     const sample = {
       views: Number(vo.viewCount ?? 0),
       likes: Number(vo.likeCount ?? 0),
-      comments: Number(vo.commentCount ?? 0),
+      // commentCount missing ≠ «the platform said zero». Writing 0 here made two weeks of unread
+      // counters indistinguishable from a genuine zero-comment rate, which is exactly the finding
+      // the sentinel then filed. NULL keeps «read as 0» and «read nothing» apart.
+      comments: vo.commentCount === undefined || vo.commentCount === null ? null : Number(vo.commentCount),
       shares: Number(vo.shareCount ?? 0),
       reactions: Number(vo.totalReactionCount ?? 0),
       flags,

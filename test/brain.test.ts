@@ -12,7 +12,7 @@ import { detectAlarms, detectStalls, runSentinel } from '../src/brain/sentinel.t
 import { tuneTemplateWeights } from '../src/stats/backfill.ts';
 import { applyAction, approveReport, missingSections, parseActions, recommendationComplete, runWeekly, stripActions } from '../src/brain/weekly.ts';
 import { activeVariants, BUILTIN_VARIANTS, isSafeVariant, seedVariants } from '../src/content/columns.ts';
-import { judgeCalls, recapLineFor, registerCall, ruling, tally, unrecapped } from '../src/calls.ts';
+import { judgeCalls, recapLineFor, registerCall, ruling, rulingFor, tally, unrecapped } from '../src/calls.ts';
 import { sanitizeBrainSettings, brainReadiness } from '../src/server/brainRoutes.ts';
 import { planArms } from '../src/rank/experiments.ts';
 import { scoreAll } from '../src/rank/score.ts';
@@ -365,6 +365,10 @@ test('a call is ruled on by code: held, faded or flipped', () => {
   assert.equal(ruling(-0.001, -0.0004), 'faded');
   assert.equal(ruling(-0.001, 0.0002), 'flipped');
   assert.equal(ruling(0.001, 0), 'flipped');
+  // New calls are judged on what the post said — «this side is paying» — not on the rate's size.
+  assert.equal(rulingFor('payer_persists', -0.001, -0.0004), 'held');
+  assert.equal(rulingFor('payer_persists', -0.001, 0.0002), 'flipped');
+  assert.equal(rulingFor('funding_persists', -0.001, -0.0004), 'faded', 'old rows keep the rule they were registered under');
 });
 
 test('open calls are judged once their time comes; a missing symbol is void, a failed fetch changes nothing', async () => {
@@ -395,9 +399,9 @@ test('the recap line carries only numbers from the ledger row and no first perso
     assert.equal(rows.length, 1);
     const line = recapLineFor(rows[0]!);
     assert.match(line, /\$AAA/);
-    assert.match(line, /-0\.200%/);
-    assert.match(line, /-0\.150%/);
-    assert.ok(!/我/.test(line));
+    assert.match(line, /空头在付 0\.20%/);
+    assert.match(line, /0\.15%/);
+    assert.ok(!/我|成立/.test(line));
   } finally { close(); }
 });
 

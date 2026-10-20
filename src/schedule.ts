@@ -40,6 +40,21 @@ export function nominalIntervalMinutes(s: Settings): number {
   return Math.max(s.minIntervalMinutes, Math.floor(spanMinutes / Math.max(1, s.postsPerDay)));
 }
 
+/**
+ * How many posts a cadence can actually fit: the active window divided by the minimum gap.
+ *
+ * A quota above this number is unreachable, and pretending otherwise costs two things at once —
+ * the day ends with the target unmet for a reason nobody wrote down, and the panel advertises a
+ * spacing tighter than the floor it is also enforcing (24 posts over 8:00–24:00 reads as «one
+ * every 40 minutes» next to a 45-minute minimum). The reachable number is what a quota is
+ * checked against, so the promise and the floor cannot disagree.
+ */
+export function reachablePostsPerDay(s: Settings): number {
+  const { start, end } = windowBounds(s);
+  const spanMinutes = end > start ? end - start : 1440 - start + end;
+  return Math.max(1, Math.floor(spanMinutes / Math.max(1, s.minIntervalMinutes)));
+}
+
 export interface SlotDecision {
   allowed: boolean;
   at: number;
@@ -117,12 +132,16 @@ export function settingsForAccount(base: Settings, a: AccountRow): Settings {
     // Per-account publish mode, so "start these three, keep the rest on review" works
     // without flipping a global switch that would affect every account.
     autoPublish: a.auto_publish === null ? base.autoPublish : a.auto_publish === 1,
+    // The target is this account's own promise: how many posts it aims to spread across its
+    // window. The cap stays the global ceiling every account shares. They used to be one number
+    // (`dailyCap = posts_per_day`), which is why the panel showed «今日 7 / 30» at the top and
+    // 「上限 24」 on the account card and both read as that account's quota.
     postsPerDay: a.posts_per_day ?? base.postsPerDay,
     minIntervalMinutes: a.min_interval_minutes ?? base.minIntervalMinutes,
     activeStartHour: a.active_start_hour ?? base.activeStartHour,
     activeEndHour: a.active_end_hour ?? base.activeEndHour,
-    // The 100/day ceiling is per key, so this account's own cap is the one that binds.
-    dailyCap: Math.min(100, a.posts_per_day ?? base.dailyCap),
+    // The 100/day ceiling is per key, so it still binds below the global figure.
+    dailyCap: Math.min(100, base.dailyCap),
   };
 }
 
@@ -143,8 +162,14 @@ export function nextSlotFor(
 ): SlotDecision {
   const s = settingsForAccount(base, a);
   const mine = store.accountPostsToday(a.id, beijingDayStart(now));
+  // Two different ceilings, two different sentences. The cap is the global figure shared by every
+  // account; the target is what this account promised itself, and reaching it is a normal end of
+  // day rather than a limit being hit.
   if (mine >= s.dailyCap) {
-    return { allowed: false, at: now, reason: `${a.label} 今日已发 ${mine}/${s.dailyCap}，达到该号上限` };
+    return { allowed: false, at: now, reason: `${a.label} 今日已发 ${mine}/${s.dailyCap}，达到全局硬上限` };
+  }
+  if (mine >= s.postsPerDay) {
+    return { allowed: false, at: now, reason: `${a.label} 今日已发 ${mine}/${s.postsPerDay}，达到该号目标帖数` };
   }
   if (mine >= 100) {
     return { allowed: false, at: now, reason: `${a.label} 达到币安单号 100 帖/天硬上限` };

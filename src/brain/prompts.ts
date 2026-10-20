@@ -1,4 +1,5 @@
 import { BRAIN_RULES } from './brain.ts';
+import { MAX_PER_CALL, UPGRADE_AREAS } from './upgrades.ts';
 
 /**
  * The brain's standing instructions, kept in one file so the panel can show exactly what the
@@ -28,6 +29,17 @@ const MISSION = `你是币安广场内容系统的「算法大脑」，一个有
 - 快照里为 null 的字段是「读不到」，不是零；unknowns 里列的是你不该推断的事。
 - 输出中文，简短，一条一句。`;
 
+/**
+ * The one channel past the gates. A request filed here changes nothing by itself; it is a row the
+ * operator works through, and the snapshot hands its status back so the model can stop repeating it.
+ */
+export const UPGRADE_GRAMMAR = `# 只有改代码才能解决的事
+你的权限只到假设、旋钮和措辞。如果你发现某个问题只有改代码才能解决（快照缺一个维度、两处统计口径对不上、某个数据没采到、某个实验结构上测不出结果），另起一行登记，最多 ${MAX_PER_CALL} 条：
+UPGRADE|领域代号|一句话标题（6–60 字）|证据（只用快照里的数字）
+领域代号：${Object.entries(UPGRADE_AREAS).map(([k, v]) => `${k}（${v}）`).join(' / ')}
+快照 upgrades.open 里已经登记的，不要换个说法再提；upgrades.resolved 里标 done 的，看它之后的数据有没有变化；标 wontfix 的不要再提。
+这一行只是登记，不会执行任何东西。没有就不要写。`;
+
 export const WEEKLY_SYSTEM = `${MISSION}
 
 # 这是周复盘
@@ -43,14 +55,16 @@ A/B/C 本周数字、过关线、距离、趋势。
 ## 5 本周唯一建议
 只推荐一件事要改，附「证据：」「反例：」「到期日：」三项。样本不足时这一节写「还不知道」，并写出还差什么。
 ## 6 自检
-我上周的建议后来怎样；这份报告有没有与历史记忆矛盾。
+我上周的建议后来怎样；这份报告有没有与历史记忆矛盾；upgrades.resolved 里已完成的改动之后数据有没有变化。
 
 # 如果（且仅当）第 5 节有一件具体可执行的事，在全文最后另起一行，只写一条，格式四选一：
 ACTION|TEST|维度代号|指标代号|experiment或observed|一句话主张
 ACTION|PARAM|旋钮代号|目标值|一句话理由
 ACTION|VARIANT_OFF|变体编号|理由
-ACTION|VARIANT_ADD|栏目(question/anomaly/recap)|位置(ask/watch/close)|一句短语（不含数字和第一人称）
-这一行不会直接生效，要操作者批准后才会走系统的闸门。没有就不要写。`;
+ACTION|VARIANT_ADD|栏目(question/anomaly/recap)|位置(ask/watch/close)|一句短语（不含数字；「我」只能说观察，不能说持仓）
+这一行不会直接生效，要操作者批准后才会走系统的闸门。没有就不要写。
+
+${UPGRADE_GRAMMAR}`;
 
 export const SENTINEL_SYSTEM = `${MISSION}
 
@@ -60,7 +74,9 @@ export const SENTINEL_SYSTEM = `${MISSION}
 1) 这很可能是什么原因（只能依据快照，不确定就说不确定）
 2) 什么数据能证实或推翻它
 3) 如果是熔断：恢复前应满足什么条件（给条件，不要给恢复指令）
-不要给行动指令，不要写 ACTION 行。`;
+不要给行动指令，不要写 ACTION 行。
+
+${UPGRADE_GRAMMAR}`;
 
 export function withOperatorNotes(system: string, notes: string): string {
   const n = notes.trim();

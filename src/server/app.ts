@@ -8,7 +8,7 @@ import { ALERT_KINDS, activeAlerts, ack as ackAlert, clear as clearAlert, dayGap
 import { labelRenderable } from '../labels.ts';
 import { collect, generate, generateFromPool, publishDue, pauseState, reroll } from '../pipeline.ts';
 import { pool, refreshPool } from '../hot/pool.ts';
-import { nextSlot, nextSlotFor, settingsFrom, saveSettings, beijingDayStart } from '../schedule.ts';
+import { nextSlot, nextSlotFor, reachablePostsPerDay, settingsForAccount, settingsFrom, saveSettings, beijingDayStart } from '../schedule.ts';
 import { templates as builtinTemplates } from '../content/templates.ts';
 import { DEFAULT_SETTINGS, STYLE_LABELS, type Settings } from '../config.ts';
 import { isStructuralDuplicate } from '../engine/guard.ts';
@@ -20,7 +20,7 @@ import { currentTarget } from '../rank/gates.ts';
 import { registerBrainRoutes } from './brainRoutes.ts';
 import { backupAgeHours, BACKUP_STALE_HOURS } from '../backup.ts';
 import { attributeConversions } from '../money/conversion.ts';
-import { scoreAll } from '../rank/score.ts';
+import { heatProfile, scoreAll } from '../rank/score.ts';
 import { distributionRows } from '../rank/observations.ts';
 import { armsOf } from '../rank/experiments.ts';
 import { playbook } from '../rank/playbook.ts';
@@ -100,7 +100,7 @@ function llmConfigFrom(s: Settings, override?: Partial<LlmConfig>): LlmConfig {
   };
 }
 
-app.get('/', (_req, reply) => reply.type('text/html').send(ui));
+app.get('/', (_req, reply) => reply.type('text/html').header('cache-control', 'no-cache').send(ui));
 
 /**
  * Stylesheet and script, read once at boot like the HTML. An allowlist rather than a static
@@ -408,6 +408,13 @@ app.get('/api/rank', (req, reply) => {
     knobs: KNOBS.map(k => ({ ...k, current: currentKnob(store, k.key), live: liveKnobs(settingsFrom(store)).some(l => l.key === k.key) })),
     paramChanges: changeLedger(store, 20),
     target,
+    // How much the coin's heat and the account move views by themselves: the confound every
+    // stratified number above is trying to remove, shown so its size is a measurement, not a belief.
+    heat: (() => {
+      const h = heatProfile(store, { days });
+      const names = new Map((store.db.prepare('SELECT id, label FROM accounts').all() as { id: number; label: string }[]).map(a => [a.id, a.label]));
+      return { ...h, byAccount: h.byAccount.map(a => ({ ...a, label: a.accountId == null ? '未挂账号' : names.get(a.accountId) ?? `#${a.accountId}` })) };
+    })(),
     conversion: {
       days: store.conversions(14),
       totals: store.db
@@ -792,8 +799,10 @@ app.patch('/api/settings', (req, reply) => {
   const next = { ...cur, ...patch };
   // Guard the values that would otherwise let the tool hurt the account.
   next.dailyCap = Math.min(100, Math.max(1, Math.round(next.dailyCap)));
-  next.postsPerDay = Math.min(next.dailyCap, Math.max(1, Math.round(next.postsPerDay)));
   next.minIntervalMinutes = Math.max(5, Math.round(next.minIntervalMinutes));
+  // A target the window cannot hold is not a target: it just makes every day end short by a
+  // margin nobody wrote down. Clamp to what this cadence actually fits.
+  next.postsPerDay = Math.min(next.dailyCap, reachablePostsPerDay(next), Math.max(1, Math.round(next.postsPerDay)));
   // Typed as a union in Settings, but this route accepts arbitrary JSON.
   if (!['1h', '4h', '1d'].includes(next.chartInterval)) next.chartInterval = DEFAULT_SETTINGS.chartInterval;
   store.setSetting('settings', next);
@@ -902,7 +911,8 @@ app.post('/api/accounts', (req, reply) => {
 
 app.patch('/api/accounts/:id', (req, reply) => {
   const id = Number((req.params as { id: string }).id);
-  if (!store.accountById(id)) return reply.code(404).send({ error: 'not found' });
+  const a = store.accountById(id);
+  if (!a) return reply.code(404).send({ error: 'not found' });
   const b = (req.body ?? {}) as Record<string, unknown>;
   const patch = accountPatchFrom(b);
   if (typeof b.enabled === 'boolean') {
@@ -911,9 +921,27 @@ app.patch('/api/accounts/:id', (req, reply) => {
     // silently resume posting under a state the user already thought they fixed.
     if (b.enabled) patch.pausedUntil = null;
   }
+  // The quota is checked against this account's own window and floor, and the clamp is said out
+  // loud: silently storing a smaller number than the operator typed leaves the panel showing a
+  // cadence the account can never keep.
+  let note: string | undefined;
+  if (typeof patch.postsPerDay === 'number') {
+    const eff = settingsForAccount(settingsFrom(store), {
+      ...a,
+      posts_per_day: patch.postsPerDay,
+      min_interval_minutes: typeof patch.minIntervalMinutes === 'number' ? patch.minIntervalMinutes : a.min_interval_minutes,
+      active_start_hour: typeof patch.activeStartHour === 'number' ? patch.activeStartHour : a.active_start_hour,
+      active_end_hour: typeof patch.activeEndHour === 'number' ? patch.activeEndHour : a.active_end_hour,
+    });
+    const reach = Math.min(reachablePostsPerDay(eff), eff.dailyCap);
+    if (patch.postsPerDay > reach) {
+      note = `目标帖数 ${patch.postsPerDay} 超过这个节奏装得下的 ${reach} 条（时段 ÷ 最小间隔），已收到 ${reach}`;
+      patch.postsPerDay = reach;
+    }
+  }
   store.updateAccount(id, patch);
-  store.log('account_update', { id, keys: Object.keys(patch) });
-  return reply.send({ ok: true });
+  store.log('account_update', { id, keys: Object.keys(patch), ...(note ? { note } : {}) });
+  return reply.send({ ok: true, ...(note ? { note } : {}) });
 });
 
 app.post('/api/accounts/:id/key', (req, reply) => {

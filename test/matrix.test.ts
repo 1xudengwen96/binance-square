@@ -28,8 +28,10 @@ test('no two accounts are handed the same coin in one pass', () => {
     assert.equal(new Set(all).size, all.length, `coins were duplicated: ${all.join(',')}`);
     // Four coins, two accounts, alternating: everything goes out exactly once.
     assert.equal(all.length, candidates.length);
-    assert.deepEqual(out.get(a)!.map(c => c.symbol), ['BTC', 'SOL']);
-    assert.deepEqual(out.get(b)!.map(c => c.symbol), ['ETH', 'XRP']);
+    // A picks first in round 0, B picks first in round 1 — the first pick rotates, so the
+    // second-strongest remaining coin (SOL) goes to B rather than back to A.
+    assert.deepEqual(out.get(a)!.map(c => c.symbol), ['BTC', 'XRP']);
+    assert.deepEqual(out.get(b)!.map(c => c.symbol), ['ETH', 'SOL']);
   } finally {
     store.close();
     rmSync(dir, { recursive: true, force: true });
@@ -43,9 +45,35 @@ test('allocation spreads coins round-robin instead of the first account hoarding
     const b = store.createAccount({ label: 'B', enabled: true, postsPerDay: 2 });
     const acc = store.allAccounts().filter(x => x.enabled);
     const out = allocate([cand('BTC', 90), cand('ETH', 80), cand('SOL', 70)], acc, store, S);
-    // A must not take the top two; each account gets one strong and one weaker coin.
-    assert.deepEqual(out.get(a)!.map(c => c.symbol), ['BTC', 'SOL']);
-    assert.deepEqual(out.get(b)!.map(c => c.symbol), ['ETH']);
+    // A must not take the top two. With the first pick rotating, B leads the second round and
+    // takes SOL, so A ends with the single strongest coin and B with the two behind it.
+    assert.deepEqual(out.get(a)!.map(c => c.symbol), ['BTC']);
+    assert.deepEqual(out.get(b)!.map(c => c.symbol), ['ETH', 'SOL']);
+  } finally {
+    store.close();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('a bigger quota does not buy the first pick in every round', () => {
+  // The live shape this fixes: one account at 24 posts/day and one at 4. The rounds are numbered
+  // by the largest quota, so a fixed order let the big account pick first 24 times and the small
+  // one take what was left, four times. Rotating the first pick is what keeps quota size from
+  // deciding who gets the good board.
+  const { store, dir } = temp();
+  try {
+    const big = store.createAccount({ label: '大额度', enabled: true, postsPerDay: 6 });
+    const small = store.createAccount({ label: '小额度', enabled: true, postsPerDay: 2 });
+    const acc = store.allAccounts().filter(x => x.enabled);
+    assert.equal(acc[0]!.id, big, 'the big account really is evaluated first by id order');
+    const board = ['C1', 'C2', 'C3', 'C4', 'C5', 'C6', 'C7', 'C8'].map((s, i) => cand(s, 90 - i * 10));
+
+    const out = allocate(board, acc, store, S);
+    const smallGot = out.get(small)!.map(c => c.symbol);
+    assert.equal(smallGot.length, 2, 'the small account still fills its own quota');
+    assert.ok(smallGot.includes('C3'), `the small account must reach a top-three coin, got ${smallGot.join(',')}`);
+    const all = [...out.values()].flat().map(c => c.symbol);
+    assert.equal(new Set(all).size, all.length, 'exclusivity still holds while rotating');
   } finally {
     store.close();
     rmSync(dir, { recursive: true, force: true });

@@ -14,7 +14,7 @@ const median = (xs: number[]): number | null => {
 type Row = Distribution & {
   account_id: number | null; category: string | null; style: string | null; template_id: string | null;
   symbol: string | null; chars: number; has_chart: number; published_at: number; text: string;
-  material_score: number | null; rebate_usd: number | null;
+  material_score: number | null; quote_volume: number | null; rebate_usd: number | null;
   likes: number | null; comments: number | null; shares: number | null;
   arms?: Record<string, string>;
   repeatGapHours?: number | null;
@@ -146,7 +146,13 @@ export interface Verdict {
   /** The naive all-posts-together gap. Kept visible so a rule that evaporates under stratification is obvious. */
   effect: number;
   /** Same comparison inside (category × heat) strata. This is the number promotion is judged on. */
-  stratified: { gap: number | null; rel: number | null; strata: number; dropped: number; winner: string | null };
+  stratified: {
+    gap: number | null; rel: number | null; strata: number; dropped: number; winner: string | null;
+    /** Strata in which the overall winner also came first — «is the direction the same once heat is held». */
+    agree: number;
+    /** Every stratum that had both sides, with each arm's median: the evidence behind `agree`. */
+    detail: { stratum: string; arms: { arm: string; n: number; median: number }[]; winner: string }[];
+  };
   /** Did the second half of the sample reproduce what the first half found? */
   replicated: boolean | null;
   confidence: number;
@@ -299,7 +305,7 @@ export function scoreAll(store: Store, opts: { days?: number; writeMemory?: bool
     const verdict: Verdict = {
       id: h.id, claim: h.claim, metric, mode: h.mode, how: h.how, risk: h.risk,
       arms, winner, loser, effect: Number(rel.toFixed(3)),
-      stratified: { gap: st.gap, rel: st.rel, strata: st.strata, dropped: st.dropped, winner: st.winner },
+      stratified: { gap: st.gap, rel: st.rel, strata: st.strata, dropped: st.dropped, winner: st.winner, agree: st.agree, detail: st.detail },
       replicated,
       confidence: Number(confidence.toFixed(2)), status,
       action: status === 'rule' ? `以后按「${st.winner}」这一档来写：同热度同格子内它比另一档高约 ${st.gap}（${((st.rel ?? 0) * 100).toFixed(0)}%）。` : null,
@@ -381,18 +387,39 @@ export function revokeStaleRules(store: Store, verdicts: Verdict[], now = Date.n
 }
 
 /**
+ * How much of the market was looking at the coin, from the one number every coin has: its 24-hour
+ * quote volume on Binance when the material was written.
+ *
+ * The bands used to come from the collector's score, which is not a heat measure at all once posts
+ * span lanes: an attention row scores 46–57, a Hyperliquid row 83–88, and a funding row's score is
+ * how extreme its rate is. Two posts in the same «高热» band could be a top-10 coin and a thin
+ * small cap. Volume is measured the same way for every lane. The score stays as the fallback for
+ * a row whose material never carried a volume.
+ */
+export const HEAT_BANDS = [
+  { key: '大盘', min: 500_000_000, label: '24h 成交额 ≥ 5 亿' },
+  { key: '中盘', min: 50_000_000, label: '5000 万 – 5 亿' },
+  { key: '小盘', min: 0, label: '< 5000 万' },
+] as const;
+
+export function heatBand(r: { quote_volume: number | null; material_score: number | null }): string {
+  if (r.quote_volume != null && Number.isFinite(r.quote_volume) && r.quote_volume > 0) {
+    return HEAT_BANDS.find(b => r.quote_volume! >= b.min)!.key;
+  }
+  const score = r.material_score ?? 0;
+  return score >= 85 ? '评分高' : score >= 70 ? '评分中' : score >= 55 ? '评分低' : '评分冷';
+}
+
+/**
  * Which comparison a post belongs in.
  *
- * The single largest driver of a post's view count is which coin it was about and how hot that
- * coin was at the time — an effect one or two orders of magnitude bigger than anything a wording
- * choice can do. Comparing arms across all posts therefore measures the luck of the draw. Inside
- * a stratum (same category, same heat band) the coin factor is roughly held constant, so the
- * remaining difference is much more plausibly the arm.
+ * The single largest driver of a post's view count is supposed to be which coin it was about and
+ * how hot that coin was at the time. Comparing arms across all posts therefore measures the luck of
+ * the draw. Inside a stratum (same category, same heat band) the coin factor is roughly held
+ * constant, so the remaining difference is much more plausibly the arm.
  */
 function stratumOf(r: Row): string {
-  const score = r.material_score ?? 0;
-  const band = score >= 85 ? '高热' : score >= 70 ? '中热' : score >= 55 ? '低热' : '冷门';
-  return `${r.category ?? '未分类'}|${band}`;
+  return `${r.category ?? '未分类'}|${heatBand(r)}`;
 }
 
 interface StratumResult {
@@ -404,6 +431,8 @@ interface StratumResult {
   strata: number;
   /** Strata where one arm simply has no rows — the honest cost of slicing thin. */
   dropped: number;
+  agree: number;
+  detail: { stratum: string; arms: { arm: string; n: number; median: number }[]; winner: string }[];
 }
 
 function stratify(rows: Row[], h: Hypothesis, metric: Metric): StratumResult {
@@ -420,8 +449,9 @@ function stratify(rows: Row[], h: Hypothesis, metric: Metric): StratumResult {
   const gaps: number[] = [];
   const wins = new Map<string, number>();
   const pooledAll: number[] = [];
+  const detail: StratumResult['detail'] = [];
   let dropped = 0;
-  for (const arms of byStratum.values()) {
+  for (const [stratum, arms] of byStratum) {
     const present = [...arms.entries()].filter(([, vs]) => vs.length > 0);
     for (const [, vs] of present) pooledAll.push(...vs);
     if (present.length < 2) {
@@ -429,12 +459,13 @@ function stratify(rows: Row[], h: Hypothesis, metric: Metric): StratumResult {
       continue;
     }
     const ranked = present
-      .map(([arm, vs]) => ({ arm, m: median(vs)! }))
+      .map(([arm, vs]) => ({ arm, n: vs.length, m: median(vs)! }))
       .sort((a, b) => b.m - a.m);
     gaps.push(ranked[0]!.m - ranked[ranked.length - 1]!.m);
     wins.set(ranked[0]!.arm, (wins.get(ranked[0]!.arm) ?? 0) + 1);
+    detail.push({ stratum, arms: ranked.map(x => ({ arm: x.arm, n: x.n, median: Number(x.m.toFixed(2)) })), winner: ranked[0]!.arm });
   }
-  if (!gaps.length) return { gap: null, rel: null, winner: null, strata: 0, dropped };
+  if (!gaps.length) return { gap: null, rel: null, winner: null, strata: 0, dropped, agree: 0, detail };
   const gap = gaps.reduce((a, b) => a + b, 0) / gaps.length;
   const centre = median(pooledAll) ?? 1;
   const top = [...wins.entries()].sort((a, b) => b[1] - a[1]);
@@ -445,6 +476,42 @@ function stratify(rows: Row[], h: Hypothesis, metric: Metric): StratumResult {
     winner: clear ? top[0]![0] : null,
     strata: gaps.length,
     dropped,
+    agree: top[0]![1],
+    detail: detail.sort((a, b) => b.arms.reduce((s, x) => s + x.n, 0) - a.arms.reduce((s, x) => s + x.n, 0)),
+  };
+}
+
+/**
+ * How much heat actually moves views on this account, measured on the same rows the verdicts use
+ * (published, a day old, read at 24 hours). If the bands barely differ, heat is not what is hiding
+ * the arms; if they differ by multiples, every unstratified comparison is mostly measuring the draw.
+ * Per account too, because two accounts with different followings are a second, separate confound.
+ */
+export function heatProfile(store: Store, opts: { days?: number; now?: number } = {}): {
+  basis: string;
+  bands: { band: string; label: string; n: number; medianViews: number | null }[];
+  byAccount: { accountId: number | null; n: number; medianViews: number | null }[];
+  unbanded: number;
+} {
+  const now = opts.now ?? Date.now();
+  const rows = (distributionRows(store, opts.days ?? 30) as Row[])
+    .filter(r => now - r.published_at >= MATURITY_FLOOR_MS && r.v24h != null);
+  const labels = new Map<string, string>(HEAT_BANDS.map(b => [b.key, b.label]));
+  const by = new Map<string, number[]>();
+  let unbanded = 0;
+  for (const r of rows) {
+    const band = heatBand(r);
+    if (!labels.has(band)) { unbanded++; continue; }
+    (by.get(band) ?? by.set(band, []).get(band)!).push(r.v24h!);
+  }
+  const acct = new Map<number | null, number[]>();
+  for (const r of rows) (acct.get(r.account_id) ?? acct.set(r.account_id, []).get(r.account_id)!).push(r.v24h!);
+  const med = (xs: number[]): number | null => { const m = median(xs); return m == null ? null : Math.round(m); };
+  return {
+    basis: '素材写下时该币的币安 24h 成交额；只统计满 24 小时且有 24h 读数的帖子',
+    bands: HEAT_BANDS.map(b => ({ band: b.key, label: b.label, n: by.get(b.key)?.length ?? 0, medianViews: med(by.get(b.key) ?? []) })),
+    byAccount: [...acct].map(([accountId, xs]) => ({ accountId, n: xs.length, medianViews: med(xs) })),
+    unbanded,
   };
 }
 

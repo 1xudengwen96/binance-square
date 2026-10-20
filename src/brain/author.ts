@@ -7,6 +7,7 @@ import { propose, registry } from '../rank/registry.ts';
 import { liveKnobs, proposeChange } from '../rank/params.ts';
 import { signalLabel } from '../stats/insight.ts';
 import { settingsFrom } from '../schedule.ts';
+import { UPGRADE_AREAS, fileFromReply, upgradesForSnapshot } from './upgrades.ts';
 
 /**
  * The part that behaves like a person who writes regularly: before drafting, it re-reads what it
@@ -95,8 +96,12 @@ export async function reflect(store: Store, brain: Brain | null, opts: { days?: 
 
 3) 一句你注意到但这些格式表达不了的观察，直接写中文，不要加前缀。
 
+4) 一个只有改代码才能解决的问题（缺一个维度、口径对不上、数据没采到、实验结构上测不出结果），登记给操作者：
+   UPGRADE|领域代号|一句话标题|证据（只用上面给的数字）
+   领域代号：${Object.keys(UPGRADE_AREAS).join(' / ')}。下面「已登记的升级需求」里有的不要换个说法再提。
+
 **已经登记在测的比较见下面，复述它们会被系统拒绝。如果你觉得答案就是"继续攒样本"，那就只输出第 3 类或者什么都不输出。**`,
-    context: `最近 30 天各假设的测量结果（median/样本数）：\n${evidence}\n\n已经在测的主张：\n${registered.map(h => `- ${h.id}: ${h.claim}`).join('\n')}\n\n还没结论的实验：${stuck.map(v => `${v.id}(还需 ${v.missing} 条)`).join('、') || '无'}`,
+    context: `最近 30 天各假设的测量结果（median/样本数）：\n${evidence}\n\n已经在测的主张：\n${registered.map(h => `- ${h.id}: ${h.claim}`).join('\n')}\n\n还没结论的实验：${stuck.map(v => `${v.id}(还需 ${v.missing} 条)`).join('、') || '无'}\n\n已登记的升级需求：${upgradesForSnapshot(store).open.map(u => `#${u.id} ${u.title}`).join('；') || '无'}`,
     maxTokens: settings.brainMaxTokensDaily,
   });
   if (!r.ok) {
@@ -111,7 +116,13 @@ export async function reflect(store: Store, brain: Brain | null, opts: { days?: 
   let proposalsIn = 0;
   let paramsIn = 0;
   let prose = 0;
+  let upgradesIn = 0;
   for (const line of lines) {
+    if (line.toUpperCase().startsWith('UPGRADE|')) {
+      const filed = fileFromReply(store, line, { source: 'reflect' });
+      if (filed.length) { upgradesIn++; notes.push(`大脑登记了需要改代码的事：${filed[0]}`); }
+      continue;
+    }
     if (line.toUpperCase().startsWith('TEST|')) {
       const [, dimension, metric, mode, ...rest] = line.split('|');
       const res = propose(store, {
@@ -168,8 +179,8 @@ export async function reflect(store: Store, brain: Brain | null, opts: { days?: 
     stored.push(`brain:${prose}`);
     prose++;
   }
-  if (!proposalsIn && !paramsIn && !prose) notes.push('大脑这轮没有给出可用输出（按规则，"还不知道"也是合法答案）。');
-  else notes.push(`大脑本轮：${proposalsIn} 条新假设、${paramsIn} 条参数改动、${prose} 条备注。`);
+  if (!proposalsIn && !paramsIn && !prose && !upgradesIn) notes.push('大脑这轮没有给出可用输出（按规则，"还不知道"也是合法答案）。');
+  else notes.push(`大脑本轮：${proposalsIn} 条新假设、${paramsIn} 条参数改动、${upgradesIn} 条升级需求、${prose} 条备注。`);
   return { stored, notes };
 }
 

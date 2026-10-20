@@ -92,6 +92,8 @@ export function distributionRows(store: Store, days = 30): (Distribution & {
   /** Apportioned from the operator's daily entry — a guess weighted by views, not a bill. */
   rebate_usd: number | null; click_credit: number | null;
   material_score: number | null;
+  /** The coin's 24h quote volume when the material was written — how much of the market was looking at it. */
+  quote_volume: number | null;
   /** Latest counters for the post; null until the stats sweep has read it once. */
   likes: number | null; comments: number | null; shares: number | null;
 })[] {
@@ -99,6 +101,7 @@ export function distributionRows(store: Store, days = 30): (Distribution & {
     .prepare(
       `SELECT d.*, p.account_id, p.published_at, p.text, LENGTH(p.text) AS chars,
               m.score AS material_score,
+              CAST(json_extract(m.facts_json, '$.quoteVolume24h') AS REAL) AS quote_volume,
               cv.rebate_usd AS rebate_usd, cv.clicks AS click_credit,
               s.likes AS likes, s.comments AS comments, s.shares AS shares,
               CASE WHEN p.images_json IS NOT NULL AND p.images_json NOT IN ('', '[]') THEN 1 ELSE 0 END AS has_chart,

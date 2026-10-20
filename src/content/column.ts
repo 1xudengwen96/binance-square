@@ -99,24 +99,26 @@ const VOICE: Record<Reading, { verdict: string[]; watch: string[] }> = {
 /** Headlines for 今日反常, kept apart from the 费率账 verdicts so one sentence never serves both. */
 export const ANOMALY_HEADLINES: Record<'longs_paying_into_weakness' | 'shorts_paying_into_strength' | 'oi_up_price_down' | 'oi_down_price_up', string[]> = {
   longs_paying_into_weakness: [
-    '价格往下，多头却还在付费，两边在打架',
-    '跌了一天，付费的仍是多头',
-    '走势和费率各说各话：在跌，多头却在付钱',
+    '价格在跌，多头却还在交钱',
+    '跌了一天，掏钱的还是多头',
+    '一边跌，一边是多头在付费',
+    '走势往下，付费的却是多头',
   ],
   shorts_paying_into_strength: [
-    '价格在涨，空头还在付费',
-    '涨着，却是空头在交钱，走势和资金站在了对立面',
-    '上涨里付费的是空头，这不是常见的搭配',
+    '价格在涨，空头却还在交钱',
+    '一边涨，一边是空头在付费',
+    '涨势里掏钱的反而是空头',
+    '涨着涨着，付费的还是空头',
   ],
   oi_up_price_down: [
-    '价格往一边走，新增的仓位却往另一边堆',
-    '价格在跌，持仓量却在涨，两个数背向而行',
-    '走势往一头，新增仓位往另一头',
+    '价格在跌，持仓却在往上加',
+    '价格往下走，新仓位却越堆越多',
+    '跌着跌着，持仓反而多了',
   ],
   oi_down_price_up: [
-    '价格还在动，但仓位已经在悄悄撤',
-    '价格没停，持仓量先收了',
-    '价格在涨，持仓量却在收，走势在继续，仓位在减少',
+    '价格在涨，持仓却在往外撤',
+    '涨势还在，仓位先退了',
+    '价格没停，持仓量倒是先收了',
   ],
 };
 

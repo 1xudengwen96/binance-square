@@ -20,7 +20,7 @@ import {
 import { makeMaterial } from './material/types.ts';
 import { enrichWithMarketContext } from './material/enrich.ts';
 import { mergeSameStory } from './material/merge.ts';
-import { buildChartFor } from './chart/forSymbol.ts';
+import { buildChartFor, cardAnnotation } from './chart/forSymbol.ts';
 import { readFileSync } from 'node:fs';
 import { extname } from 'node:path';
 import { SquareClient, MAX_BODY_CHARS, type PublishOutcome } from './publisher/square.ts';
@@ -39,8 +39,10 @@ import { exploreRepeat, planArms, recordArms } from './rank/experiments.ts';
 import { playbook, type Playbook } from './rank/playbook.ts';
 import { followCta, stanceLine, tensionLine } from './content/voice.ts';
 import { scoreAll } from './rank/score.ts';
+import { CATEGORY_LABELS } from './stats/insight.ts';
 import { writingNotes } from './brain/author.ts';
 import type { Verdict } from './rank/score.ts';
+import { applyFreshen, freshenForPublish, type QuoteFn } from './freshen.ts';
 
 /** A line from the word bank, chosen by the same seed that chose the draft, so a preview repeats. */
 function pickBank(key: string, seed: string | number): string {
@@ -226,15 +228,22 @@ export async function collect(store: Store, settings: Settings): Promise<Collect
   const enabled = new Set(settings.enabledCategories);
 
   const gathered: Material[] = [];
-  for (const job of jobs) {
-    if (!enabled.has(job.name)) continue;
-    try {
-      const mats = await job.run();
-      report.fetched += mats.length;
-      gathered.push(...mats);
-    } catch (err) {
-      report.errors.push(`${job.name}: ${err instanceof Error ? err.message : String(err)}`);
-    }
+  // Fetch in small parallel batches. Sequentially, thirteen sources at seconds-per-request
+  // (proxied egress) made one tick longer than the whole 15-minute loop interval.
+  const active = jobs.filter(j => enabled.has(j.name));
+  const BATCH = 4;
+  for (let i = 0; i < active.length; i += BATCH) {
+    const batch = active.slice(i, i + BATCH);
+    const settled = await Promise.allSettled(batch.map(j => j.run()));
+    settled.forEach((s, k) => {
+      if (s.status === 'fulfilled') {
+        report.fetched += s.value.length;
+        gathered.push(...s.value);
+      } else {
+        const err = s.reason;
+        report.errors.push(`${batch[k]!.name}: ${err instanceof Error ? err.message : String(err)}`);
+      }
+    });
   }
 
   // One batched market-context pass over everything, before anything is stored: this is
@@ -320,7 +329,7 @@ export function llmConfigFor(store: Store, settings: Settings): LlmConfig | null
 /** Run the rewrite pass and keep a record of why it was rejected, if it was. */
 export async function applyPolish(
   store: Store, settings: Settings, text: string, facts: Fact[], persona = '',
-  ctx: { category?: string; subType?: string | null; symbol?: string | null; verdicts?: Verdict[] } = {},
+  ctx: { category?: string; subType?: string | null; symbol?: string | null; verdicts?: Verdict[]; voice?: boolean } = {},
 ): Promise<{ text: string; note?: string }> {
   if (settings.llmPolish === false) return { text };
   const cfg = llmConfigFor(store, settings);
@@ -328,8 +337,38 @@ export async function applyPolish(
   // The writer reads its own memory before drafting. Cheap when the ledger is empty, which is
   // what it should be — an unfounded belief must not outrank a measured one.
   const notes = writingNotes(store, { category: ctx.category, subType: ctx.subType ?? null, symbol: ctx.symbol ?? null, verdicts: ctx.verdicts });
-  const r = await polish(cfg, text, facts, persona, notes);
+  const r = await polish(cfg, text, facts, persona, notes, ctx.voice ? 'voice' : 'strict');
   return r.changed ? { text: r.text, note: 'ai_polished' } : { text, note: `ai_rejected: ${r.reason}` };
+}
+
+/**
+ * Everything a short post gets after its template renders: the voice knobs, the compliance line,
+ * the rewrite pass, the tags. Shared by both drafting lanes and by the pre-publish refresh, so a
+ * post re-rendered at its minute comes out the way it would have been drafted at that minute.
+ */
+export async function finishShort(
+  store: Store,
+  eff: Settings,
+  rendered: { text: string; facts: Fact[] },
+  m: Material,
+  pb: Playbook,
+  voiceSeed: string | number,
+  opts: { persona?: string; verdicts?: Verdict[]; polish?: boolean } = {},
+): Promise<{ text: string; polishNote?: string }> {
+  let text = applyVoice(rendered.text, m.facts, pb, voiceSeed);
+  // Only append a disclaimer the copy did not already carry.
+  if (eff.appendDisclaimer && !carriesDisclaimer(text)) text = `${text}\n${wordBank['disclaimer.default']}`;
+  let polishNote: string | undefined;
+  if (opts.polish !== false) {
+    const polished = await applyPolish(store, eff, text, rendered.facts, opts.persona ?? '', {
+      category: m.category, subType: m.subType, symbol: m.symbol, verdicts: opts.verdicts,
+    });
+    text = polished.text;
+    polishNote = polished.note;
+  }
+  // Tagged after polish: a model must never get the chance to reword a hashtag.
+  if (eff.appendHashtags) text = withHashtags(text, m, pb.hashtagTotal);
+  return { text, polishNote };
 }
 
 export async function generate(
@@ -455,22 +494,14 @@ export async function generate(
       report.skipped.push(`${m.title}: ${c.error}`);
       continue;
     }
-    let text = c.text;
     // The arm is drawn before the post exists, so an outcome can never be explained by whoever
     // chose the winner afterwards.
     const arms = planArms({ seed: hashString(`${seed}:arms`), verdicts: rankVerdicts, only: settings.activeExperiments, exclude: ['h_column', 'h_column_polish'] });
     const pb = playbook(store, { verdicts: rankVerdicts, arms });
-    text = applyVoice(text, m.facts, pb, seed);
-    // Only append a disclaimer the copy did not already carry.
-    if (eff.appendDisclaimer && !carriesDisclaimer(text)) {
-      text = `${text}\n${wordBank['disclaimer.default']}`;
-    }
-    const polished = await applyPolish(store, eff, text, c.result.facts, account?.persona_note ?? '', {
-      category: m.category, subType: m.subType, symbol: m.symbol, verdicts: rankVerdicts,
+    const finished = await finishShort(store, eff, { text: c.text, facts: c.result.facts }, m, pb, seed, {
+      persona: account?.persona_note ?? '', verdicts: rankVerdicts,
     });
-    text = polished.text;
-    // Tagged after polish: a model must never get the chance to reword a hashtag.
-    if (eff.appendHashtags) text = withHashtags(text, m, pb.hashtagTotal);
+    const text = finished.text;
     if (!opts.dryRun) {
       const thin = tooThin(c.result.facts, text);
       if (thin) {
@@ -492,8 +523,14 @@ export async function generate(
           funding: pick('funding'),
           oiChangePct: pick('oiChangePct'),
           longRatio: pick('longRatio'),
+        }, undefined, undefined, {
+          column: CATEGORY_LABELS[m.category] ?? m.category,
+          annotation: cardAnnotation(text),
+          watermark: account ? `@ ${account.label}` : undefined,
         });
-        if (built) images = [built.path];
+        // Card first: it is the thumbnail the feed shows, the candles are the second image
+        // for whoever opens the post to check the claim.
+        if (built) images = built.card ? [built.card, built.path] : [built.path];
       } catch (err) {
         report.skipped.push(`${m.title}: chart 失败 ${String(err).slice(0, 60)}`);
       }
@@ -512,13 +549,16 @@ export async function generate(
       status: eff.autoPublish ? 'approved' : 'draft',
       scheduledAt: slot.at,
       facts: c.result.facts,
-      trace: { ...c.result.trace, polish: polished.note, account: account?.label ?? null },
+      trace: { ...c.result.trace, polish: finished.polishNote, voiceSeed: seed, account: account?.label ?? null },
       images,
       // P0-2: bound and labelled at the write itself — no second update that can half-fail.
       accountId: account?.id ?? null,
     });
     if (account) store.recordLaneLease(account.id, 'short', beijingDayStart(Date.now()), slot.at, 'matrix');
-    recordArms(store, id, arms);
+    // The arm on record is the shape that actually ran. A chart that failed to build is a text
+    // post; leaving it under `chart` drags that comparison toward zero — the same rule the polish
+    // arm follows when a rewrite is rejected.
+    recordArms(store, id, images.length === 0 && arms.h_chart === 'chart' ? { ...arms, h_chart: 'text' } : arms);
     // Consume the material. Without this every account's pass sees the same unused list
     // and drafts the same events, which is the duplication the matrix exists to avoid.
     store.markMaterialUsed(m.id);
@@ -565,6 +605,8 @@ export interface PublishReport {
   published: { id: number; url?: string }[];
   uncertain: { id: number; label: string }[];
   failed: { id: number; label: string }[];
+  /** Drafts the pre-publish check found no longer true; rejected, so their slot and quota free up. */
+  dropped: { id: number; label: string }[];
   /** Things the last-mile gate fixed rather than blocked — worth surfacing, not alarming. */
   notes: string[];
   paused: boolean;
@@ -574,13 +616,19 @@ export interface PublishReport {
  * Send everything that is approved and due.
  * A gateway timeout is recorded as `uncertain` and the post is never re-sent —
  * the only safe reading of that response is "it probably went through".
+ *
+ * A draft is written for a slot that may be hours away, so before a market post goes out its
+ * numbers are checked against the market as it is now: re-rendered with the live figures, or
+ * dropped when the reading it makes has stopped being true (see freshen.ts). This runs on live
+ * sends only; a drill touches neither the market data nor the queue, unless a test hands in its
+ * own `quote`.
  */
 export async function publishDue(
   store: Store,
   settings: Settings,
-  opts: { live?: boolean; apiKey?: string; account?: AccountRow } = {},
+  opts: { live?: boolean; apiKey?: string; account?: AccountRow; quote?: QuoteFn } = {},
 ): Promise<PublishReport> {
-  const report: PublishReport = { attempted: 0, published: [], uncertain: [], failed: [], notes: [], paused: false };
+  const report: PublishReport = { attempted: 0, published: [], uncertain: [], failed: [], dropped: [], notes: [], paused: false };
   const acct = opts.account ?? null;
   // P0-2: the env-var fallback is gone. A live publish without an account-bound key used to
   // quietly drain nothing and count as 「失败1」 every tick — the 4.7h stall dressed up as a
@@ -609,8 +657,10 @@ export async function publishDue(
     .sort((a, b) => (a.scheduled_at ?? a.created_at) - (b.scheduled_at ?? b.created_at) || a.id - b.id);
   // Posts queued in the same run must not duplicate each other either.
   const justSent: string[] = [];
+  const freshenFor = opts.live || opts.quote ? { quote: opts.quote } : null;
 
-  for (const post of due) {
+  for (const row of due) {
+    let post = row;
     const candidate = { id: post.id, at: post.scheduled_at ?? post.created_at };
     const slot = acct ? nextSlotFor(store, settings, acct, Date.now(), candidate) : nextSlot(store, settings, Date.now(), candidate);
     if (!slot.allowed) {
@@ -626,6 +676,24 @@ export async function publishDue(
       break;
     }
     report.attempted++;
+
+    // Re-check the numbers against the market at the minute of sending, before any gate reads the
+    // text: the duplicate and compliance checks below must judge the words that will go out.
+    if (freshenFor) {
+      const fr = await freshenForPublish(store, settings, post, acct, freshenFor);
+      if (fr.kind === 'drop') {
+        store.updatePost(post.id, { status: 'rejected', error: `发布前复核：${fr.why}` });
+        store.log('freshen', { postId: post.id, outcome: 'drop', why: fr.why });
+        report.dropped.push({ id: post.id, label: fr.why });
+        continue;
+      }
+      if (fr.kind === 'update') {
+        applyFreshen(store, post, fr);
+        store.log('freshen', { postId: post.id, outcome: 'update', drift: fr.drift });
+        report.notes.push(`#${post.id} 发布前按最新行情重写${fr.drift ? `：${fr.drift}` : ''}`);
+        post = store.postById(post.id) ?? post;
+      }
+    }
 
     // Last gate before the network: approval can come from the CLI in bulk, so the
     // duplicate check lives here where it cannot be stepped around.
@@ -913,18 +981,12 @@ export async function generateFromPool(
       continue;
     }
 
-    let text = c.text;
     const arms = planArms({ seed: hashString(`${material.id}:arms`), verdicts: rankVerdicts, only: settings.activeExperiments, exclude: ['h_column', 'h_column_polish'] });
     const pb = playbook(store, { verdicts: rankVerdicts, arms });
-    text = applyVoice(text, material.facts, pb, material.id);
-    if (eff.appendDisclaimer && !carriesDisclaimer(text)) {
-      text = `${text}\n${wordBank['disclaimer.default']}`;
-    }
-    const polished = await applyPolish(store, eff, text, c.result.facts, acct?.persona_note ?? '', {
-      category: material.category, subType: material.subType, symbol: material.symbol, verdicts: rankVerdicts,
+    const finished = await finishShort(store, eff, { text: c.text, facts: c.result.facts }, material, pb, material.id, {
+      persona: acct?.persona_note ?? '', verdicts: rankVerdicts,
     });
-    text = polished.text;
-    if (eff.appendHashtags) text = withHashtags(text, material, pb.hashtagTotal);
+    const text = finished.text;
     const thin = tooThin(c.result.facts, text);
     if (thin) {
       report.skipped.push({ symbol: e.symbol, why: thin });
@@ -932,6 +994,7 @@ export async function generateFromPool(
     }
 
     let chart: string | null = null;
+    let card: string | undefined;
     if (eff.attachChart && pb.attachChart) {
       try {
         const built = await buildChartFor(
@@ -945,8 +1008,14 @@ export async function generateFromPool(
           },
           undefined,
           settings.chartInterval,
+          {
+            column: CATEGORY_LABELS.attention,
+            annotation: cardAnnotation(text),
+            watermark: acct ? `@ ${acct.label}` : undefined,
+          },
         );
         chart = built?.path ?? null;
+        card = built?.card;
       } catch (err) {
         report.errors.push(`chart ${e.symbol}: ${String(err).slice(0, 100)}`);
       }
@@ -962,12 +1031,13 @@ export async function generateFromPool(
       status: eff.autoPublish ? 'approved' : 'draft',
       scheduledAt: slot.at,
       facts: c.result.facts,
-      trace: { ...c.result.trace, polish: polished.note, account: acct?.label ?? null },
-      images: chart ? [chart] : [],
+      trace: { ...c.result.trace, polish: finished.polishNote, voiceSeed: material.id, account: acct?.label ?? null },
+      images: card && chart ? [card, chart] : chart ? [chart] : [],
       accountId: acct?.id ?? null,
     });
     if (acct) store.recordLaneLease(acct.id, 'short', beijingDayStart(Date.now()), slot.at, 'matrix');
-    recordArms(store, id, arms);
+    // Same rule as the short lane: no image means the post ran as text, whatever was drawn.
+    recordArms(store, id, !chart && arms.h_chart === 'chart' ? { ...arms, h_chart: 'text' } : arms);
     store.markMaterialUsed(material.id);
     // One post per attention rise; the coin stays blocked until the cooldown passes.
     store.claim(e.symbol, id, e.score, acct?.id ?? null);

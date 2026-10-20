@@ -72,6 +72,11 @@ export const binance = {
     return rows.filter(r => r.symbol.endsWith('USDT'));
   },
 
+  /** One contract's 24h ticker — the pre-publish check needs one coin, not the whole board. */
+  async futuresTicker(symbol: string): Promise<FuturesTicker24h> {
+    return fetchJson<FuturesTicker24h>(`${FUT}/fapi/v1/ticker/24hr?symbol=${symbol}`);
+  },
+
   async klines(symbol: string, interval: '1m' | '3m' | '5m' | '15m' | '1h' | '4h' | '1d', limit = 100): Promise<Kline[]> {
     return fetchJson<Kline[]>(`${SPOT}/api/v3/klines?symbol=${symbol}&interval=${interval}&limit=${limit}`);
   },
@@ -83,6 +88,10 @@ export const binance = {
 
   async premiumIndex(): Promise<PremiumIndex[]> {
     return fetchJson<PremiumIndex[]>(`${FUT}/fapi/v1/premiumIndex`);
+  },
+
+  async premiumIndexFor(symbol: string): Promise<PremiumIndex> {
+    return fetchJson<PremiumIndex>(`${FUT}/fapi/v1/premiumIndex?symbol=${symbol}`);
   },
 
   async fundingHistory(symbol: string, limit = 3): Promise<{ symbol: string; fundingRate: string; fundingTime: number }[]> {

@@ -81,7 +81,9 @@ function navCount(id) {
   if (id === 'queue') return STATE.pending || 0;
   if (id === 'accounts') return (STATE.accounts || []).filter(a => a.enabled).length || 0;
   if (id === 'templates') return STATE.templateCount || 0;
-  if (id === 'ops') return OPS_LAST ? OPS_LAST.live.filter(a => sevRank(a.severity) >= 1).length : 0;
+  // 三分出处（§9c 判据 4 加）：总线残量 + 面板自算 + 仅存在于 tick note 的限制条件。
+  // 读不到的那一面不铺 0（宁可少计），题注里点名缺面 —— 见 opsBadge()。
+  if (id === 'ops') return opsBadge().n;
   if (id === 'overview') return s.autoRun ? 0 : 0;
   return 0;
 }
@@ -92,7 +94,9 @@ function renderNav() {
       <i>${esc(group)}</i>
       ${items.map(([id, label, , icon]) => {
         const n = navCount(id);
-        return `<button class="${id === TAB ? 'on' : ''}" onclick="go('${id}')" title="${esc(label)}">
+        // 运行台那枚角标的题注必须带三分拆法，否则"3"会被读成"三面都证实了 3 枚"。
+        const title = id === 'ops' ? `${label} —— ${opsBadge().title}` : label;
+        return `<button class="${id === TAB ? 'on' : ''}" onclick="go('${id}')" title="${esc(title)}">
           <svg viewBox="0 0 24 24" stroke-linecap="round" stroke-linejoin="round">${icon}</svg>
           <span>${esc(label)}</span>${n ? `<span class="cnt">${n}</span>` : ''}
         </button>`;
@@ -107,11 +111,14 @@ async function go(tab) {
   await render();
 }
 
-function fmtTs(ms) {
+function fmtTs(ms, withSeconds = false) {
   if (!ms) return '—';
   const d = new Date(ms + 8 * 3600000);
   const p = n => String(n).padStart(2, '0');
-  return `${p(d.getUTCMonth() + 1)}-${p(d.getUTCDate())} ${p(d.getUTCHours())}:${p(d.getUTCMinutes())}`;
+  // 秒位是给网格相位用的（22:05:36.9 与 :36.89 不是同一个钟面读数）；默认仍只到分钟，
+  // 免得把所有历史读数的宽度改掉。
+  const sec = withSeconds ? ':' + p(d.getUTCSeconds()) + (ms % 1000 ? '.' + String(ms % 1000).padStart(3, '0') : '') : '';
+  return `${p(d.getUTCMonth() + 1)}-${p(d.getUTCDate())} ${p(d.getUTCHours())}:${p(d.getUTCMinutes())}${sec}`;
 }
 function ago(ms) {
   const s = (Date.now() - ms) / 1000;
@@ -122,16 +129,499 @@ function ago(ms) {
 }
 const scoreCls = n => n >= 70 ? 's-high' : n >= 55 ? 's-mid' : 's-low';
 
+/* ------------------------------------------------- 账号维度 · 四元组 · 首屏三问 ---
+ * 群主的原话是"不区分账号"。这一格为真：帖子、概览、素材、效果分析都只按状态过滤，
+ * 账号只在「账号」这一页出现。所以这里把账号提成一等维度 —— 但只在自己能证明的范围内说大话：
+ *
+ * 1) 合并数字必须带着它的母体出场。"今日 4 条"如果不说是两个号加起来的，就会被当成
+ *    一个号的成绩读；停用号混在合并里，合并值还继续增长，看起来像"当前在发"。
+ * 2) 每个数都带四元组：母体 n ／ 口径 ／ 尺 ／ 取数时刻。缺任一枚就写"无出处"，
+ *    并把这条降级为"只展示、不判读" —— 不许裸数字出现在页面上。
+ * 3) 取数时刻是本机读到 /api/status 的那一刻，不是服务器的钟：面板拿不到服务端时间戳
+ *    （补字段属后端的只读接口件），所以这里明写"面板读取时刻"，不冒充库内时刻。
+ * 4) 分母只用库内四字段（status/published_at/square_post_id/url），不用事件行计数 ——
+ *    现网实测事件行 52 ⊂ 库内 53，缺的那一枚确实对外发过。
+ * ----------------------------------------------------------------------------- */
+
+const OUTWARD_FIELDS = ['status', 'published_at', 'square_post_id', 'url'];
+const OUTWARD_CALIBER = `库内四字段：status=published ∧ ${OUTWARD_FIELDS.slice(1).join(' ∧ ')}`;
+const STATUS_SIX = ['draft', 'approved', 'published', 'rejected', 'failed', 'uncertain'];
+
+/** 每次 /api/status 回来就打一个点；页面上所有"取于"都指向它，绝不沿用上一轮的读数。 */
+let FETCHED_AT = 0;
+/** 0 = 全部账号（合并口径）；其余 = 单个账号 id。选中的号停用后仍不算"当前"。 */
+let ACCT = (() => {
+  const v = Number(localStorage.getItem('sf-acct'));
+  return Number.isInteger(v) && v > 0 ? v : 0;
+})();
+
+function acctScopeOf(accounts, acctId) {
+  const all = accounts || [];
+  const one = acctId ? all.find(a => a.id === acctId) || null : null;
+  const off = all.filter(a => !a.enabled).length;
+  return {
+    one,
+    id: one ? one.id : null,
+    label: one ? (one.label ?? String(one.id)) : '全部账号',
+    isOne: Boolean(one),
+    n: one ? 1 : all.length,
+    off,
+    // 停用号绝不进"当前"这句话；它只是历史母体的一部分。
+    caliber: one
+      ? `单号 · ${one.label ?? one.id}${one.enabled ? '' : '（已停用 · 不是当前）'}`
+      : `合并 ${all.length} 号${off ? ` · 含 ${off} 个停用` : ''}`,
+  };
+}
+const acctScope = () => acctScopeOf(STATE.accounts, ACCT);
+
+/**
+ * 归属过滤：没有账号的行（早期存量 60 条）只在合并视图里出现，且必须被点名，
+ * 否则"合并"就悄悄把无主稿算进了某个号的功劳里。
+ */
+function rowsInScope(rows, acctId) {
+  const list = rows || [];
+  if (acctId) return list.filter(r => (r.account_id ?? null) === acctId);
+  return list;
+}
+const unownedCount = rows => (rows || []).filter(r => r.account_id == null).length;
+
+/** 对外分母：四个库内字段齐了才算"发出去了"。事件行不算。 */
+function outwardRows(rows) {
+  return (rows || []).filter(p => p.status === 'published' && OUTWARD_FIELDS.slice(1).every(k => p[k]));
+}
+
+function srcLine(t) {
+  const parts = [
+    `母体 ${t && t.n != null ? (typeof t.n === 'number' ? t.n + ' 条' : t.n) : '未取'}`,
+    `口径 ${t && t.caliber ? t.caliber : '未标注'}`,
+    `尺 ${t && t.ruler ? t.ruler : '未标注'}`,
+    `取于 ${t && t.at ? (typeof t.at === 'string' ? t.at : fmtTs(t.at, true) + '（北京 · 面板读取时刻）') : '未取'}`,
+  ];
+  const incomplete = !t || t.n == null || !t.caliber || !t.ruler || !t.at;
+  // 四元组默认折进一枚小徽标：审计链一条不少，但不再平铺在页面上压过数字本身。
+  return `<details class="src${incomplete ? ' unk' : ''}"><summary>溯源${incomplete ? ' · 无出处不判读' : ''}</summary><span>${esc(parts.join(' ｜ '))}</span></details>`;
+}
+/** 一次性给全四元组的快捷入口：n／口径／尺由调用方点名，时刻统一取本轮 FETCHED_AT。 */
+const tupleOf = (n, caliber, ruler) => ({ n, caliber, ruler, at: FETCHED_AT });
+/** 从 tip 行里提四元组：凡名字以 母体／口径／尺／取于 开头的行就是这一格的出处，缺哪枚就报哪枚。 */
+function tupleFromRows(rows) {
+  const get = pre => (rows || []).find(r => String(r[0]).startsWith(pre));
+  const val = pre => { const r = get(pre); return r ? String(r[1]) : null; };
+  return { n: val('母体'), caliber: val('口径'), ruler: val('尺') || val('发帖时段'), at: val('取于') };
+}
+
+/** 分母为零时不显示比率，也不显示 0%。0% 会把"没样本"读成"没人看"。 */
+function ratioOrDash(num, den, fmt) {
+  if (!den) return { v: '—', note: '无分母 · 不显示比率' };
+  return { v: fmt(num / den), note: `${num} / ${den}` };
+}
+
+/**
+ * 状态六格分列：一格都不并母。缺格补 0，但 0 与"读不到"必须在同一行里区分开 ——
+ * 整表拿不到时传 null，渲染成"未取"，绝不渲染成一排 0。
+ */
+function sixGrid(rows) {
+  if (!rows) return { ok: false, cells: STATUS_SIX.map(s => [s, null]), other: 0 };
+  const by = {};
+  for (const s of STATUS_SIX) by[s] = 0;
+  let other = 0;
+  for (const r of rows) { if (by[r.status] != null) by[r.status] += 1; else other += 1; }
+  return { ok: true, cells: STATUS_SIX.map(s => [s, by[s]]), other };
+}
+
+/**
+ * 熔断两栏：`acked:false` 有两态 —— 从未签（ackedAt:null）与签后过 24h 静音窗重火
+ * （ackedAt 留旧值），只有 ackedAt 能区分，所以禁止写成"未签"一栏。
+ * 台账拿不到时返回 ok:false —— 面板不许把"读不到"报成"没有"。
+ */
+function breakerGrid(items) {
+  if (!items) return { ok: false, never: null, refire: null, acked: null, total: null };
+  const list = items.filter(i => i && i.kind === 'breaker_tripped');
+  return {
+    ok: true,
+    total: list.length,
+    never: list.filter(i => i.acked === false && (i.ackedAt == null || i.ackedAt === 0)).length,
+    refire: list.filter(i => i.acked === false && i.ackedAt != null && i.ackedAt !== 0).length,
+    acked: list.filter(i => i.acked === true).length,
+  };
+}
+
+/**
+ * 告警面按 kind 摊开"全量条目 / 未签残量"。HTTP 200 与自己那一条变绿都不算数 ——
+ * 挡止按 kind 全量、解除按 (kind,key) 逐枚，所以残量必须整列出来。
+ * 无总线数据（现网 /api/status 还没带 alerts）时，residual 一律 null = 不可判。
+ */
+function alertKinds(items) {
+  if (!items) return { ok: false, rows: [] };
+  const by = {};
+  for (const it of items) {
+    const k = it.kind || '(无 kind)';
+    const r = by[k] || (by[k] = { kind: k, total: 0, unacked: 0, keys: [], severity: 'info', bus: false, panel: false });
+    r.total += 1;
+    if (it.source === 'bus') r.bus = true; else r.panel = true;
+    if (it.acked !== true) r.unacked += 1;
+    if (it.key) r.keys.push(it.key);
+    if (sevRank(it.severity) > sevRank(r.severity)) r.severity = it.severity;
+  }
+  return { ok: true, rows: Object.values(by).sort((a, b) => sevRank(b.severity) - sevRank(a.severity) || b.unacked - a.unacked) };
+}
+
+/**
+ * 挡止面三分出处（§9c 判据 4 加 · 裁定八十五）。三个证据面各有独立的读数状态：
+ * ① 总线 kind —— `/api/status.alerts`（`activeAlerts()`）逐枚 (kind,key)，残量＝未签；
+ * ② 面板自算 —— `opsState` 从 state 推出来的条目（`source:'panel'`），只展示、不驱动灯；
+ * ③ 仅存在于 `tick` note —— 事件面根本没有同名 kind 的限制条件。现网已核两枚：
+ *    `stats_stalled`（谓词 `sentinel.ts:84`／产出 `:85`，只写旧告警码面＋note）与「未唤醒大脑」（`daemon.ts:384`，只有 note）。
+ * 禁手：不许拿"ledger 无条目／kind 无此名"推"无挡止"。而且 notes 是**边沿触发**的
+ * （`daemon.ts:383` 那条 push 只对 `sn.raised` 里的每一枚留行 ⇒ 同一条件持续成立也只留一轮）⇒ 第三面读到、且这轮没有新行，也只能写
+ * "最近一轮没有新行"，仍不能写成"没有挡止"。缺哪一面就点名哪一面。
+ */
+const NOTE_ONLY = [
+  { mark: 'stats_stalled', cn: '效果数据断流 · 学习回路在读空气', where: 'sentinel.ts:84 谓词／:85 产出 ⇒ 旧告警码面＋tick note · 事件面无同名 kind' },
+  { mark: '未唤醒大脑', cn: '大脑未唤醒 · 今日唤醒次数已达上限', where: 'src/daemon.ts:384 ⇒ 只有 tick note · 事件面无同名 kind' },
+];
+const FACE_CN = { bus: '总线 kind', panel: '面板自算', note: '仅 tick note' };
+
+/** 第三面：note 与旧告警码面各自独立可读，两个都拿不到就是不可判（不写"没有"）。 */
+function noteFaces(notes, alarms) {
+  const hasNotes = Array.isArray(notes);
+  const hasAlarms = Array.isArray(alarms);
+  const rows = NOTE_ONLY.map(c => {
+    const hit = hasNotes ? notes.filter(n => typeof n === 'string' && n.includes(c.mark)) : [];
+    const led = hasAlarms ? alarms.filter(a => a && a.code === c.mark) : [];
+    return {
+      mark: c.mark,
+      cn: c.cn,
+      where: c.where,
+      noteN: hit.length,
+      note: hit.length ? String(hit[0]).slice(0, 90) : null,
+      alarmAt: led.length ? Math.max(...led.map(a => Number(a.at) || 0)) : null,
+      seen: hit.length > 0 || led.length > 0,
+    };
+  });
+  return { ok: hasNotes || hasAlarms, hasNotes, hasAlarms, rows, any: rows.some(r => r.seen) };
+}
+
+/**
+ * 把三面摊成一个结构：每面要么给数组（读到），要么给 null（不可判）。
+ * 面板自算面里 `displayOnly` 那几枚单列 —— 它们按契约不驱动灯，混进残量就假报警。
+ */
+function blockerFaces(q) {
+  const alerts = Array.isArray(q.alerts) ? q.alerts : null;
+  const bus = alerts ? alerts.filter(a => a && a.acked !== true) : null;
+  const ops = q.ops || null;
+  const panel = ops ? ops.all.filter(a => a.source !== 'bus' && a.acked !== true && !a.displayOnly) : null;
+  const shown = ops ? ops.all.filter(a => a.source !== 'bus' && a.acked !== true && a.displayOnly) : null;
+  const note = noteFaces(q.notes, q.alarms);
+  const missing = [];
+  if (!bus) missing.push(`${FACE_CN.bus}未接入`);
+  if (!panel) missing.push(`${FACE_CN.panel}未算（运行台状态层没跑过）`);
+  if (!note.ok) missing.push(`${FACE_CN.note}未取到最近一轮`);
+  const counts = [bus, panel].map(x => (x == null ? null : x.length)).concat([note.any ? note.rows.filter(r => r.seen).length : null]);
+  return { bus, panel, shown, note, missing, counts, conclusive: missing.length === 0 };
+}
+
+/** 角标三分：读不到的那一面不铺 0，只在题注里点名 —— 角标宁可少计也不假报警。 */
+function opsBadge() {
+  const f = blockerFaces({ alerts: STATE.alerts, ops: OPS_LAST, notes: STATE.loop?.lastTick?.notes, alarms: null });
+  const n = (f.bus?.length ?? 0) + (f.panel?.length ?? 0) + (f.note.ok ? f.note.rows.filter(r => r.seen).length : 0);
+  const seg = x => (x == null ? '不可判' : String(x));
+  return {
+    n,
+    title: `挡止角标三分：${FACE_CN.bus} ${seg(f.bus?.length)} · ${FACE_CN.panel} ${seg(f.panel?.length)} · ${FACE_CN.note} ${seg(f.note.ok ? f.note.rows.filter(r => r.seen).length : null)}${f.missing.length ? `（缺面：${f.missing.join('／')} ⇒ 不推"无挡止"）` : ''}`,
+  };
+}
+
+/** 三分出处的呈现：整段折进可展开面板 —— 摘要行给三面计数，缺面在摘要里直接点名。 */
+function blockerFacesHtml(f) {
+  const pill = a => `<span class="pill ${sevRank(a.severity) >= 2 ? 'bad' : a.severity === 'warning' ? 'warn' : 'plain'}">${esc(a.kind)}｜${esc(a.key)}${a.ackedAt ? ' · 签后过窗重火' : ''}</span>`;
+  const face = (label, xs, extra) => `<div class="facerow"><span class="lbl">${label}</span>${
+    xs == null ? '<span class="pill warn plain">不可判 —— 这一面没读到</span>' : xs.length ? xs.map(pill).join(' ') : '<span class="muted">读到：这一面 0 枚</span>'}${extra || ''}</div>`;
+  const noteRow = r => `<div class="facerow"><span class="lbl">${FACE_CN.note}</span>${
+    !f.note.ok ? '<span class="pill warn plain">不可判 —— 最近一轮 tick 的 notes 没取到</span>'
+      : r.seen ? `<span class="pill warn plain">${esc(r.cn)} · note ${r.noteN} 行${r.alarmAt ? ` · 旧码面最近 ${fmtTs(r.alarmAt)}` : ''}</span>`
+        : `<span class="pill plain">${esc(r.cn)} · 最近一轮没有新行（notes 边沿触发 ⇒ 这不等于"没有"）</span>`}
+    <span class="muted">${esc(r.where)}</span></div>`;
+  const seg = x => (x == null ? '不可判' : String(x));
+  const noteSeen = f.note.ok ? f.note.rows.filter(r => r.seen).length : null;
+  return `<details class="faces">
+    <summary><span class="ttl">阻断面三分出处</span><b>${FACE_CN.bus} ${seg(f.bus?.length ?? null)} ／ ${FACE_CN.panel} ${seg(f.panel?.length ?? null)} ／ ${FACE_CN.note} ${seg(noteSeen)}</b>${f.missing.length ? `<b class="miss">缺面：${esc(f.missing.join('／'))}</b>` : ''}<i>展开</i></summary>
+    <div class="faces-in">
+      <div class="sub">缺任何一面都不许写"无挡止"；三面的母体不同，不并成一格</div>
+      ${face(`${FACE_CN.bus} · 未签残量`, f.bus)}
+      ${face(`${FACE_CN.panel} · 只展示／不驱动灯`, f.panel, f.shown?.length ? ` <span class="muted">另 ${f.shown.length} 枚只展示</span>` : '')}
+      ${f.note.rows.map(noteRow).join('')}
+      ${f.missing.length ? `<div class="src unk"><span>覆盖声明：${esc(f.missing.join('／'))} ⇒ 禁推"无挡止"；三面的母体不同，不并成一格</span></div>`
+        : '<div class="src"><span>覆盖声明：三面都读到（母体分别＝总线台账／面板可见 state／最近一轮 notes＋旧告警码面）· 不并母</span></div>'}
+    </div>
+  </details>`;
+}
+
+/**
+ * 旧码面（brain_alarms）的中文标签与"同名不同物"声明（裁定八十六 §二）。
+ * `breaker` 这枚的谓词是"最近窗浏览中位数低于 floor"（sentinel.ts:29-34），
+ * 和发布门里那枚 busBreaker（总线台账 breaker_tripped 未签，bus.ts:159-162）**只是同名**。
+ * 面板必须把这句话说出来 —— 否则旧码面出现 breaker 会被读成"发布门挡着"，反之亦然。
+ */
+const LEGACY_CODE_CN = {
+  breaker: '熔断（浏览量低于线）', stats_stalled: '回抓停了', no_posts: '停发',
+  brain_failing: '大脑调用失败', no_comments: '无评论', outlier_good: '异常好',
+  gate_a_cleared: '关卡 A 过线', calls_failing: '判断不成立',
+};
+const NOT_THE_PUBLISH_GATE = { breaker: '≠ 发布门那枚（这枚谓词＝浏览中位数低于 floor）' };
+/** 发布门那枚的反向标签：看到 bus 的 breaker_tripped 时也要说清它不是浏览量熔断。 */
+const GATE_KIND_NOTE = { breaker_tripped: '这是发布门那枚（总线台账，未签＝整个自动面被挡），不是旧码面的浏览量熔断' };
+function legacyCodeCell(code) {
+  const cn = LEGACY_CODE_CN[code] || code;
+  return `<span class="pill ${code === 'breaker' ? 'bad' : 'info'}">${esc(cn)}</span>${NOT_THE_PUBLISH_GATE[code] ? `<span class="tag">${esc(NOT_THE_PUBLISH_GATE[code])}</span>` : ''}`;
+}
+
+/** 账号切换条：全部 + 每个号；停用号用"停用"旗标压住，不会被看成当前在跑的号。 */
+function accountBar(scope) {
+  const all = STATE.accounts || [];
+  const chip = (id, label, off) => `<button class="chip ${ACCT === id ? 'on' : ''}${off ? ' off' : ''}" onclick="setAcct(${id})">${esc(label)}${off ? ' · 停用' : ''}</button>`;
+  return `<div class="acctbar">
+    <span class="lbl">账号维度</span>
+    <div class="chips">${chip(0, `全部（${scope.caliber.replace(/^合并 /, '')}）`, false)}${all.map(a => chip(a.id, a.label ?? String(a.id), !a.enabled)).join('')}</div>
+    <span class="scope">${esc(scope.isOne ? `当前视图＝${scope.label}` : `当前视图＝合并 ${scope.n} 号${scope.off ? `（含 ${scope.off} 停用）` : ''}`)}</span>
+  </div>`;
+}
+
+async function setAcct(id) {
+  const next = Number(id) || 0;
+  if (next && !(STATE.accounts || []).some(a => a.id === next)) { toast('这个号不在当前账号列表里', true); return; }
+  ACCT = next;
+  localStorage.setItem('sf-acct', String(ACCT));
+  await render();
+}
+
+/**
+ * 发布门四枚（`daemon.ts:206`：`opts.live && settings.autoPublish && !breakerNow.tripped && !busBreaker`）。
+ *
+ * 排程给出的"下一帖 HH:mm 可发"不含这四枚里任何一枚（`schedule.ts:59-88` 只管额度／间隔／时段窗），
+ * 所以现网出现过"标签页亮红＋首屏说可发"并存 —— 两个不同谓词被画成同一句话。这里逐枚给
+ * 通过／不通过／不可判，并给出挡止那一枚的 kind 残量；面板证明不了的（`live`）就明写证明不了。
+ */
+function publishGateRows(q) {
+  const unacked = (q.alerts || []).filter(a => a && a.kind === 'breaker_tripped' && a.acked !== true);
+  const keys = unacked.map(a => a.key);
+  const acctAp = q.accountAutoPublish;
+  const gates = [
+    {
+      name: '① opts.live',
+      verdict: 'unknown',
+      why: '演练轮与实跑轮分不开：`TickResult` 里没有 live 字段（`daemon.ts:56-72`），而 `dryRun` 也推前 `lastTickAt`（`:127`）⇒ 面板无法从载荷证明这一枚，禁当成通过。',
+    },
+    {
+      name: '② settings.autoPublish',
+      verdict: q.autoPublish === undefined ? 'unknown' : q.autoPublish ? 'pass' : 'blocked',
+      why: q.autoPublish === undefined
+        ? '读不到全局 stored 值。'
+        : `全局 stored＝${q.autoPublish ? '开' : '关（等人工审核）'}${acctAp === null || acctAp === undefined ? '' : ` · 号级 auto_publish 覆盖＝${acctAp ? '开' : '关'}（生效值看号级那一枚）`}`,
+    },
+    {
+      name: '③ !breakerNow.tripped（浏览量熔断）',
+      verdict: q.breaker === undefined || q.breaker === null ? 'unknown' : q.breaker.tripped ? 'blocked' : 'pass',
+      why: !q.breaker || q.breaker.tripped === undefined
+        ? '这一枚只在 /api/brain 的 breaker 面里，面板没拉到 ⇒ 不可判。'
+        : `中位 ${q.breaker.median == null ? '无读数' : Math.round(q.breaker.median)} ／ 线 ${q.breaker.floor} · 窗 ${q.breaker.window} 条${q.breaker.tripped ? ' ⇒ 已停止自动发布，需在 AI 大脑页手动恢复' : ''}`,
+    },
+    {
+      name: '④ !busBreaker（告警总线熔断）',
+      verdict: q.alerts === undefined || q.alerts === null ? 'unknown' : unacked.length ? 'blocked' : 'pass',
+      why: q.alerts == null
+        ? '总线台账读不到 ⇒ 不可判（把不可判当通过＝假绿）。'
+        : `breaker_tripped 未确认残量 ${unacked.length} 枚${keys.length ? `（key：${keys.join(' / ')}）` : ''}。挡止按 kind 全量、解除按 (kind,key) 逐枚 —— 签一枚不够，除非该 kind 只剩这一枚。`,
+      residual: unacked.length,
+    },
+  ];
+  return gates;
+}
+
+/** 四枚里第一个真正挡住的：不可判排在通过之前，绝不算"没挡住"。 */
+function blockingGate(gates) {
+  return gates.find(g => g.verdict === 'blocked') || gates.find(g => g.verdict === 'unknown') || null;
+}
+
+/**
+ * 下一班拆两行：排程时刻一行、发布门残量一行。
+ * 单值"下一帖 HH:mm"以"可发"语气显示是禁止的 —— 那把两个谓词合成了一句。
+ */
+function shiftClock(state, gates, scope) {
+  const next = state.next || {};
+  const blocker = blockingGate(gates);
+  const bad = gates.filter(g => g.verdict === 'blocked').length;
+  const unk = gates.filter(g => g.verdict === 'unknown').length;
+  // 门状态灯：四枚固定用短标签，完整名字与理由悬浮可见、细节可展开。
+  const SHORT_GATE = ['live', 'autoPublish', 'breakerNow', 'busBreaker'];
+  const chip = (g, i) => `<span class="gatechip ${g.verdict}" title="${esc(g.name)} · ${esc(g.why)}"><i></i>${esc(SHORT_GATE[i] ?? g.name.replace(/（.*?）/g, ''))}</span>`;
+  const chips = `<div class="gatechips">${gates.map(chip).join('')}</div>`;
+  const proof = `<details class="proof"><summary>判定细节</summary><div class="proof-in">
+      <div class="gatewhy"><b>排程时刻</b>＝网格相位（相位随进程换，禁沿用上一轮）· 排程谓词只含额度／间隔／时段窗 —— 这一格不含发布门，门单独看下面四枚</div>
+      ${gates.map(g => `<div class="gatewhy">${esc(g.name)} · ${esc(g.why)}</div>`).join('')}
+      ${srcLine(tupleOf(scope.n, `${scope.caliber} · 号级 auto_publish 可再覆盖一层`, '排程＝nextSlot（额度／间隔／时段窗）· 门＝daemon.ts:206 四枚'))}
+    </div></details>`;
+  if (!next.allowed) {
+    return `<div class="clockcard"><div class="clock"><span class="clock-nope">不可发</span></div>
+      <span class="clock-ago">${esc(next.reason || '原因未记录')}</span>
+      <span class="clock-gate ${bad ? 'bad' : 'warn'}">${bad ? `门里 ${bad} 枚不通过、${unk} 枚不可判` : `门里有 ${unk} 枚不可判`}</span>
+      ${chips}${proof}</div>`;
+  }
+  const d = new Date(next.at + 8 * 3600000);
+  const p = n => String(n).padStart(2, '0');
+  const hm = `${p(d.getUTCHours())}:${p(d.getUTCMinutes())}:${p(d.getUTCSeconds())}`;
+  const gate = bad
+    ? `<span class="clock-gate bad">门挡 · ${bad} 枚不通过${blocker ? ` · ${esc(blocker.name.replace(/（.*?）/g, ''))}` : ''}</span>`
+    : unk ? '<span class="clock-gate warn">门里有不可判</span>' : '<span class="clock-gate ok">四门全过</span>';
+  return `<div class="clockcard">
+      <div class="clock"><b>${hm}</b><span class="clock-date">${p(d.getUTCMonth() + 1)}-${p(d.getUTCDate())}</span><span class="clock-ago">距今 ${Math.max(0, Math.round((next.at - Date.now()) / 60_000))} 分</span></div>
+      ${gate}${chips}${proof}</div>`;
+}
+
+/**
+ * 队列／待发布必须点名"一表还是两表"：`pendingQueueCount`（`db/index.ts:1044-1054`）是
+ * `posts` ∪ `studio_articles` 两段 UNION ALL，而只看 `posts` 的读数会给出 0 ——
+ * 同屏 7 与 0 两个真数就是这么来的，不是时点差。
+ */
+function queueSplit(postsRows, studioRows, acctId) {
+  const pick = rows => (rows || []).filter(r => !acctId || (r.account_id ?? null) === acctId);
+  const p = pick(postsRows), a = pick(studioRows);
+  const cnt = (rows, st) => rows.filter(r => r.status === st).length;
+  return {
+    ok: postsRows != null && studioRows != null,
+    posts: { draft: cnt(p, 'draft'), approved: cnt(p, 'approved'), n: p.length },
+    studio: { draft: cnt(a, 'draft'), approved: cnt(a, 'approved'), n: a.length },
+    total: cnt(p, 'draft') + cnt(p, 'approved') + cnt(a, 'draft') + cnt(a, 'approved'),
+    acctId: acctId || null,
+  };
+}
+
+function queueSplitHtml(q, scope) {
+  if (!q.ok) return `<div class="src unk">待发布＝两表口径 · 其中一表读不到 ⇒ 不显示合并数（读不到≠零）</div>`;
+  return `<div class="kv" style="flex-wrap:wrap;gap:8px;margin-top:6px">
+      <span class="pill plain">两表分列：posts 草稿 ${q.posts.draft}／已通过 ${q.posts.approved} · studio_articles 草稿 ${q.studio.draft}／已通过 ${q.studio.approved}</span>
+      <span class="pill ${q.total ? 'warn' : 'plain'}">合计 ${q.total} 条 = 号级封顶用的那个数</span>
+      ${q.studio.draft + q.studio.approved > 0 ? '<span class="muted">长文草稿计入号级"待发布"是设计意图（共用同一个额度）—— 它会把短帖生成门顶到"已达每日目标"，即使熔断面签了仍按住生成侧。</span>' : ''}
+    </div>
+    ${srcLine(tupleOf(q.posts.n + q.studio.n, `母体＝posts ∪ studio_articles（两表 UNION ALL）· ${scope.caliber}${q.acctId ? ' · 按号过滤' : ' · 不分号'}`, '只数 draft／approved 两态 · 队列数不过日界'))}`;
+}
+
+/**
+ * 首屏三问 —— 概览页顶部先把这三个答案给出来：今天发了几帖 ／ 现在被什么挡着 ／ 下一班几点。
+ * 三个答案各自带自己的四元组，且"被什么挡着"允许回答"面板读不到"，不允许留空当没挡住。
+ * 第二问按**三分出处**建（§9c 判据 4 加 · 裁定八十五）：每条都带着它来自哪一面，
+ * 缺哪一面就单独点名哪一面 —— 缺面时禁止任何"无挡止"措辞。
+ */
+function firstScreen(q) {
+  const out = outwardRows(q.rows);
+  const today = (q.rows || []).filter(p => p.published_at && bjDay(p.published_at) === bjDay(Date.now()));
+  const sent = out.filter(p => p.published_at && bjDay(p.published_at) === bjDay(Date.now()));
+  const faces = blockerFaces({ alerts: q.alerts, ops: q.ops, notes: q.notes, alarms: q.alarms });
+  const bus = [];
+  if (q.breaker && q.breaker.ok && q.breaker.never + q.breaker.refire > 0) {
+    bus.push(`[${FACE_CN.bus}] 熔断面未签 ${q.breaker.never + q.breaker.refire} 枚（从未签 ${q.breaker.never} ／ 过窗重火 ${q.breaker.refire}）`);
+  }
+  const panel = [];
+  if (q.hasKey === false) panel.push(`[${FACE_CN.panel}] 没有广场 Key：只能演练`);
+  if (q.paused) panel.push(`[${FACE_CN.panel}] 已暂停：${q.pauseReason || '原因未记录'}`);
+  if (q.autoPublish === false) panel.push(`[${FACE_CN.panel}] 自动发布关着：等人工审核`);
+  if (q.next && q.next.allowed === false) panel.push(`[${FACE_CN.panel}] 下一班不可发：${q.next.reason || '原因未记录'}`);
+  if ((q.orphanPending ?? 0) > 0) panel.push(`[${FACE_CN.panel}] ${q.orphanPending} 条无归属账号（只展示，不驱动灯）`);
+  const note = faces.note.rows.filter(r => r.seen).map(r => `[${FACE_CN.note}] ${r.cn} —— ${r.where}`);
+  const blockers = bus.concat(panel, note);
+  // "没读到"与"读到且为空"是两件事：前者只许写不可判，两者都不许写成"无挡止"。
+  const unknown = [];
+  if (!faces.bus) unknown.push(`${FACE_CN.bus}残量不可判（台账未接入面板）`);
+  if (!faces.panel) unknown.push(`${FACE_CN.panel}未算（状态层这轮没跑）`);
+  if (!faces.note.ok) unknown.push(`${FACE_CN.note}未取到最近一轮（loop.lastTick 缺位）`);
+  return {
+    scope: q.scope,
+    sentToday: { v: sent.length, tuple: tupleOf(out.length, `${OUTWARD_CALIBER} · 北京日 ${bjDay(Date.now())}`, '库内 published_at 落在北京今日') },
+    inLibrary: { v: q.publishedToday ?? out.length, tuple: tupleOf(out.length, OUTWARD_CALIBER, '接口 publishedToday（不区分日界口径见尺）') },
+    draftedToday: { v: today.length, tuple: tupleOf(q.rows ? q.rows.length : null, '库内 status=published 行 · 北京日', '面板自算 · 只展示不判读') },
+    blockers: blockers.length ? blockers
+      : unknown.length ? [`不能判"无挡止"：${unknown.join('／')}`]
+        : ['三面都读到、都没有未确认条目（notes 边沿触发 ⇒ 这只算"最近一轮没有新行"，不算"没有"）'],
+    faces,
+    blockerTuple: tupleOf(q.alertCount ?? null, `三分出处：${FACE_CN.bus}／${FACE_CN.panel}／${FACE_CN.note}（缺面单列，不推无挡止）`, 'kind 全量／残量分列；note 面按 (标记, 最近一轮) 计'),
+    next: q.next || null,
+    nextTuple: tupleOf(q.scope.n, q.scope.caliber, q.next?.allowed ? '派生式 max(min_interval, ⌊窗长/帖数⌋) · 见"下一班"尺注' : '不可发'),
+  };
+}
+
+/**
+ * 按号表：效果分析那页的后端只读接口没有号参数（补字段归后端），所以这一格是面板自算。
+ * 面板自算的行只展示、不参与判定；无归属账号的行单列一行，不并进任何一个号。
+ * 整表读不到（rows=null）时返回 ok:false，页面写"未取"，不铺一排 0。
+ */
+function acctScopeTable(rows) {
+  if (!rows) return { ok: false, rows: [] };
+  const out = outwardRows(rows);
+  const by = {};
+  for (const p of out) {
+    const id = p.account_id ?? null;
+    const r = by[id] || (by[id] = { id, label: id == null ? '无归属账号' : (p.account_label ?? `账号 ${id}`), off: false, n: 0, measured: 0, views: 0, likes: 0, comments: 0, shares: 0 });
+    r.n += 1;
+    if (p.stats) { r.measured += 1; r.views += p.stats.views || 0; r.likes += p.stats.likes || 0; r.comments += p.stats.comments || 0; r.shares += p.stats.shares || 0; }
+  }
+  const a = acctScopeOf(STATE.accounts, null);
+  for (const acc of (STATE.accounts || [])) if (by[acc.id]) by[acc.id].off = !acc.enabled;
+  const list = Object.values(by).sort((x, y) => y.n - x.n);
+  const median = vs => { const v = vs.filter(x => x != null).sort((x, y) => x - y); return v.length ? v[Math.floor((v.length - 1) / 2)] : null; };
+  for (const r of list) {
+    r.medianViews = median(out.filter(p => (p.account_id ?? null) === r.id && p.stats).map(p => p.stats.views || 0));
+    r.per1k = r.views ? Math.round(((r.likes + r.comments + r.shares) / r.views) * 1000) : null;
+  }
+  return { ok: true, rows: list, n: out.length, mergedCaliber: a.caliber, listed: (STATE.accounts || []).length };
+}
+
+function acctTableHtml(t) {
+  if (!t.ok) return `<div class="card" style="margin-top:14px"><div class="empty"><b>按号读数未取</b><span>发帖列表拉不到 —— 这里不会铺一排 0，也不会把合并数按号分。</span></div></div>`;
+  return `<div class="card" style="margin-top:14px">
+    <div class="card-hd"><h3>按号看</h3><span class="sub">面板自算 · 只展示、不参与判定与验收</span></div>
+    <div class="tw"><table><thead><tr><th>账号</th><th class="num">已发布（四字段）</th><th class="num">有读数</th><th class="num">中位浏览</th><th class="num">互动/千</th><th class="num">赞·评·转</th></tr></thead>
+      <tbody>${t.rows.map(r => `<tr class="${r.id == null ? 'off' : ''}">
+        <td><span class="b">${esc(r.label)}</span>${r.off ? '<span class="pill warn plain">已停用 · 不是当前</span>' : ''}</td>
+        <td class="num">${r.n}</td>
+        <td class="num">${r.measured}<span class="muted"> / ${r.n}</span></td>
+        <td class="num">${r.medianViews == null ? '—' : fmtN(r.medianViews)}</td>
+        <td class="num">${r.per1k == null ? '无分母 · 不显示' : r.per1k}</td>
+        <td class="num muted">${r.likes}·${r.comments}·${r.shares}</td>
+      </tr>`).join('') || '<tr><td colspan="6" class="muted">列表里没有四字段齐的已发布行</td></tr>'}</tbody></table></div>
+    ${srcLine(tupleOf(t.n, `库内四字段 · 面板自算按号（列表接口前 200 条，不是全库）`, '中位数＝nearest-rank · 互动/千 分母是该号累计浏览量；无读数不并进母体'))}
+  </div>`;
+}
+
 /** The always-visible strip: what the machine is doing right now, without opening a page. */
+/**
+ * 侧栏「下一帖」那一行（判据 3 对侧栏同样成立）：单值时刻禁止带"可发"语气。
+ * 后缀必须是发布门里第一枚未过的门（不可判也算未过），口径行自己声明"这一行不含发布门"。
+ */
+function sideNextRow(state, scope, s) {
+  const next = state.next;
+  if (!next || !next.allowed) {
+    return `<div class="mt"><span>下一帖</span><b>暂不可发</b></div>
+      <div class="src">${esc(`不可发：${next?.reason || '原因未记录'}`)}</div>`;
+  }
+  const g = blockingGate(publishGateRows({ alerts: state.alerts, autoPublish: s?.autoPublish, breaker: state.breaker ?? null }));
+  const short = g ? g.name.replace(/（.*?）/g, '') : '';
+  return `<div class="mt"><span>下一帖</span><b>${hhmm(next.at)} <small>排程</small></b>${
+    g ? `<span class="pill ${g.verdict === 'blocked' ? 'bad' : 'warn'} plain" title="${esc(g.name)} · ${esc(g.why)}">门未过：${esc(short)}</span>`
+      : '<span class="pill on plain">四枚门都过</span>'}</div>
+    <div class="src">${esc(`口径 全局排程（合并 ${scope.n} 号）· 这一行不含发布门 · 尺 ${nominalHint()} 分钟派生 · 依据 ${next.reason || '未记录'}`)}</div>`;
+}
+
 function renderChrome() {
   const s = STATE.settings || {};
+  const scope = acctScope();
   const [, , sub] = pageMeta(TAB);
   $('#pageTitle').textContent = NAV_FLAT.find(([k]) => k === TAB)?.[1] ?? '概览';
   $('#pageSub').textContent = sub;
   const paused = STATE.pause?.paused;
   const chips = [
     paused ? ['bad', `已暂停：${STATE.pause.reason}`] : [s.autoPublish ? 'on' : 'info', s.autoPublish ? '自动发布中' : '人工审核中'],
-    ['plain', `今日 ${STATE.publishedToday ?? 0} / ${s.dailyCap ?? 0}`],
+    // 合并数必须在场面上就带口径，否则"今日 4 条"会被读成单个号的成绩。
+    ['plain', `今日 ${STATE.publishedToday ?? 0} / ${s.dailyCap ?? 0} · ${scope.caliber}`],
     STATE.pending ? ['plain', `队列 ${STATE.pending} 条`] : ['plain', '队列空'],
     [STATE.hasKey ? 'on' : 'warn', STATE.hasKey ? '广场 Key 已配置' : '未配 Key（只能演练）'],
   ];
@@ -140,16 +630,18 @@ function renderChrome() {
   const used = cap ? Math.min(100, ((STATE.publishedToday ?? 0) / cap) * 100) : 0;
   $('#sideFoot').innerHTML = `
     <div class="meter">
-      <div class="mt"><span>今日额度</span><b>${STATE.publishedToday ?? 0} / ${cap}</b></div>
+      <div class="mt"><span>今日合计 / 全局硬上限</span><b>${STATE.publishedToday ?? 0} / ${cap}</b></div>
       <div class="track"><i style="width:${used}%"></i></div>
+      <div class="src">${esc(`口径 ${scope.caliber} · 取于 ${fmtTs(FETCHED_AT)}（北京 · 面板读取时刻）`)}</div>
     </div>
     <div class="mt"><span>自动循环</span><b>${s.autoRun ? (STATE.loop?.lastTick ? ago(STATE.loop.lastTick.at) : '未跑过') : '已关闭'}</b></div>
-    <div class="mt"><span>下一帖</span><b>${STATE.next?.allowed ? fmtTs(STATE.next.at) : '暂不可发'}</b></div>`;
+    ${sideNextRow(STATE, scope, s)}`;
 }
 
 async function render() {
   captureLlmForm();
   STATE = await api('/api/status');
+  FETCHED_AT = Date.now();
   renderChrome();
   opsRefresh(STATE);
   renderNav();
@@ -182,7 +674,9 @@ const STYLE_CHOICES = [
   ['chat', '唠嗑派', '第一人称聊天口吻，像朋友分享'],
   ['joke', '段子手', '幽默玩梗，把行情写成段子'],
 ];
-const CADENCE_PRESETS = [['轻松', 12], ['标准', 24], ['积极', 40]];
+// 档位贴着定稿的承诺（每号 4 帖/天，区间 3–5）。原来的 12/24/40 是「点一下就把额度抬到
+// 承诺的六倍」，而且 24 帖在 45 分钟最小间隔、8:00–24:00 时段下根本铺不满（最多 21 条）。
+const CADENCE_PRESETS = [['轻', 3], ['标准', 4], ['积极', 5]];
 const CATEGORY_CHOICES = [
   ['newsflash', '快讯消息', '金十、PANews、吴说等快讯'],
   ['announcement', '币安公告', '上新、下架、活动公告'],
@@ -199,10 +693,15 @@ const CATEGORY_CHOICES = [
 let TPLIST = [];
 
 /** Live readout of what a cadence actually means, instead of a bare number. */
-function intervalHint(ppd, start, end) {
+function intervalHint(ppd, start, end, minInt) {
   const span = (end === 24 ? 1440 : end * 60) - start * 60;
   if (span <= 0 || !ppd) return '';
-  return `平均每 ${Math.max(1, Math.round(span / ppd))} 分钟一帖`;
+  const floor = Math.max(1, minInt || 1);
+  const reach = Math.max(1, Math.floor(span / floor));
+  // 不报一个比最小间隔还密的节奏：24 帖铺在 8:00–24:00 算出「每 40 分钟一帖」，而最小
+  // 间隔是 45 分钟——那个数做不到，只会让人以为额度被谁吞了。
+  if (ppd > reach) return `这个节奏最多装 ${reach} 条（${span} 分 ÷ ${floor} 分）`;
+  return `平均每 ${Math.max(floor, Math.round(span / ppd))} 分钟一帖`;
 }
 
 function chipGroup(name, choices, selected) {
@@ -224,6 +723,11 @@ function accountCard(a) {
   const start = a.active_start_hour ?? STATE.settings.activeStartHour;
   const end = a.active_end_hour ?? STATE.settings.activeEndHour;
   const ap = a.auto_publish === null ? 'inherit' : (a.auto_publish ? 'auto' : 'review');
+  // 目标与上限是两个数：目标是这个号自己铺排节奏用的，硬上限是全局共用的天花板。
+  const minInt = a.min_interval_minutes ?? STATE.settings.minIntervalMinutes;
+  const spanMin = (end === 24 ? 1440 : end * 60) - start * 60;
+  const reach = spanMin > 0 ? Math.max(1, Math.floor(spanMin / Math.max(1, minInt))) : ppd;
+  const perPost = spanMin > 0 ? Math.max(minInt, Math.round(spanMin / Math.max(1, ppd))) : minInt;
   const mini = (label, value, sub, rows) => `<div class="tile"${rows ? tip(label, rows) : ''}>
       <div class="lbl">${label}</div><div class="v" style="font-size:19px">${value}</div><div class="s">${sub}</div></div>`;
   return `
@@ -247,15 +751,17 @@ function accountCard(a) {
       <svg viewBox="0 0 24 24"><path d="M12 9v4M12 17h.01M10.3 3.9L2.4 18a2 2 0 001.7 3h15.8a2 2 0 001.7-3L13.7 3.9a2 2 0 00-3.4 0z"/></svg>
       <div>${esc(a.last_error)}</div></div>` : ''}
     <div class="grid gkpi" style="margin-top:12px">
-      ${mini('今日', `${a.today}<small>/${a.trackId ? `${a.articlesPerDay} 篇` : ppd}</small>`, a.trackId ? '长文额度' : '短帖额度',
-        [['已发', `${a.today}`], ['上限', `${a.trackId ? `${a.articlesPerDay} 篇长文` : `${ppd} 帖`}`], ['口径', '长文与短帖共用同一个 Key 的日额度']])}
+      ${mini('今日', `${a.today}<small>/${a.trackId ? `${a.articlesPerDay} 篇` : ppd}</small>`, a.trackId ? '长文额度' : '今日目标',
+        [['已发', `${a.today}`], ['今日目标', `${a.trackId ? `${a.articlesPerDay} 篇长文` : `${ppd} 帖`}`],
+         ['全局硬上限', `${STATE.settings.dailyCap} 帖 · 所有号合计`], ['这个节奏装得下', `${reach} 帖`],
+         ['口径', '目标是这个号铺排间隔用的数，硬上限是全局共用的天花板，两者不是一回事']])}
       ${mini('队列', a.pending ?? 0, a.pending ? '已排好分钟' : '空的，下一轮现写',
         [['待发布', `${a.pending ?? 0} 条`], ['说明', a.pending ? '到点由自动循环发出' : '队列空时下一轮会现写现发']])}
       ${mini('下一帖', a.next?.allowed && a.next.at ? hhmm(a.next.at) : '不可发', a.next?.allowed ? fmtTs(a.next.at).slice(0, 5) : esc(a.next?.reason ?? ''),
         [['时间', a.next?.allowed && a.next.at ? fmtTs(a.next.at) : '不可发'], ['依据', a.next?.reason ?? '']])}
-      ${mini('节奏', a.trackId ? `${a.articlesPerDay}<small> 篇/天</small>` : `${intervalHint(ppd, start, end).replace('平均每 ', '').replace(' 分钟一帖', '')}<small> 分钟/帖</small>`,
-        a.trackId ? '长文赛道自带的间隔' : `时段 ${start}:00–${end}:00 · 每天 ${ppd} 帖`,
-        [['最小间隔', `${a.min_interval_minutes ?? STATE.settings.minIntervalMinutes} 分钟`], ['每天目标', `${a.trackId ? `${a.articlesPerDay} 篇长文` : `${ppd} 帖`}`], ['发帖时段', `${start}:00 – ${end}:00`], ['错峰偏移', `${a.phase_minutes} 分钟`]])}
+      ${mini('节奏', a.trackId ? `${a.articlesPerDay}<small> 篇/天</small>` : `${perPost}<small> 分钟/帖</small>`,
+        a.trackId ? '长文赛道自带的间隔' : ppd > reach ? `每天 ${ppd} 帖超出这个节奏 · 最多装 ${reach} 条` : `时段 ${start}:00–${end}:00 · 每天 ${ppd} 帖`,
+        [['最小间隔', `${minInt} 分钟`], ['每天目标', `${a.trackId ? `${a.articlesPerDay} 篇长文` : `${ppd} 帖`}`], ['这个节奏装得下', `${reach} 帖（时段 ${spanMin} 分 ÷ 最小间隔 ${minInt} 分）`], ['发帖时段', `${start}:00 – ${end}:00`], ['错峰偏移', `${a.phase_minutes} 分钟`]])}
     </div>
     ${open ? `
     <div class="grp"><div class="gh">发帖节奏</div>
@@ -264,7 +770,7 @@ function accountCard(a) {
         <span class="muted">自定义</span>
         <input type="number" id="ac-ppd-${a.id}" min="1" max="100" value="${ppd}" style="width:74px" oninput="cadenceHint(${a.id})">
         <input type="hidden" id="ac-start-${a.id}" value="${start}"><input type="hidden" id="ac-end-${a.id}" value="${end}">
-        <span class="pill" id="ac-hint-${a.id}">${esc(intervalHint(ppd, start, end))}</span>
+        <span class="pill" id="ac-hint-${a.id}">${esc(intervalHint(ppd, start, end, minInt))}</span>
       </div>
       <div class="kv">
         <span class="muted">发帖时段</span>
@@ -379,8 +885,9 @@ function csv(sel) { return (document.querySelector(sel)?.value || '').split(/[,�
 function checkedValues(name) { return [...document.querySelectorAll(`input[name="${name}"]:checked`)].map(i => i.value); }
 
 async function patchAccount(id, body) {
-  await api('/api/accounts/' + id, { method: 'PATCH', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body) });
+  const r = await api('/api/accounts/' + id, { method: 'PATCH', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body) });
   await render();
+  return r;
 }
 
 async function saveAccount(id) {
@@ -406,19 +913,21 @@ async function saveAccount(id) {
     blockedSymbols: csv(`#ac-deny-${id}`),
   };
   if (!body.label) return toast('备注名不能为空', true);
-  await patchAccount(id, body);
-  toast('已保存');
+  const r = await patchAccount(id, body);
+  toast(r?.note ?? '已保存');
 }
 
 function cadenceHint(id) {
   const ppd = +$(`#ac-ppd-${id}`).value, start = +$(`#ac-start2-${id}`).value, end = +$(`#ac-end2-${id}`).value;
-  $(`#ac-hint-${id}`).textContent = intervalHint(ppd, start, end);
+  const el = $(`#ac-minint-${id}`);
+  $(`#ac-hint-${id}`).textContent = intervalHint(ppd, start, end, el ? +el.value : STATE.settings.minIntervalMinutes);
 }
 
 async function setCadence(id, n) {
   const start = +$(`#ac-start2-${id}`).value, end = +$(`#ac-end2-${id}`).value;
-  await patchAccount(id, { postsPerDay: n, activeStartHour: start, activeEndHour: end });
-  toast(`已设为 ${n} 帖/天`);
+  // 后端会把装不下的额度收到物理上限并说一声，这里原话转达，不让人以为填多少就是多少。
+  const r = await patchAccount(id, { postsPerDay: n, activeStartHour: start, activeEndHour: end });
+  toast(r?.note ?? `已设为 ${n} 帖/天`);
 }
 
 async function setWindow(id, s, e) { await patchAccount(id, { activeStartHour: s, activeEndHour: e }); toast('时段已保存'); }
@@ -469,25 +978,48 @@ async function removeAccount(id) {
 
 async function overview() {
   const s = STATE.settings;
-  const recent = await api('/api/posts?status=published&limit=8').catch(() => []);
+  const scope = acctScope();
+  // 一次多取一些再按号过滤：直接带 limit=8 的话，选单个号时会在过滤前先丢一批。
+  const feedAll = await api('/api/posts?status=published&limit=120').catch(() => []);
+  const mine = rowsInScope(feedAll, ACCT).slice(0, 8);
+  const fs = firstScreen({
+    rows: rowsInScope(feedAll, ACCT), scope, hasKey: STATE.hasKey, paused: STATE.pause?.paused,
+    pauseReason: STATE.pause?.reason, autoPublish: s.autoPublish, next: STATE.next,
+    publishedToday: STATE.publishedToday, orphanPending: STATE.orphanPending,
+    alertCount: STATE.alerts ? STATE.alerts.length : (OPS_LAST ? OPS_LAST.all.length : null),
+    breaker: breakerGrid(STATE.alerts ?? null),
+    // 挡止面三分（§9c 判据 4 加）：总线台账／面板状态层／最近一轮 tick notes。
+    // 这一页**不读 /api/brain**（evaluateBreaker 会写 settings.breaker），所以旧告警码面留给运行台。
+    alerts: STATE.alerts, ops: OPS_LAST, notes: STATE.loop?.lastTick?.notes ?? null, alarms: null,
+  });
   const cap = s.dailyCap || 1;
+  // 发布门四枚：面板证不了 ①（TickResult 无 live 字段），③ 只在 /api/brain 里、这一页不拉它
+  // （evaluateBreaker 会写 settings.breaker ⇒ 不在概览的轮询里顺手 latch）。两枚都记"不可判"。
+  const gates = publishGateRows({
+    alerts: STATE.alerts, autoPublish: s.autoPublish,
+    accountAutoPublish: scope.one ? (scope.one.auto_publish ?? null) : null,
+    breaker: STATE.breaker ?? null,
+  });
+  // 瓦片只留三问没有覆盖的三格：运行状态／待发布／待用素材 —— 避免同一个数在首屏出现两遍。
   const tiles = [
     ['运行状态', STATE.pause.paused ? '已暂停' : (s.autoRun ? '运行中' : '已停摆'),
       STATE.pause.paused ? esc(STATE.pause.reason) : (s.autoRun ? `每 ${s.tickMinutes} 分钟一轮 · ${STATE.loop?.lastTick ? '上次 ' + ago(STATE.loop.lastTick.at) : '还没跑过'}` : '自动循环已在设置里关闭'),
       STATE.pause.paused ? 'bad' : s.autoRun ? 'good' : 'warn',
-      [['自动发布', s.autoPublish ? '开（到点直接发）' : '关（等人工审核）'], ['自动循环', s.autoRun ? `每 ${s.tickMinutes} 分钟` : '已关闭'], ['上次循环', STATE.loop?.lastTick ? fmtTs(STATE.loop.lastTick.at) : '还没跑过'], ['广场 Key', STATE.hasKey ? '已配置' : '未配置，只能演练']]],
-    ['今日已发', `${STATE.publishedToday}<small>/ ${s.dailyCap}</small>`, `币安硬上限 100 帖/天/Key`, '',
-      [['今日已发', `${STATE.publishedToday} 条`], ['自设上限', `${s.dailyCap} 条`], ['官方上限', '100 条 / Key / 天'], ['口径', '短帖与长文共用同一个额度']]],
-    ['下一帖', STATE.next.allowed ? `<span style="font-size:19px">${fmtTs(STATE.next.at)}</span>` : '<span style="font-size:19px">暂不可发</span>',
-      esc(STATE.next.allowed ? `距今 ${Math.max(0, Math.round((STATE.next.at - Date.now()) / 60000))} 分钟` : STATE.next.reason), '',
-      [['时间', STATE.next.allowed ? fmtTs(STATE.next.at) : '不可发'], ['依据', STATE.next.reason], ['目标间隔', `${nominalHint()} 分钟`], ['发帖时段', `${s.activeStartHour}:00 – ${s.activeEndHour}:00`]]],
+      [['自动发布', s.autoPublish ? '开（到点直接发）' : '关（等人工审核）'], ['自动循环', s.autoRun ? `每 ${s.tickMinutes} 分钟` : '已关闭'], ['上次循环', STATE.loop?.lastTick ? fmtTs(STATE.loop.lastTick.at) : '还没跑过'], ['广场 Key', STATE.hasKey ? '已配置' : '未配置，只能演练'],
+       ['母体', `全局设置 · 不分数（${scope.n} 号共用一个开关）`], ['口径', '自动发布＝全局 stored；号级 auto_publish 可再覆盖一层，见账号页'],
+       ['尺', `上次循环＝tick 行的轮起时刻（北京）`], ['取于', `${fmtTs(FETCHED_AT)}（北京 · 面板读取时刻）`]]],
     ['待发布', `${STATE.pending ?? 0}<small>条</small>`, STATE.orphanPending ? `<span style="color:var(--red)">${STATE.orphanPending} 条没有归属账号</span>` : '已排好分钟，到点自动发', '',
-      (STATE.accounts || []).map(a => [`${a.label}（${a.trackId ? '长文' : '短帖'}）`, `队列 ${a.pending} · 今日 ${a.today}/${a.articlesPerDay ?? a.posts_per_day ?? s.postsPerDay}`])],
-    ['待用素材', `${STATE.unused}<small>条</small>`, '近 6 小时抓到、还没生成过', '', null],
+      (STATE.accounts || []).map(a => [`${a.label}（${a.trackId ? '长文' : '短帖'}${a.enabled ? '' : ' · 停用'}）`, `队列 ${a.pending} · 今日 ${a.today}/${a.articlesPerDay ?? a.posts_per_day ?? s.postsPerDay}`]
+      ).concat([['母体', `${scope.n} 号 · ${scope.caliber}`], ['口径', `接口 pending＝posts(draft,approved)＋studio_articles(draft,approved)，${scope.isOne ? '按号' : '不分号'}`],
+       ['尺', '队列数不过日界（同 pendingQueueCount）—— 长文积压不随 08:00 释放'], ['取于', `${fmtTs(FETCHED_AT)}（北京 · 面板读取时刻）`]])],
+    ['待用素材', `${STATE.unused}<small>条</small>`, '近 6 小时抓到、还没生成过', '',
+      [['母体', '素材表 · 不按号分（素材没有账号归属）'], ['口径', 'unused＝近 6 小时抓到且未生成过'],
+       ['尺', '抓取时刻（素材 at）'], ['取于', `${fmtTs(FETCHED_AT)}（北京 · 面板读取时刻）`],
+       ['账号维度', '本数不适用 —— 素材在生成草稿时才挂号；强行按号切会造出一个假维度']]],
   ];
 
-  const acctRows = (STATE.accounts || []).map(a => `<tr>
-      <td><span class="b">${esc(a.label)}</span>${a.owner ? `<span class="sub">${esc(a.owner)}</span>` : ''}</td>
+  const acctRows = (STATE.accounts || []).map(a => `<tr class="${ACCT === a.id ? 'sel' : ''}${a.enabled ? '' : ' off'}">
+      <td><span class="b">${esc(a.label)}</span>${a.owner ? `<span class="sub">${esc(a.owner)}</span>` : ''}${a.enabled ? '' : '<span class="pill warn plain">已停用 · 不是当前</span>'}</td>
       <td>${a.trackId ? `<span class="pill on">${esc(a.trackLabel)} 长文</span>` : a.enabled ? '<span class="pill on">短帖矩阵</span>' : '<span class="pill">已停用</span>'}</td>
       <td class="num">${a.today} <span class="muted">/ ${a.articlesPerDay ?? a.posts_per_day ?? s.postsPerDay}</span></td>
       <td class="num">${a.pending}</td>
@@ -495,11 +1027,12 @@ async function overview() {
       <td>${a.key?.set ? '<span class="pill on plain">Key 已配</span>' : '<span class="pill warn plain">缺 Key</span>'}${a.proxy_url ? '' : ' <span class="pill warn plain">共用 IP</span>'}</td>
     </tr>`).join('');
 
-  const feed = recent.length ? recent.map(p => `<div class="feed-row">
+  const feed = mine.length ? mine.map(p => `<div class="feed-row">
       <span class="feed-t">${ago(p.published_at ?? p.created_at)}</span>
       <span class="feed-x">${esc((p.text || '').split('\n')[0].slice(0, 46))}</span>
+      <span class="feed-a">${esc(p.account_label ?? '无归属')}</span>
       <span class="feed-v">${p.stats ? fmtN(p.stats.views) + ' 看' : '读数中'}</span>
-    </div>`).join('') : '<div class="empty"><b>还没有发出内容</b><span>第一条发出去之后，这里会按时间倒序列出最近的帖子。</span></div>';
+    </div>`).join('') : '<div class="empty"><b>这个视图里没有已发布内容</b><span>第一条发出去之后，这里会按时间倒序列出最近的帖子；换号或点"全部"看别的号。</span></div>';
 
   const cats = (STATE.materials || []).map(m => ({ ...m, label: CATEGORY_LABELS[m.category] ?? m.category }))
     .sort((a, b) => b.n - a.n);
@@ -513,7 +1046,35 @@ async function overview() {
       <td class="num">${Number(r.weight).toFixed(2)}</td>
     </tr>`).join('');
 
+  // 首屏三问的"无挡止"形态：三面都读到且都没有未确认条目 —— 这句话很长，但它是好消息。
+  const clearDay = fs.blockers.length === 1 && fs.blockers[0].startsWith('三面都读到');
+  const capN = s.dailyCap || 0;
+  const pct = capN ? Math.min(100, Math.round((fs.sentToday.v / capN) * 100)) : 0;
+
   return `
+  ${accountBar(scope)}
+
+  <div class="card first3">
+    <div class="card-hd"><h3>首屏三问</h3><span class="sub">今天发了几帖 · 现在被什么挡着 · 下一班几点</span>
+      <span class="right"><span class="muted">${esc(scope.caliber)}</span></span></div>
+    <div class="grid g3">
+      <div class="q qbig"><i>今天发了几帖</i>
+        <div class="qrow">
+          <div class="ring${pct >= 100 ? ' full' : ''}" style="--p:${pct}%"><div class="rv"><b>${fs.sentToday.v}</b><small>/ ${capN || '—'}</small></div></div>
+          <div class="qside"><span>对外口径＝四字段齐</span><span>接口今值 ${STATE.publishedToday ?? '未取'} / ${capN || '—'}</span></div>
+        </div>
+        ${srcLine(fs.sentToday.tuple)}</div>
+      <div class="q qbig"><i>现在被什么挡着</i>
+        <b class="qstat ${clearDay ? 'ok' : 'bad'}">${clearDay ? '通行' : '被挡'}</b>
+        <span class="qwhy">${esc(fs.blockers[0])}</span>
+        ${fs.blockers.length > 1 ? `<details class="src"><summary>另 ${fs.blockers.length - 1} 项 · 展开</summary><span>${fs.blockers.slice(1).map(esc).join('<br>')}</span></details>` : ''}
+        ${srcLine(fs.blockerTuple)}</div>
+      <div class="q qbig"><i>下一班几点 —— 排程与门是两件事</i>
+        ${shiftClock(STATE, gates, scope)}</div>
+    </div>
+    ${blockerFacesHtml(fs.faces)}
+  </div>
+
   ${STATE.warnings?.length ? STATE.warnings.map(w => `<div class="alert bad" style="margin-bottom:14px">
       <svg viewBox="0 0 24 24"><path d="M12 9v4M12 17h.01M10.3 3.9L2.4 18a2 2 0 001.7 3h15.8a2 2 0 001.7-3L13.7 3.9a2 2 0 00-3.4 0z"/></svg>
       <div>${esc(w)}</div></div>`).join('') : ''}
@@ -527,13 +1088,15 @@ async function overview() {
     <div class="card">
       <div class="card-hd"><h3>账号一览</h3><span class="sub">谁在干什么、今天发了多少</span>
         <span class="right"><button class="btn sm" onclick="go('accounts')">管理账号</button></span></div>
-      <div class="tw"><table><thead><tr><th>账号</th><th>岗位</th><th class="num">今日</th><th class="num">队列</th><th class="num">下一帖</th><th>密钥与出口</th></tr></thead>
+      <div class="tw"><table><thead><tr><th>账号</th><th>岗位</th><th class="num">今日/目标</th><th class="num">队列</th><th class="num">下一帖</th><th>密钥与出口</th></tr></thead>
         <tbody>${acctRows || '<tr><td colspan="6"><div class="empty"><b>还没有账号</b><span>加一个号、填上它的广场 Key，再打开开关。</span></div></td></tr>'}</tbody></table></div>
+      ${srcLine(tupleOf((STATE.accounts || []).length, '账号表全量 · 停用号带旗标、不算"当前"', '今日＝接口 accountPostsToday（北京日界）· 目标＝该号 posts_per_day（铺排间隔用）· 硬上限是全局 dailyCap，在设置页 · 队列＝pendingQueueCount 按号'))}
     </div>
     <div class="card">
-      <div class="card-hd"><h3>刚刚发出去</h3><span class="sub">最近 8 条 · 按时间</span>
+      <div class="card-hd"><h3>刚刚发出去</h3><span class="sub">${esc(scope.label)} · 最近 ${mine.length} 条 · 按时间</span>
         <span class="right"><button class="btn sm" onclick="go('queue')">全部记录</button></span></div>
       <div class="feed">${feed}</div>
+      ${srcLine(tupleOf(outwardRows(rowsInScope(feedAll, ACCT)).length, `${OUTWARD_CALIBER} · ${scope.caliber}`, '抓取列表前 120 条（LIMIT，不是全库）· 账号维度在面板侧过滤'))}
     </div>
   </div>
 
@@ -546,6 +1109,7 @@ async function overview() {
           <span class="track"><i style="width:${Math.max(3, (m.n / catMax) * 100)}%"></i></span>
           <span class="v"${tip(m.label, [['条数', m.n + ' 条'], ['最高分', m.best.toFixed(0)]])}>${m.n}<span class="muted">最高 ${m.best.toFixed(0)} 分</span></span>
         </div>`).join('')}</div>` : '<div class="empty"><b>还没有素材</b><span>点右上角「抓取素材」，或等自动循环下一轮自己抓。</span></div>'}
+      ${srcLine(tupleOf((STATE.materials || []).reduce((a, m) => a + m.n, 0), '素材表按分类 · 不按号分（素材在生成草稿时才挂号）', '接口 materials：每类的条数与最高分 · 账号维度不适用'))}
     </div>
     <div class="card">
       <div class="card-hd"><h3>当前节奏与护栏</h3><span class="sub">全局设置，账号可各自覆盖</span>
@@ -628,9 +1192,11 @@ async function materialsView() {
   const byCat = {};
   for (const m of rows) byCat[m.categoryCn] = (byCat[m.categoryCn] || 0) + 1;
   return `<div class="card">
+    ${accountBar(acctScope())}
     <div class="card-hd"><h3>素材库</h3><span class="sub">最近抓到的 ${rows.length} 条原始素材 · 分数越高越值得发</span>
       <span class="right"><button class="btn sm" onclick="act('collect')">抓取素材</button></span></div>
     <div class="hint" style="margin-top:0">每条素材都有保质期：多空比、费率这类数字一小时后就是错的陈述。过期素材会在自动循环里被作废，不会变成帖子。</div>
+    ${srcLine(tupleOf(rows.length, `素材表 · 账号维度不适用（素材在生成草稿时才挂号）· 当前视图 ${acctScope().caliber}`, '列表接口前 120 条（LIMIT，不是全库）· 尺＝素材抓取时刻 at'))}
   </div>
   <div class="card" style="margin-top:14px">
     <div class="tw"><table>
@@ -647,16 +1213,23 @@ async function materialsView() {
 }
 
 async function queueView() {
-  const posts = await api(`/api/posts?${POST_FILTER === '全部' ? '' : 'status=' + encodeURIComponent(POST_FILTER) + '&'}sort=${POST_SORT}`);
-  const counts = await api('/api/posts');
+  const scope = acctScope();
+  const posts = rowsInScope(await api(`/api/posts?${POST_FILTER === '全部' ? '' : 'status=' + encodeURIComponent(POST_FILTER) + '&'}sort=${POST_SORT}`), ACCT);
+  const all = await api('/api/posts').catch(() => null);
+  const counts = all === null ? [] : rowsInScope(all, ACCT);
+  // 六格用整表算，不用被状态筛过的列表算 —— 否则选"已发布"时其余五格全成 0，那是假象。
+  // 整表拉不到时传 null：sixGrid 渲染"未取"，绝不把读不到铺成一排 0。
+  const grid = sixGrid(all === null ? null : counts);
+  // 两表口径：pendingQueueCount 是 posts ∪ studio_articles，只看一表必然同屏出现两个真数。
+  // /api/studio 是只读列表（articles 里带 status 与 account_id）；拿不到就单列"读不到"。
+  const studio = await api('/api/studio').catch(() => null);
+  const studioArticles = studio && Array.isArray(studio.articles) ? studio.articles : null;
   const byStatus = {};
   for (const p of counts) byStatus[p.status] = (byStatus[p.status] ?? 0) + 1;
 
-  const tabs = ['全部', 'published', 'draft', 'approved', 'rejected', 'failed', 'uncertain'];
   const label = { 全部: '全部', published: '已发布', draft: '待审核', approved: '已通过', rejected: '已驳回', failed: '失败', uncertain: '状态未知' };
-  const chips = tabs
-    .filter(t => t === '全部' || (byStatus[t] ?? 0) > 0)
-    .map(t => `<button class="chip ${t === POST_FILTER ? 'on' : ''}" onclick="setPostFilter('${t}')">${label[t] ?? t}${t === '全部' ? ` ${counts.length}` : ` ${(byStatus[t] ?? 0)}`}</button>`)
+  const chips = ['全部', ...STATUS_SIX]
+    .map(t => `<button class="chip ${t === POST_FILTER ? 'on' : ''}" onclick="setPostFilter('${t}')">${label[t] ?? t}${t === '全部' ? ` ${counts.length}` : ` ${byStatus[t] ?? 0}`}</button>`)
     .join('');
 
   const n = posts.filter(p => p.stats).length;
@@ -676,18 +1249,53 @@ async function queueView() {
     : '';
 
   return `<div class="card">
-    <div class="card-hd"><h3>发帖记录</h3><span class="sub">${counts.length} 条 · 筛选与排序</span>
+    ${accountBar(scope)}
+    <div class="card-hd"><h3>发帖记录</h3><span class="sub">${counts.length} 条 · ${esc(scope.caliber)}${all && unownedCount(counts) ? ` · 其中 ${unownedCount(counts)} 条无归属账号（只展示）` : ''}</span>
       <span class="right"><div class="seg">
         <button class="${POST_SORT === 'recent' ? 'on' : ''}" onclick="setPostSort('recent')">最新</button>
         <button class="${POST_SORT === 'views' ? 'on' : ''}" onclick="setPostSort('views')">浏览最多</button>
       </div></span></div>
     <div class="chips">${chips}</div>
     ${banner}
-    <div class="hint">按浏览量排序时，还没拿到读数的帖子排在最后，不会被当成 0 浏览。</div>
+    <div class="hint">按浏览量排序时，还没拿到读数的帖子排在最后，不会被当成 0 浏览。状态六格分列、不并母。</div>
+    ${statusGridHtml(grid, scope)}
+    ${queueSplitHtml(queueSplit(all, studioArticles, ACCT), scope)}
+    ${breakerHtml(STATE.alerts ?? null)}
   </div>
   ${warn}
   ${posts.length ? `<div style="margin-top:14px">${posts.map(postCard).join('')}</div>`
-    : '<div class="card" style="margin-top:14px"><div class="empty"><b>这个筛选下没有记录</b><span>先「抓取素材」再「生成草稿」，草稿会出现在这里等审核或直接发布。</span></div></div>'}`;
+    : '<div class="card" style="margin-top:14px"><div class="empty"><b>这个视图里没有记录</b><span>换个号或点"全部账号"；先「抓取素材」再「生成草稿」，草稿会出现在这里等审核或直接发布。</span></div></div>'}`;
+}
+
+/** 状态六格分列：一格都不并母；0 就是 0，整表读不到才是"未取"。 */
+function statusGridHtml(grid, scope) {
+  const cells = grid.cells.map(([st, n]) => `<div class="sg${n == null ? ' unk' : ''}">
+      <i>${esc(STATUS_LABELS[st] || st)}</i><b>${n == null ? '未取' : n}</b></div>`).join('')
+    + (grid.other ? `<div class="sg other"><i>非六格状态</i><b>${grid.other}</b></div>` : '');
+  return `<div class="sixgrid">${cells}</div>
+    ${srcLine(tupleOf(grid.ok ? (grid.cells.reduce((a, [, n]) => a + (n || 0), 0)) : null,
+      `${scope.caliber} · 状态六格分列（不并母、不合并）`,
+      grid.ok ? `列表接口全量（LIMIT 150/页 · 账号维度在面板侧过滤）${grid.other ? ` · 另有 ${grid.other} 条不在六格内` : ''}` : '整表读不到 · 六格一律显示"未取"'))}`;
+}
+
+/**
+ * 熔断两栏：`acked:false` 有"从未签"与"签后过 24h 窗重火"两态，只有 ackedAt 能区分，
+ * 所以禁止压成一栏"未签"。
+ * 参数只能是总线台账（/api/status.alerts）—— 面板自算的那几项不是台账，把它们喂进来
+ * 会让"残量 0"显示成绿灯，而那正是投影面替代事实面的形状。
+ */
+function breakerHtml(ledger) {
+  const g = breakerGrid(ledger);
+  const kinds = alertKinds(ledger);
+  return `<div class="kv" style="margin-top:12px;padding-top:12px;border-top:1px solid var(--border);flex-wrap:wrap;gap:8px">
+      <span class="pill ${g.ok && g.never + g.refire > 0 ? 'bad' : g.ok ? 'on' : 'warn'}">${g.ok ? `熔断台账：从未签 ${g.never} · 签后过窗重火 ${g.refire} · 已签 ${g.acked}（发布门那枚，非旧码面浏览量熔断）` : '熔断残量：总线台账未接入面板 · 不可判'}</span>
+      ${kinds.ok ? (kinds.rows.length ? kinds.rows.map(r => `<span class="pill plain">${esc(KIND_CN[r.kind] || r.kind)} 全量 ${r.total} · 未确认 ${r.unacked}${r.keys.length ? ` · key ${esc(r.keys.join('/'))}` : ''}</span>`).join('') : '<span class="muted">总线这一轮读到 0 枚条目 —— 这是读到空集，不是"无挡止"。</span>')
+        : '<span class="muted">按 kind 的全量／残量要等总线落地；面板自算的那几项在运行台单列，不冒充台账残量。</span>'}
+    </div>
+    <div class="hint">${g.ok ? 'acked:false 是两态 —— 只有 ackedAt 能区分"从未签"与"签后过 24h 窗重火"，所以不并成一栏。' : '读不到就写不可判：把不可判铺成 0 会让面板显示"没有熔断"，那是假绿。'}</div>
+    ${srcLine(tupleOf(g.ok ? g.total : null,
+      g.ok ? 'kind 全量与 (kind,key) 残量分列 · HTTP 200 与"我签那枚变绿"都不算解除' : '熔断与告警残量：读不到（来源＝/api/status.alerts）',
+      g.ok ? 'ledger 的 acked／ackedAt 双字段（两态靠 ackedAt 区分，唯一写点 bus.ts:137）' : '现网 /api/status 无 alerts 字段 · 禁把读不到写成 0'))}`;
 }
 
 function postCard(p) {
@@ -776,25 +1384,34 @@ async function insightsView() {
 
   if (!t.posts) {
     return `<div class="card">
+      ${accountBar(acctScope())}
       <div class="chips">${days}</div>
       <div class="muted" style="margin-top:12px">还没有已发布的帖子，所以没有任何效果数据。等第一条发出去约 20 分钟，第一个读数会自己进来。</div>
+      ${srcLine(tupleOf(0, `${OUTWARD_CALIBER} · ${acctScope().caliber}`, `近 ${ANALYSIS_DAYS} 北京日 · 母体为零 ⇒ 本页不显示任何比率`))}
     </div>`;
   }
 
-  const kpi = (label, value, sub, rows) => `<div class="tile"${rows ? tip(label, rows) : ''}>
+  const kpi = (label, value, sub, rows, tn, tcaliber, truler) => `<div class="tile"${tip(label, (rows || []).concat([['母体 n', tn == null ? '未取' : `${tn} 条`], ['口径', tcaliber], ['尺', truler], ['取于', `${fmtTs(FETCHED_AT)}（北京 · 面板读取时刻）`]]))}>
       <div class="lbl">${label}</div><div class="v" style="font-size:22px">${value}</div>
       ${sub ? `<div class="s">${sub}</div>` : ''}
+      ${srcLine(tupleOf(tn, tcaliber, truler))}
     </div>`;
 
   // The reach/attraction pair is the whole point of this page, so it is shown side by side
   // rather than merged into one "performance" number that would hide the difference.
+  const MER = `后端只读接口全库 · 不分号（分号读数看下面「按号」表）`;
   const kpis = `<div class="grid gkpi">
-    ${kpi('已发布', t.posts, `${t.measured} 条拿到读数`, [['已发布', `${t.posts} 条`], ['拿到读数', `${t.measured} 条`], ['还没读数', `${t.posts - t.measured} 条`], ['口径', '发布后按 20 分钟 / 1 / 3 / 8 / 24 / 72 小时回看']])}
-    ${kpi('总浏览', fmtN(t.views), `中位 ${fmtN(t.medianViews)}`, [['累计浏览', fmtN(t.views)], ['单条中位', fmtN(t.medianViews)], ['为什么用中位数', '浏览量是长尾分布，一条爆款会把平均值抬到没有意义']])}
-    ${kpi('互动（赞+评+转）', t.likes + t.comments + t.shares, `每千次浏览 ${t.engagementPer1k} 次回应`, [['赞', String(t.likes)], ['评论', String(t.comments)], ['转发', String(t.shares)], ['每千次浏览', `${t.engagementPer1k} 次回应`], ['口径', '用「每千次浏览」而不是百分比：浏览量本身是基数，百分比会被它骗']])}
-    ${kpi('上过公开榜', t.surfaced, t.posts ? `上榜率 ${((t.surfaced / t.posts) * 100).toFixed(0)}%` : '—', [['上过榜', `${t.surfaced} 条`], ['上榜率', t.posts ? `${((t.surfaced / t.posts) * 100).toFixed(0)}%` : '—'], ['含义', '被广场算法推出去过，和「被人看到」是两件事']])}
-    ${kpi('广场热榜中位', fmtN(r.benchmark.trendMedian), `快讯流中位 ${fmtN(r.benchmark.newsMedian)}`, [['热榜中位', fmtN(r.benchmark.trendMedian)], ['快讯流中位', fmtN(r.benchmark.newsMedian)], ['基准样本', `${r.benchmark.pool} 条`], ['提醒', '榜上的帖子已经赢过一次算法筛选，直接对比会高估我们']])}
+    ${kpi('已发布', t.posts, `${t.measured} 条拿到读数`, [['已发布', `${t.posts} 条`], ['拿到读数', `${t.measured} 条`], ['还没读数', `${t.posts - t.measured} 条`], ['口径', '发布后按 20 分钟 / 1 / 3 / 8 / 24 / 72 小时回看']], t.posts, `${MER} · ${OUTWARD_CALIBER}`, `近 ${ANALYSIS_DAYS} 北京日 · 尺＝回看检查点`)}
+    ${kpi('总浏览', fmtN(t.views), `中位 ${fmtN(t.medianViews)}`, [['累计浏览', fmtN(t.views)], ['单条中位', fmtN(t.medianViews)], ['为什么用中位数', '浏览量是长尾分布，一条爆款会把平均值抬到没有意义']], t.measured, `${MER} · 只算拿到读数的行`, '中位数（nearest-rank）· 无读数的行不并进母体')}
+    ${kpi('互动（赞+评+转）', t.likes + t.comments + t.shares, `每千次浏览 ${t.engagementPer1k} 次回应`, [['赞', String(t.likes)], ['评论', String(t.comments)], ['转发', String(t.shares)], ['每千次浏览', `${t.engagementPer1k} 次回应`], ['口径', '用「每千次浏览」而不是百分比：浏览量本身是基数，百分比会被它骗']], t.measured, `${MER} · 赞+评+转`, '每千次浏览（分母是浏览量，不是帖子数）')}
+    ${kpi('上过公开榜', t.surfaced, `${ratioOrDash(t.surfaced, t.posts, x => (x * 100).toFixed(0) + '%').v === '—' ? '无分母 · 不显示比率' : `上榜率 ${ratioOrDash(t.surfaced, t.posts, x => (x * 100).toFixed(0) + '%').v}`}`, [['上过榜', `${t.surfaced} 条`], ['上榜率', ratioOrDash(t.surfaced, t.posts, x => (x * 100).toFixed(0) + '%').v], ['含义', '被广场算法推出去过，和「被人看到」是两件事']], t.posts, `${MER} · 分母＝已发布（库内四字段）`, '上榜率＝上过榜 ÷ 已发布 · 分母为零不显示比率不显示 0%')}
+    ${kpi('广场热榜中位', fmtN(r.benchmark.trendMedian), `快讯流中位 ${fmtN(r.benchmark.newsMedian)}`, [['热榜中位', fmtN(r.benchmark.trendMedian)], ['快讯流中位', fmtN(r.benchmark.newsMedian)], ['基准样本', `${r.benchmark.pool} 条`], ['提醒', '榜上的帖子已经赢过一次算法筛选，直接对比会高估我们']], r.benchmark.pool, '平台基准池 · 与我们的号无关（不是我们的分母）', '中位数 · 样本＝基准池条数')}
   </div>`;
+
+  // 分号表：后端的只读接口没有按号参数（补字段属后端那一格），所以这页的"分号"是面板自算。
+  // 面板自算的行只展示、不参与任何判定或验收，并且明写它用的哪把尺。
+  const acctPosts = await api('/api/posts?status=published&limit=200').catch(() => null);
+  const perAcct = acctScopeTable(acctPosts);
 
   const insights = r.insights.length
     ? r.insights.map(i => {
@@ -832,15 +1449,18 @@ async function insightsView() {
   }).join('');
 
   return `<div class="card">
+    ${accountBar(acctScope())}
     <div class="chips">${days}</div>
     <div class="kv" style="margin-top:10px">
       ${r.conclusive
         ? `<span class="pill on">样本足够（${t.measured} 条读数）</span>`
         : `<span class="pill warn">样本不足：还差 ${r.neededForFirstRank} 条读数才能让任何一个分组可比</span>`}
       <span class="muted">排名一律用中位数：广场的浏览量是长尾分布，一条爆款就能把均值抬到毫无意义。</span>
+      <span class="pill plain">上方数字＝${esc(MER)}</span>
     </div>
   </div>
   <div style="margin-top:14px">${kpis}</div>
+  ${acctTableHtml(perAcct)}
   <div class="card" style="margin-top:14px">
     <div class="card-hd"><h3>自动归纳</h3></div>
     ${insights}
@@ -1089,75 +1709,141 @@ async function boardView() {
   ensureTip();
   const d = await api('/api/dashboard?days=' + BOARD_DAYS);
   const c = d.cadence;
+  const names = d.accounts.map(a => a.label);
+
+  // 账号 × 天：从每条发布流水现聚成矩阵，账号日历卡与每日明细表共用这一份，后端不必加接口。
+  const byAcct = new Map();
+  for (const e of c.events) {
+    if (!byAcct.has(e.accountLabel)) byAcct.set(e.accountLabel, new Map());
+    const m = byAcct.get(e.accountLabel), k = bjDay(e.at);
+    if (!m.has(k)) m.set(k, { p: 0, a: 0, v: 0, e: 0 });
+    const b = m.get(k);
+    if (e.kind === 'article') b.a++; else b.p++;
+    b.v += e.views ?? 0;
+    b.e += e.engagement || 0;
+  }
+  const dayOf = (label, k) => (byAcct.get(label) || new Map()).get(k) || null;
+
   const days = [3, 7, 14, 30].map(n => `<button class="chip ${n === BOARD_DAYS ? 'on' : ''}" onclick="setBoardDays(${n})">最近 ${n} 天</button>`).join('');
 
   const kpi = (label, value, sub, rows) => `<div class="tile"${rows ? tip(label, rows) : ''}>
     <div class="lbl">${label}</div><div class="v">${value}</div><div class="s">${sub}</div></div>`;
 
   const today = d.accounts.reduce((a, x) => a + x.today, 0);
+  const pendingAll = d.accounts.reduce((a, x) => a + x.pending, 0);
   const kpis = `<div class="grid gkpi">
-    ${kpi('区间内发布', `${d.totals.posts + d.totals.articles} 篇`, `短帖 ${d.totals.posts} · 长文 ${d.totals.articles}`,
+    ${kpi('区间内发布', `${d.totals.posts + d.totals.articles}`, `短帖 ${d.totals.posts} · 长文 ${d.totals.articles}`,
       [['短帖', d.totals.posts + ' 篇'], ['长文', d.totals.articles + ' 篇'], ['拿到读数', `${d.totals.measured} 篇`], ['还没读到数', `${d.totals.posts + d.totals.articles - d.totals.measured} 篇`]])}
     ${kpi('累计浏览', fmtN(d.totals.views), `单条中位 ${fmtN(d.totals.medianViews ?? 0)}`,
       [['累计浏览', fmtN(d.totals.views)], ['单条中位', fmtN(d.totals.medianViews ?? 0)], ['互动合计', `${d.totals.engagement} 次`]])}
-    ${kpi('中位间隔', c.actualMedianMinutes == null ? '—' : `${Math.round(c.actualMedianMinutes)} 分`, `目标 ${c.intendedMinutes} 分一帖`,
-      [['实测中位间隔', c.actualMedianMinutes == null ? '数据不足' : Math.round(c.actualMedianMinutes) + ' 分钟'], ['设定目标', c.intendedMinutes + ' 分钟'], ['同分钟挤发', c.bursts + ' 次'], ['最长空档', c.longestIdleHours == null ? '—' : c.longestIdleHours + ' 小时']])}
-    ${kpi('待发布', `${d.accounts.reduce((a, x) => a + x.pending, 0)} 条`, d.orphanPending ? `<span style="color:var(--bad)">${d.orphanPending} 条没有归属账号</span>` : '全部都有账号可发',
-      d.accounts.map(a => [a.label, `待发布 ${a.pending} · 今日 ${a.today}/${a.cap}`]).concat(d.orphanPending ? [['无归属', d.orphanPending + ' 条']] : []))}
-    ${kpi('今日已发', `${today} 篇`, `额度：${d.accounts.map(a => `${a.label} ${a.today}/${a.cap}${a.capUnit === '篇长文' ? '篇' : '帖'}`).join(' · ')}`)}
+    ${kpi('今日已发', `${today}`, d.accounts.map(a => `${a.label} ${a.today}/${a.cap}${a.capUnit === '篇长文' ? '篇' : '帖'}`).join(' · '),
+      d.accounts.map(a => [a.label, `今日 ${a.today}/${a.cap} ${a.capUnit}`]))}
+    ${kpi('待发布', `${pendingAll}`, d.orphanPending ? `<span style="color:var(--bad)">${d.orphanPending} 条没有归属账号</span>` : '全部都有账号可发',
+      d.accounts.map(a => [a.label, `待发布 ${a.pending} 条`]).concat(d.orphanPending ? [['无归属', d.orphanPending + ' 条']] : []))}
   </div>`;
 
   const verdict = [];
-  if (c.bursts) verdict.push(['bad', `${c.bursts} 次同一分钟挤发 —— 应当为 0`]);
-  else verdict.push(['on', '没有同一分钟挤发']);
-  if (c.actualMedianMinutes != null && c.actualMedianMinutes < c.intendedMinutes) verdict.push(['warn', `中位间隔 ${Math.round(c.actualMedianMinutes)} 分，比目标 ${c.intendedMinutes} 分密`]);
-  else if (c.actualMedianMinutes != null) verdict.push(['on', `中位间隔 ${Math.round(c.actualMedianMinutes)} 分，符合目标 ${c.intendedMinutes} 分`]);
-  if (c.idleWindow) verdict.push(['warn', `最长空档 ${c.longestIdleHours} 小时：${c.idleWindow.from} → ${c.idleWindow.to}`]);
-  if (d.orphanPending) verdict.push(['bad', `${d.orphanPending} 条待发布没有归属账号，谁也发不出去`]);
+  if (c.bursts) verdict.push(['warn', `${c.bursts} 次同一分钟挤发`]);
+  else verdict.push(['on', '节奏正常 · 无挤发']);
+  if (c.actualMedianMinutes != null) verdict.push([c.actualMedianMinutes < c.intendedMinutes ? 'warn' : 'on', `中位间隔 ${Math.round(c.actualMedianMinutes)} 分（目标 ${c.intendedMinutes}）`]);
+  if (c.idleWindow) verdict.push(['warn', `最长空档 ${c.longestIdleHours} 小时（${c.idleWindow.from} → ${c.idleWindow.to}）`]);
+  if (d.orphanPending) verdict.push(['bad', `${d.orphanPending} 条待发布无归属`]);
 
-  const sect = (title, how, body) => `<div class="card" style="margin-top:14px">
-    <div class="card-hd"><h3>${title}</h3></div><div class="how">${how}</div>${body}</div>`;
+  // 每账号一张卡：岗位与额度做头，四个区间数字做骨架，日历条把每一天印在页面上——一格一天。
+  const TODAY_KEY = bjDay(Date.now());
+  const acctCard = a => {
+    const m = byAcct.get(a.label) || new Map();
+    const cal = d.series.map(pt => {
+      const b = m.get(pt.day);
+      const n = b ? b.p + b.a : 0;
+      const rows = [['短帖', (b ? b.p : 0) + ' 篇'], ['长文', (b ? b.a : 0) + ' 篇'], ['浏览', fmtN(b ? b.v : 0)], ['互动', String(b ? b.e : 0)]];
+      return `<div class="cd${n ? ' has' : ''}${pt.day === TODAY_KEY ? ' today' : ''}"${tip(dayLabel(pt.day) + ' · ' + a.label, rows)}>
+        <span class="d">${Number(pt.day.slice(8))}</span>${n ? `<b class="n">${n}</b><span class="v">${b.v ? fmtN(b.v) : '·'}</span>` : '<span class="v">&nbsp;</span>'}
+      </div>`;
+    }).join('');
+    const nums = [
+      ['发布', `${a.posts + a.articles}`, `帖 ${a.posts} · 文 ${a.articles}`],
+      ['浏览', fmtN(a.views), a.medianViews == null ? '暂无读数' : `中位 ${fmtN(a.medianViews)}`],
+      ['互动/千', `${a.engagementPer1k}`, `${a.engagement} 次`],
+      ['队列', `${a.pending}`, `今日 ${a.today}/${a.cap}${a.capUnit === '篇长文' ? ' 篇' : ' 帖'}`],
+    ].map(([l, v, s]) => `<div class="an"><span class="l">${l}</span><b>${v}</b><span class="s">${s}</span></div>`).join('');
+    return `<div class="card acct${a.enabled ? '' : ' off'}">
+      <div class="acct-hd">
+        <span class="cdot" style="background:${colorOf(a.label, names)}"></span>
+        <h3>${esc(a.label)}</h3>
+        <span class="pill plain">${esc(a.role)}</span>
+        <span class="acct-next"${tip('下一帖', [['时间', a.nextAt ? fmtTs(a.nextAt) : '不可发'], ['依据', a.nextReason]])}>${a.nextAt ? '下一帖 ' + hhmm(a.nextAt) : '暂不可发'}</span>
+      </div>
+      <div class="acct-nums">${nums}</div>
+      <div class="acal">${cal}</div>
+    </div>`;
+  };
+
+  // 每日明细表：行＝天（最近的在上），列＝账号。格内大数字＝当天发布条数，小字＝当天浏览。
+  const dailyRows = [...d.series].reverse().map(pt => {
+    const k = pt.day;
+    const cells = names.map(nm => {
+      const b = dayOf(nm, k);
+      if (!b || !(b.p + b.a)) return '<td class="num mut">·</td>';
+      return `<td class="num"${tip(nm + ' · ' + dayLabel(k), [['短帖', b.p + ' 篇'], ['长文', b.a + ' 篇'], ['浏览', fmtN(b.v)], ['互动', String(b.e)]])}><b>${b.p + b.a}</b><small>${b.v ? ' ' + fmtN(b.v) : ''}</small></td>`;
+    }).join('');
+    return `<tr${k === TODAY_KEY ? ' class="now"' : ''}>
+      <td>${dayLabel(k)}${k === TODAY_KEY ? ' <span class="tag">今天</span>' : ''}</td>${cells}
+      <td class="num"><b>${pt.posts + pt.articles}</b></td>
+      <td class="num">${fmtN(pt.views)}</td>
+      <td class="num">${pt.engagement}</td>
+    </tr>`;
+  }).join('');
+
+  const fold = (title, how, body) => `<details class="card fold"><summary>${title}<i></i></summary><div class="fold-in"><div class="how">${how}</div>${body}</div></details>`;
 
   const acctRows = d.accounts.map(a => `<tr>
       <td><span class="b">${esc(a.label)}</span>${a.enabled ? '' : ' <span class="pill">已停用</span>'}</td>
       <td><span class="pill ${a.trackId ? 'on' : a.enabled ? 'on' : ''}">${esc(a.role)}</span></td>
       <td class="num"${tip('今日额度', [['已发', `${a.today} ${a.capUnit}`], ['上限', `${a.cap} ${a.capUnit}`], ['口径', '长文与短帖共用同一个 Key 的日额度']])}>${a.today} <span class="muted">/ ${a.cap} ${a.capUnit}</span></td>
-      <td class="num"${tip('队列', [['待发布', a.pending + ' 条'], ['说明', a.pending ? '这些已经排好分钟，到点自动发' : '队列是空的，下一轮会现写']])}>${a.pending}</td>
-      <td class="num"${tip('下一帖', [['时间', a.nextAt ? fmtTs(a.nextAt) : '不可发'], ['依据', a.nextReason]])}>${a.nextAt ? hhmm(a.nextAt) : '<span class="muted">不可发</span>'}<span class="muted" style="display:block;font-size:11px">${a.nextAt ? '' : esc(a.nextReason)}</span></td>
-      <td class="num"${tip('发布条数', [['短帖', a.posts + ' 篇'], ['长文', a.articles + ' 篇'], ['有读数', a.measured + ' 篇']])}>${a.posts} <span class="muted">+${a.articles}</span></td>
-      <td class="num"${tip('中位浏览', [['中位', a.medianViews == null ? '无读数' : fmtN(a.medianViews)], ['合计', fmtN(a.views)], ['说明', '取一半帖子达到的那条线，不会被一条爆款拉高']])}>${a.medianViews == null ? '—' : fmtN(a.medianViews)}</td>
-      <td class="num"${tip('互动', [['赞+评+转', a.engagement + ' 次'], ['每千次浏览', a.engagementPer1k + ' 次']])}>${a.engagementPer1k}</td>
-      <td class="num"${tip('订阅', [['长文订阅数', String(a.subscribers)], ['说明', '只有长文有这个指标，这是能被反复打开的资产']])}>${a.subscribers || '—'}</td>
+      <td class="num">${a.pending}</td>
+      <td class="num">${a.nextAt ? hhmm(a.nextAt) : '<span class="muted">不可发</span>'}</td>
+      <td class="num">${a.posts} <span class="muted">+${a.articles}</span></td>
+      <td class="num">${a.medianViews == null ? '—' : fmtN(a.medianViews)}</td>
+      <td class="num">${a.engagementPer1k}</td>
+      <td class="num">${a.subscribers || '—'}</td>
       <td>${rolePicker(a)}</td>
     </tr>`).join('');
 
   return `
   <div class="card">
     <div class="chips">${days}</div>
-    <div class="kv" style="margin-top:10px">${verdict.map(([cls, t]) => `<span class="pill ${cls === 'bad' ? 'warn' : cls}">${esc(t)}</span>`).join('')}</div>
+    <div class="kv" style="margin-top:10px">${verdict.map(([cls, t]) => `<span class="pill ${cls} plain">${esc(t)}</span>`).join('')}</div>
     <div style="margin-top:12px">${kpis}</div>
   </div>
-  ${sect('发帖时间轴 · 一行一天',
-    '横轴是北京时间 0–24 点，底色区间是你设定的发帖时段。鼠标停在任何一个点上，会看到它具体是几点、哪个账号发的、写的什么、多少人看。没有内容的日子照样占一行 —— 空行就是空档。',
-    stripChart(d))}
-  <div class="grid g2" style="margin-top:14px">
-    ${sect('每天发了多少、被看了多少', '柱子＝当天发布条数，黄线＝当天内容的浏览量。鼠标停在柱子上看当天明细。', dayChart(d))}
-    ${sect('几点发的，几点有人看', '蓝柱＝该时段发布条数，黄点＝该时段单条中位浏览。两个都高，才是值得加码的时段。', hourChart(d))}
+  <div class="grid g2" style="margin-top:14px">${d.accounts.map(acctCard).join('')}</div>
+  <div class="card" style="margin-top:14px">
+    <div class="card-hd"><h3>每日明细 · 每个号每天发了多少</h3></div>
+    <div class="how">行＝天（最近的在上），列＝账号。格内大数字＝当天发布条数，小字＝当天浏览合计；悬停看短帖/长文拆分与互动。</div>
+    <div class="tw"><table class="daily">
+      <thead><tr><th>日期</th>${names.map(nm => `<th class="num"><i class="cdot" style="background:${colorOf(nm, names)}"></i>${esc(nm)}</th>`).join('')}<th class="num">合计</th><th class="num">浏览</th><th class="num">互动</th></tr></thead>
+      <tbody>${dailyRows || `<tr><td colspan="${names.length + 4}" class="muted">这个区间里还没有发布记录</td></tr>`}</tbody>
+    </table></div>
   </div>
-  ${sect('相邻两帖的间隔分布',
-    `两帖之间隔了多久。目标是 ${c.intendedMinutes} 分钟一帖：红色＝同一分钟挤发，黄色＝比目标密，蓝色＝正常或偏松。`,
+  ${fold('发帖时间轴 · 几点发的、哪个号发的',
+    '横轴是北京时间 0–24 点，底色区间是设定的发帖时段。悬停任何一个点，会看到几点、哪个账号、写的什么、多少人看。空行就是空档。',
+    stripChart(d))}
+  ${fold('每日趋势与分时段效率',
+    '左图：柱＝当天发布条数，黄线＝当天浏览量。右图：蓝柱＝该时段发布条数，黄点＝该时段中位浏览。两个都高的时段才值得加码。',
+    `<div class="grid g2">${dayChart(d)}${hourChart(d)}</div>`)}
+  ${fold('相邻两帖的间隔分布',
+    `两帖之间隔了多久。目标是 ${c.intendedMinutes} 分钟一帖：红＝同一分钟挤发，黄＝比目标密，蓝＝正常或偏松。`,
     gapChart(c))}
-  ${sect('每个账号在干什么',
-    '岗位直接决定它发什么内容：短帖矩阵按热度出短帖，长文赛道深耕一个领域。右侧按钮当场换岗，不用去别的页面。',
+  ${fold('哪类内容、哪种写法有人看',
+    '每条的中位浏览从高到低排。条数少的先别下结论，悬停能看到几篇拿到了读数。',
+    `<div class="grid g2">${rankBars(d.cells.slice(0, 10), '互动')}${rankBars(d.styles.slice(0, 10), '互动')}</div>`)}
+  ${fold('账号岗位管理 · 当场换岗',
+    '岗位决定账号发什么：短帖矩阵按热度出短帖，长文赛道深耕一个领域。这里改动立即生效。',
     `<div class="tw"><table><thead><tr>
-      <th>账号</th><th>岗位</th><th class="num">今日额度</th><th class="num">队列</th><th class="num">下一帖</th>
+      <th>账号</th><th>岗位</th><th class="num">今日/目标</th><th class="num">队列</th><th class="num">下一帖</th>
       <th class="num">短帖+长文</th><th class="num">中位浏览</th><th class="num">互动/千</th><th class="num">订阅</th><th>改岗位</th>
     </tr></thead><tbody>${acctRows || '<tr><td colspan="10" class="muted">还没有账号</td></tr>'}</tbody></table></div>`)}
-  <div class="grid g2" style="margin-top:14px">
-    ${sect('哪类内容有人看 · 按信号', '每条的中位浏览从高到低排。条数少的先别下结论，鼠标停上去能看到它有几篇拿到了读数。', rankBars(d.cells.slice(0, 10), '互动'))}
-    ${sect('哪种写法有人看 · 按风格', '同一类内容用不同语气写，谁的效果好。样本都很小时，这张表只说明方向，不说明结论。', rankBars(d.styles.slice(0, 10), '互动'))}
-  </div>
-  <div class="hint" style="margin-top:12px">这页的每个数字都来自已经写入库的发布记录，不来自设置项。「效果分析」回答的是哪类内容吸引人，需要样本量；这页回答的是机器有没有按你说的在跑，不需要。</div>`;
+  <div class="hint" style="margin-top:12px">这页的每个数字都来自已经写入库的发布记录，不来自设置项。每张账号卡下面一条日历：哪天发了、发了多少、被看了多少，一格一天，不用悬停就能读。</div>`;
 }
 
 function setBoardDays(n) { BOARD_DAYS = n; render(); }
@@ -1202,8 +1888,7 @@ const targetReadout = t => {
   const pill = t === 'views'
     ? '<span class="pill on">浏览量口径</span>'
     : '<span class="pill bad">非浏览量口径</span>';
-  return `<div class="targetbar">${pill}<b>当前世代绑定口径：${esc(label)}</b>`
-    + '<span class="muted">只读 · 改口径＝开新假设（走口径库，只收紧不放宽）。面板已无切换入口。</span></div>';
+  return `<div class="targetbar"${tip('判定口径（只读）', [['当前口径', label], ['为什么锁着', '关卡 A 未过时按互动/返佣判定，会把全零样本判成「差别不大」并写进记忆'], ['谁能改', '口径库审批；改口径＝开新假设，只收紧不放宽，面板无切换入口'], ['手输返佣列', '已降为自愿记录观察列，不参与判定']])}>${pill}<b>口径 ${esc(label)}</b><span class="muted">只读 · 改口径走口径库</span></div>`;
 };
 
 async function saveConversion() {
@@ -1283,42 +1968,46 @@ async function rankView() {
     </div>
   </details>`;
 
+  // 首屏只回答三个问题：在测什么、学会了什么、样本有多少。口径/记忆/大脑的细节进悬浮与折叠。
+  const obsN = counts.observing + counts.leaning;
   const kpis = `<div class="grid gkpi">
-    ${tile('已成立的规则', counts.rule, counts.rule ? '已写入长期记忆，正在影响写法' : '还没有任何一条判断攒够样本',
-      d.verdicts.filter(v => v.status === 'rule').map(v => [v.id, v.arms.map(a => `${a.arm}:${a.median ?? '—'}`).join(' ')]) )}
-    ${tile('正在观察', counts.observing, `另有 ${counts.leaning} 条已现倾向`, d.verdicts.filter(v => v.status === 'observing').map(v => [v.id, `还差 ${v.missing} 条`] ))}
-    ${tile('已观察帖子', d.curve.length, '按 20 分钟 / 1 / 3 / 8 / 24 小时回看', null)}
-    ${tile('判定口径', esc(TARGET_CN[d.target] ?? '未知'), '只读 · 改口径＝开新假设',
-      [['当前世代绑定口径', TARGET_CN[d.target] ?? String(d.target ?? '未知')], ['为什么锁着', '关卡 A 未过时按互动/返佣判定，会把全零样本判成「差别不大」并写进记忆'], ['谁能改', '口径库审批，不在面板上点'], ['手输返佣列', '已降为自愿记录观察列，不参与判定']])}
-    ${tile('长期记忆', d.memory.length, '条当前生效的判断', d.memory.slice(0, 6).map(m => [m.kind, `${m.text.slice(0, 28)}… 置信 ${(m.confidence * 100).toFixed(0)}%`]))}
-    ${tile('AI 大脑', d.brain ? '已接入' : '未启用', d.brain ? `${d.brain.provider} · ${d.brain.model}` : '没有大脑也照常运转：规则由测量直接得出',
-      d.brain ? [['提供方', d.brain.provider], ['模型', d.brain.model], ['权限', '只改写与排序，不得新增数字或币种']] : [['状态', '未配置或已关闭'], ['影响', '自我迭代仍在工作，只是少一层归纳']] )}
+    ${tile('正在测', `${obsN}`, obsN ? `${counts.observing} 条样本不足 · ${counts.leaning} 条已现倾向` : '没有在测的假设',
+      d.verdicts.filter(v => v.status === 'observing' || v.status === 'leaning').map(v => [v.id, (RANK_STATUS[v.status] ?? ['', v.status])[1] + (v.status === 'observing' ? ` · 还差 ${v.missing} 条` : '')]))}
+    ${tile('已成立', `${counts.rule}`, counts.rule ? `正在影响每一次写作 · 记忆 ${d.memory.length} 条` : '还没有 · 样本与差距同时够格才升规则',
+      d.verdicts.filter(v => v.status === 'rule').map(v => [v.id, v.arms.map(a => `${a.arm}:${a.median ?? '—'}`).join(' ')]))}
+    ${tile('已测帖子', `${d.curve.length}`, '20 分钟 / 1 / 3 / 8 / 24 小时回看',
+      [['怎么读曲线', '首小时增速 > 1 表示引擎在持续推'], ['判定口径', TARGET_CN[d.target] ?? String(d.target ?? '未知')], ['AI 大脑', d.brain ? `${d.brain.provider} · ${d.brain.model}` : '未启用 · 规则由测量直接得出']])}
   </div>`;
 
   const cards = d.verdicts.map(v => {
     const [cls, label] = RANK_STATUS[v.status] ?? ['', v.status];
     const max = Math.max(0, ...v.arms.map(a => a.median ?? 0));
-    const bars = v.arms.map(a => `<div class="hbar${a.median == null ? ' off' : ''}">
+    const bars = v.arms.map(a => `<div class="hbar big${a.median == null ? ' off' : ''}">
         <span>${esc(a.arm)}</span>
         <span class="track"><i style="width:${a.median == null || !max ? 0 : Math.max(3, (a.median / max) * 100)}%;background:${v.winner === a.arm ? 'var(--green)' : 'var(--blue)'}"></i></span>
         <span class="v"${tip(`${v.id} · ${a.arm}`, [['中位', a.median == null ? '无读数' : Math.round(a.median).toLocaleString('en-US')], ['样本', `${a.n} 条`], ['最好一条', a.best == null ? '—' : Math.round(a.best).toLocaleString('en-US')]])}>${a.median == null ? '—' : Math.round(a.median).toLocaleString('en-US')}<span class="muted">${a.n} 条</span></span>
       </div>`).join('');
-    return `<div class="card" style="margin-top:14px">
-      <div class="card-hd"><h3>${esc(v.claim)}</h3>
-        <span class="right"><span class="pill ${cls}">${label}</span>${v.status === 'observing' ? `<span class="muted">还差 ${v.missing} 条</span>` : ''}</span></div>
-      <div class="kv" style="gap:8px;margin-bottom:10px">
-        <span class="pill plain">${v.mode === 'experiment' ? '主动实验：机器人随机分配' : '观察：从已发生的事里读'}</span>
-        <span class="pill plain">指标 ${esc(v.metric)}</span>
-        <span class="pill plain">置信 ${(v.confidence * 100).toFixed(0)}%</span>
-        <span class="pill ${v.stratified.strata >= 2 ? 'plain' : 'warn'}" ${tip('分层比较', [['可比层数', `${v.stratified.strata} 层`], ['被丢掉的层', `${v.stratified.dropped} 层（层内只有一个臂）`], ['层内差距', v.stratified.gap == null ? '—' : v.stratified.gap], ['相对差距', v.stratified.rel == null ? '—' : ((v.stratified.rel * 100).toFixed(0) + '%')], ['为什么分层', '浏览量最大的影响因素是哪个币、它当时多热，比写法的影响大一到两个数量级']], true)}>${v.stratified.strata} 层内比</span>
-        <span class="pill ${v.replicated === true ? 'on' : v.replicated === false ? 'bad' : 'plain'}"${tip('时间对半验证', [['前半段赢家', v.replicated == null ? '无法判定' : '见后半'], ['结论', v.replicated === true ? '两半一致' : v.replicated === false ? '两半不一致 —— 噪声' : '样本不够分两半']])}>${v.replicated === true ? '两半一致' : v.replicated === false ? '两半打架' : '未验证'}</span>
-        <span class="pill ${Math.abs(v.effect) >= 0.15 ? 'warn' : 'plain'}"${tip('混比（不分层）', [['相对差距', (v.effect * 100).toFixed(0) + '%'], ['用途', '只作对照：如果混比很大而分层很小，说明那个差是币的热度']])}>混比 ${(v.effect * 100).toFixed(0)}%</span>
-        ${v.status === 'observing' ? `<span class="muted">还差 ${v.missing} 条</span>` : ''}
+    // 药丸墙换成四格「标签+值」：一眼读完，解释全部进悬浮——页面只留数字。
+    const facts = [
+      ['样本', `${v.arms.reduce((s, a) => s + a.n, 0)} 条`, v.arms.map(a => `${a.arm} ${a.n} 条`).join(' · ')],
+      ['置信', `${(v.confidence * 100).toFixed(0)}%`, '样本量和差距同时够格，才升为规则'],
+      ['分层比', v.stratified.strata >= 1 ? `${v.stratified.agree}/${v.stratified.strata} 层同向` : '0 层·比不了', v.stratified.strata >= 1 ? `同一类别、同一成交额档里对比：领先的那一臂在 ${v.stratified.strata} 层里赢了 ${v.stratified.agree} 层${v.stratified.rel != null ? `；层内相对差距 ${(v.stratified.rel * 100).toFixed(0)}%` : ''}；只有一边有数据、被丢掉 ${v.stratified.dropped} 层` : '没有一层同时有两边的数据 —— 浏览受币的热度影响，得在同热度内比才算数'],
+      ['两半验证', v.replicated === true ? '一致' : v.replicated === false ? '打架' : '未验证', v.replicated === false ? '前半段的赢家后半段不在——多半是噪声' : '前半段测出的赢家，后半段还在不在'],
+    ];
+    const mrow = facts.map(([l, val, tt]) => `<div class="mf"${tip(l, [['值', String(val)], ['说明', tt]])}><span class="l">${l}</span><b>${esc(val)}</b></div>`).join('');
+    return `<div class="card vf">
+      <div class="vf-hd">
+        <span class="dotst ${cls}"></span>
+        <div class="vf-t"><h3>${esc(v.claim)}</h3>
+          <span class="vf-sub">${v.mode === 'experiment' ? '主动实验 · 机器人随机分配' : '观察 · 从已发生的事里读'} · 指标 ${esc(v.metric)}${v.status === 'observing' ? ` · 还差 ${v.missing} 条` : ''}</span></div>
+        <span class="pill ${cls} plain">${label}</span>
       </div>
       <div class="hbars">${bars}</div>
-      ${v.action ? `<div class="alert good" style="margin-top:10px"><svg viewBox="0 0 24 24"><path d="M20 6L9 17l-5-5"/></svg><div>${esc(v.action)}</div></div>` : ''}
-      ${v.note ? `<div class="alert warn" style="margin-top:10px"><svg viewBox="0 0 24 24"><path d="M12 9v4M12 17h.01M10.3 3.9L2.4 18a2 2 0 001.7 3h15.8a2 2 0 001.7-3L13.7 3.9a2 2 0 00-3.4 0z"/></svg><div>${esc(v.note)}</div></div>` : ''}
-      <div class="hint" style="margin-top:9px"><b>怎么测：</b>${esc(v.how)}<br><b>代价：</b>${esc(v.risk)}</div>
+      <div class="mgrid">${mrow}</div>
+      ${v.action ? `<div class="alert good" style="margin-top:2px"><svg viewBox="0 0 24 24"><path d="M20 6L9 17l-5-5"/></svg><div>${esc(v.action)}</div></div>` : ''}
+      ${v.note ? `<div class="alert warn" style="margin-top:2px"><svg viewBox="0 0 24 24"><path d="M12 9v4M12 17h.01M10.3 3.9L2.4 18a2 2 0 001.7 3h15.8a2 2 0 001.7-3L13.7 3.9a2 2 0 00-3.4 0z"/></svg><div>${esc(v.note)}</div></div>` : ''}
+      <details class="src"><summary>方法与代价</summary><span>怎么测：${esc(v.how)} ｜ 代价：${esc(v.risk)}</span></details>
+      ${(v.stratified.detail || []).length ? `<details class="src"><summary>分层明细 · ${v.stratified.detail.length} 层</summary><span>${v.stratified.detail.map(s => `${esc(s.stratum.replace('|', ' · '))}：${s.arms.map(a => `${a.arm === s.winner ? '<b>' : ''}${esc(a.arm)} ${Math.round(a.median).toLocaleString('en-US')}（${a.n}）${a.arm === s.winner ? '</b>' : ''}`).join(' / ')}`).join('<br>')}</span></details>` : ''}
     </div>`;
   }).join('');
 
@@ -1365,19 +2054,34 @@ async function rankView() {
 
   const knobList = (d.knobs ?? []).map(k => `<span class="tag"${tip(k.key, [['当前值', k.current], ['合法区间', `${k.min} – ${k.max}`], ['判定指标', k.judge], ['为什么是它', k.purpose]])}>${esc(k.label)} ${k.current}</span>`).join(' ');
 
-  const selfCard = `<div class="card" style="margin-top:14px">
-    <div class="card-hd"><h3>系统能改自己的两个地方</h3><span class="sub">假设登记表 · 参数旋钮 —— 发帖量、时段、间隔、日额度不在其中</span></div>
-    <div class="hint" style="margin-top:0">除了模版权重，这套系统只有这两处被允许修改自己。两处都带闸门：假设必须用<b>已有维度 × 已有指标</b>才登记得进来（表达不出来的不是假设，是感想）；参数改动必须<b>有界、单个在途、到期自动判定</b>，没改善或判不出来都自动回滚。<b>只记成功不记失败的系统不是在优化，是在积累偏见</b> —— 所以被拒和回滚的记录也留在这儿。</div>
+  const selfCard = `
+    <div class="how" style="margin-top:0">假设必须用<b>已有维度 × 已有指标</b>才登记得进来（表达不出来的不是假设，是感想）；参数改动必须<b>有界、单个在途、到期自动判定</b>，没改善或判不出来都自动回滚。<b>只记成功不记失败的系统不是在优化，是在积累偏见</b> —— 所以被拒和回滚的记录也留在这儿。发帖量、时段、间隔、日额度不在可改之列。</div>
     <div class="tw" style="margin-top:12px"><table><thead><tr><th>等审批的新假设</th><th>维度 / 指标</th><th>代价</th><th></th></tr></thead><tbody>${proposed}</tbody></table></div>
     <div class="sub" style="margin:12px 0 4px">可自动调整的旋钮（鼠标放上去看合法区间和判定指标）：</div>
     <div>${knobList}</div>
     <div class="tw" style="margin-top:12px"><table><thead><tr><th>参数改动</th><th class="num">变化</th><th>状态</th><th class="num">判定指标中位数</th></tr></thead><tbody>${paramRows}</tbody></table></div>
-  </div>`;
+  `;
 
   const acting = d.playbook?.acting?.length
     ? `<div class="alert"><svg viewBox="0 0 24 24"><path d="M12 16v-4M12 8h.01"/><circle cx="12" cy="12" r="9"/></svg>
        <div>这一轮正在生效：${d.playbook.acting.map(a => esc(a.text)).join('； ')}。主题标签 ${d.playbook.hashtagTopics} 个 · ${d.playbook.attachChart ? '带图' : '不带图'} · 收尾${d.playbook.opening === 'question' ? '提问' : '陈述'}</div></div>`
     : '<div class="hint" style="margin-top:10px">现在还没有任何一条判断在影响写法 —— 每一篇仍按默认（带图、1 个主题标签、陈述收尾）。这不是没生效，是它还没拿到足够样本。</div>';
+
+  const heat = d.heat || { bands: [], byAccount: [], unbanded: 0 };
+  const heatMax = Math.max(1, ...heat.bands.map(b => b.medianViews ?? 0), ...heat.byAccount.map(a => a.medianViews ?? 0));
+  const heatBar = (name, sub, m, n) => `<div class="hbar big${m == null ? ' off' : ''}">
+      <span>${esc(name)}${sub ? `<span class="sub" style="display:block">${esc(sub)}</span>` : ''}</span>
+      <span class="track"><i style="width:${m == null ? 0 : Math.max(3, (m / heatMax) * 100)}%;background:var(--blue)"></i></span>
+      <span class="v">${m == null ? '—' : m.toLocaleString('en-US')}<span class="muted">${n} 条</span></span>
+    </div>`;
+  const heatCard = `<div class="card" style="margin-top:14px">
+    <div class="card-hd"><h3>币的热度对浏览有多大影响</h3><span class="sub">24h 浏览中位数，只算满 24 小时的帖子。各档差得越多，下面的实验就越要看「分层比」，而不是混在一起的中位数</span></div>
+    <div class="grid" style="grid-template-columns:repeat(auto-fit,minmax(280px,1fr));gap:18px;margin-top:8px">
+      <div><div class="cap">按币的 24h 成交额</div><div class="hbars">${heat.bands.map(b => heatBar(b.band, b.label, b.medianViews, b.n)).join('')}</div></div>
+      <div><div class="cap">按账号</div><div class="hbars">${heat.byAccount.map(a => heatBar(a.label || String(a.accountId), '', a.medianViews, a.n)).join('') || '<div class="muted">还没有满 24 小时的帖子</div>'}</div></div>
+    </div>
+    ${heat.unbanded ? `<div class="hint">另有 ${heat.unbanded} 条的素材没记下成交额，分层时退回用采集评分分档。</div>` : ''}
+  </div>`;
 
   return `
   <div class="card">
@@ -1386,17 +2090,18 @@ async function rankView() {
         <div class="chips">${chips}</div>
         <button class="btn sm" onclick="rankReflect()">立即归纳一次</button>
       </span></div>
-    <div class="hint" style="margin-top:0">流程是固定的：先写下可被证伪的假设 → 机器人在发帖前按臂分配并记录 → 分档回看把浏览曲线变成分发事实 → 只有样本量和差距同时够格，才升为规则 → 规则写进长期记忆，之后每次写作前被读到。任何一条测出反果，旧结论会被新结论覆盖而不是删除，「我们曾经以为」也是要留下的。</div>
-    ${acting}
     <div style="margin-top:12px">${kpis}</div>
     ${targetReadout(d.target)}
+    ${acting}
+    <details class="fold"><summary>这套引擎怎么工作<i></i></summary><div class="fold-in"><div class="how">流程是固定的：先写下可被证伪的假设 → 机器人在发帖前按臂分配并记录 → 分档回看把浏览曲线变成分发事实 → 只有样本量和差距同时够格，才升为规则 → 规则写进长期记忆，之后每次写作前被读到。任何一条测出反果，旧结论会被新结论覆盖而不是删除，「我们曾经以为」也是要留下的。</div></div></details>
   </div>
   ${convObs}
-  ${selfCard}
+  ${heatCard}
+  <details class="fold"><summary>系统能改自己的两个地方 · 假设登记与参数旋钮<i></i></summary><div class="fold-in">${selfCard}</div></details>
   ${cards}
   <div class="card" style="margin-top:14px">
     <div class="card-hd"><h3>每条帖子的分发形状</h3><span class="sub">绝对浏览量混着币本身的热度，曲线形状才是引擎的决定</span></div>
-    <div class="tw"><table><thead><tr><th class="num">帖子</th><th>20m→24h</th><th class="num">首读</th><th class="num">最新</th><th class="num">首小时增速</th><th>上榜</th><th>本篇实验臂</th></tr></thead>
+    <div class="tw"><table><thead><tr><th class="num">帖子</th><th>20m→24h</th><th class="num"${tip('首读', [['含义', '发布后 20 分钟拿到的第一个读数']])}>首读</th><th class="num"${tip('最新', [['含义', '最近一档回看的读数（8 小时档，缺了就用 3 小时）']])}>最新</th><th class="num"${tip('首小时增速', [['怎么读', '20 分钟 → 1 小时的倍数；接近 1＝没被再推，越大＝引擎持续在分发']])}>首小时增速</th><th>上榜</th><th>本篇实验臂</th></tr></thead>
       <tbody>${curve}</tbody></table></div>
   </div>
   <div class="card" style="margin-top:14px">
@@ -2035,7 +2740,7 @@ const HOUR = 3600_000;
 const KIND_CN = {
   collect_gap: '长文观察读不到', collect_gap_clear: '观察空洞已恢复',
   publish_stall_warning: '停发预警（5h）', publish_stall_fault: '停发故障（12h）', publish_stall_breach: 'R2 违约（24h）',
-  expected_gap: '应发与实发有差', account_pool_empty: '可发布账号集合为空', breaker_tripped: '熔断触发',
+  expected_gap: '应发与实发有差', account_pool_empty: '可发布账号集合为空', breaker_tripped: '发布门熔断（总线台账）',
   receipt_mismatch: '回执与声明不符', degrade_declared: '发布前显式降级', image_missing: '广场侧无图',
   font_subset_missing: 'CJK 子集缺失', surge_blocked: '放大未入队',
   loop_stalled: '主循环停摆', credential_missing: '发布凭据不可用',
@@ -2046,7 +2751,7 @@ const SUBREASON_CN = {
   tick_reports_failure: '上一轮 tick 记了失败', auto_run_off: '自动循环被关着',
   square_key_missing: '没有广场 Key，只能演练', key_decrypt_fail: '密钥读不出来',
 };
-const CODE_CN = { no_material: '素材荒（供给不足）', quota_spent: '配额用尽', breaker_on: '熔断中', human_pause: '人为暂停' };
+const CODE_CN = { no_material: '素材荒（供给不足）', quota_spent: '配额用尽', breaker_on: '熔断中（发布门那枚）', human_pause: '人为暂停' };
 /** 契约里靠服务端产出、面板此刻读不到的那些 —— 明写出来，别让它沉默地变成绿色。 */
 const NOT_WIRED_YET = ['publish_stall_warning', 'publish_stall_fault', 'publish_stall_breach', 'receipt_mismatch',
   'image_missing', 'degrade_declared', 'surge_blocked', 'collect_gap', 'font_subset_missing'];
@@ -2185,50 +2890,90 @@ async function opsAskPermission() {
 
 async function opsView() {
   const res = OPS_LAST || opsState(STATE);
-  const [mark, color] = LIGHT[res.worst] || LIGHT.info;
   const sort = (a, b) => sevRank(b.severity) - sevRank(a.severity) || (b.lastAt || 0) - (a.lastAt || 0);
-  const row = a => `<tr>
-      <td><span class="pill ${a.severity === 'breach' || a.severity === 'fault' ? 'bad' : a.severity === 'warning' ? 'warn' : 'plain'}">${esc(KIND_CN[a.kind] || a.kind)}</span>${a.reasonCode ? `<span class="tag">${esc(CODE_CN[a.reasonCode] || a.reasonCode)}</span>` : ''}${a.subreason ? `<span class="tag">${esc(SUBREASON_CN[a.subreason] || a.subreason)}</span>` : ''}</td>
-      <td class="muted">${esc(a.severity)}</td>
-      <td class="muted">${a.source === 'bus' ? '总线' : '面板自算'}</td>
-      <td>${esc(a.detail || '—')}</td>
-      <td class="num">${a.count > 1 ? `×${a.count}` : ''}</td>
-      <td class="muted">${esc(a.key)}</td>
-      <td class="num">${a.firstAt ? fmtTs(a.firstAt) : '—'}</td>
-      <td class="num">${a.lastAt ? ago(a.lastAt) : '—'}</td>
-      <td class="num">${a.acked ? '已确认' : '—'}</td>
+  const sevCls = x => (x === 'breach' || x === 'fault' ? 'bad' : x === 'warning' ? 'warn' : 'ok');
+  const SEV_WORD = { breach: '故障', fault: '故障', warning: '预警', info: '正常' };
+  // 行卡化：状态灯 + 中文名做主体；key／出处／次数／最近／因由码压成一行小字，全文进悬浮。
+  // 两态分开：acked:false 有"从未签"与"签后过 24h 窗重火"，只有 ackedAt 能区分（§7.79）。
+  const row = a => {
+    const ack = a.acked
+      ? `<span class="pill on plain">已确认${a.ackedBy ? ' · ' + esc(a.ackedBy) : ''}</span>`
+      : a.ackedAt ? '<span class="pill warn plain">签后过窗重火（需再签）</span>' : '<span class="pill bad plain">从未签</span>';
+    const subBits = [
+      a.source === 'bus' ? '总线' : '面板自算',
+      a.count > 1 ? `×${a.count}` : null,
+      a.lastAt ? ago(a.lastAt) : null,
+      a.reasonCode ? (CODE_CN[a.reasonCode] || a.reasonCode) : null,
+      a.subreason ? (SUBREASON_CN[a.subreason] || a.subreason) : null,
+    ].filter(Boolean);
+    return `<tr>
+      <td><span class="opill ${sevCls(a.severity)}" title="${esc(a.kind)} · key ${esc(a.key)}${a.firstAt ? ` · 首次 ${fmtTs(a.firstAt)}` : ''}"><i></i>${esc(KIND_CN[a.kind] || a.kind)}</span>
+        <span class="sub">${esc(subBits.join(' · '))}</span></td>
+      <td class="dline" title="${esc(a.detail || '')}">${esc(a.detail || '—')}</td>
+      <td class="num">${ack}</td>
     </tr>`;
+  };
   const live = res.live.slice().sort(sort);
   const shown = (res.shown || []).slice().sort(sort);
   const ackedRows = res.all.filter(a => a.acked);
   const planned = res.planned.slice().sort(sort);
-  let legacy = [];
-  try { const b = await api('/api/brain'); legacy = (b.alarms || []).filter(x => x.code !== 'outlier_good' && x.code !== 'gate_a_cleared'); } catch (_) { legacy = []; }
+  let legacy = null;
+  try { const b = await api('/api/brain'); legacy = (b.alarms || []).filter(x => x.code !== 'outlier_good' && x.code !== 'gate_a_cleared'); } catch (_) { legacy = null; }
   const notWired = NOT_WIRED_YET.map(k => `<span class="tag">${esc(KIND_CN[k])}</span>`).join(' ');
+  const kinds = alertKinds(res.all);
+  const brk = breakerGrid(STATE.alerts ? STATE.alerts : null);
+  // 三分出处（§9c 判据 4 加）：这一页比概览多一枚旧告警码面（legacy），note 面在此才完整。
+  const faces = blockerFaces({ alerts: STATE.alerts, ops: res, notes: STATE.loop?.lastTick?.notes ?? null, alarms: legacy });
+  const kindRows = kinds.rows.map(r => `<tr>
+      <td><span class="pill ${r.severity === 'breach' || r.severity === 'fault' ? 'bad' : r.severity === 'warning' ? 'warn' : 'plain'}">${esc(KIND_CN[r.kind] || r.kind)}</span> <span class="muted">${esc(r.kind)}</span></td>
+      <td class="muted">${r.bus && r.panel ? '总线＋面板' : r.bus ? '总线' : '面板自算'}</td>
+      <td class="num">${r.total}</td>
+      <td class="num${r.unacked ? ' bad' : ''}">${r.unacked}</td>
+      <td class="muted dline" title="${esc(r.keys.join(' / '))}">${esc(r.keys.join(' / ') || '未记录')}</td></tr>`).join('');
+
+  const tbl = body => `<div class="tw"><table><thead><tr><th>状态</th><th>说明</th><th class="num">确认</th></tr></thead><tbody>${body}</tbody></table></div>`;
+  const grp = (title, note, body) => `<details class="grp"><summary><span class="gh">${title}<span class="muted">（${note}）</span></span></summary>${tbl(body)}</details>`;
 
   return `<div class="card">
-    <div class="card-hd"><h3>运行台</h3><span class="sub">每条状态自带出处 —— 面板自己算的，和总线给的，不混成一栏</span></div>
-    <div class="row" style="margin-top:6px">
-      <span class="pill ${res.worst === 'info' ? 'on' : sevRank(res.worst) >= 2 ? 'bad' : 'warn'}">${mark} 当前最高等级：${esc(res.worst)}</span>
-      <span class="muted">灯与图标每 20 秒刷新一次；系统通知：${typeof Notification === 'undefined' ? '浏览器不支持' : esc(Notification.permission)}</span>
-      <button class="btn sm" onclick="opsAskPermission()">${typeof Notification !== 'undefined' && Notification.permission === 'granted' ? '已开启系统通知' : '开启系统通知'}</button>
+    <div class="card-hd"><h3>运行台</h3><span class="sub">总线给的与面板自算的，不混成一栏</span></div>
+    <div class="opsline ${sevCls(res.worst)}">
+      <span class="ops-lamp"><i></i><b>${SEV_WORD[res.worst] || esc(res.worst)}</b></span>
+      <span class="ops-count">未确认 <b>${live.length}</b> · 计划内 <b>${planned.length}</b> · 只展示 <b>${shown.length}</b> · 已确认 <b>${ackedRows.length}</b></span>
+      <span class="ops-side"><button class="btn sm" onclick="opsAskPermission()">${typeof Notification !== 'undefined' && Notification.permission === 'granted' ? '已开启系统通知' : '开启系统通知'}</button></span>
     </div>
-    <div class="hint">这里的规则来自告警总线契约：带因由码的「没发」算计划内空档，<b>没码的「没发」本身就是故障</b>。同类告警按 kind+key 合并、等级只升不降，确认后同类 24 小时静默。</div>
-    <div class="tw" style="margin-top:12px"><table><thead><tr><th>状态</th><th>等级</th><th>出处</th><th>说明</th><th class="num">次数</th><th>键</th><th class="num">首次</th><th class="num">最近</th><th class="num">确认</th></tr></thead>
-      <tbody>${live.length ? live.map(row).join('') : '<tr><td colspan="9"><div class="empty"><b>没有未确认的故障或预警</b><span>这只说明面板能看见的那几项正常，不代表总线那几项已通过 —— 看下面那张「还没接上」的表。</span></div></td></tr>'}</tbody></table></div>
-    <div class="sub" style="margin:14px 0 4px">计划内空档（有因由码，不算故障）</div>
-    <div class="tw"><table><tbody>${planned.length ? planned.map(row).join('') : '<tr><td class="muted">现在没有任何带因由码的空档。</td></tr>'}</tbody></table></div>
-    ${shown.length ? `<div class="sub" style="margin:14px 0 4px">只展示 · 不驱动灯（后端从源头消灭的那类）</div>
-      <div class="tw"><table><tbody>${shown.map(row).join('')}</tbody></table></div>` : ''}
+    <details class="proof"><summary>规则与通知说明</summary><div class="proof-in">
+      <div class="gatewhy">规则来自告警总线契约：带因由码的「没发」算计划内空档，<b>没码的「没发」本身就是故障</b>。同类告警按 kind+key 合并、等级只升不降，确认后同类 24 小时静默。</div>
+      <div class="gatewhy">灯与图标每 20 秒刷新一次 · 系统通知：${typeof Notification === 'undefined' ? '浏览器不支持' : esc(Notification.permission)}（fault／breach 只发一次，20 小时节流）。</div>
+    </div></details>
+
+    <div class="grp-h">按 kind 摊全量与残量</div>
+    <div class="tw"><table><thead><tr><th>kind</th><th>出处</th><th class="num">全量</th><th class="num">残量</th><th>key 清单</th></tr></thead>
+      <tbody>${kindRows || '<tr><td colspan="5" class="muted">这一轮台账＋面板自算都没有条目 —— 这是"读到空集"，不是"无挡止"；note 面见下面三分出处。</td></tr>'}</tbody></table></div>
+    ${blockerFacesHtml(faces)}
+    <div class="brk">
+      <div class="brk-cell ${brk.ok ? (brk.never + brk.refire > 0 ? 'bad' : 'ok') : 'unk'}"><b>${brk.ok ? brk.never : '—'}</b><span>从未签</span></div>
+      <div class="brk-cell"><b>${brk.ok ? brk.refire : '—'}</b><span>签后重火</span></div>
+      <div class="brk-cell"><b>${brk.ok ? brk.acked : '—'}</b><span>已签</span></div>
+      <div class="brk-cap">${brk.ok ? '熔断台账（发布门那枚，非旧码面浏览量熔断）' : '熔断台账：/api/status 未带 alerts · 残量不可判'}</div>
+    </div>
+    ${brk.ok ? `<details class="proof"><summary>残量口径</summary><div class="proof-in"><div class="gatewhy">acked:false 是两态 —— 只有 ackedAt 能区分"从未签"与"签后过 24h 窗重火"，所以不并成一栏。</div></div></details>` : ''}
+    ${srcLine(tupleOf(kinds.rows.reduce((a, r) => a + r.total, 0), `kind 全量／(kind,key) 残量分列 · 总线 ${STATE.alerts ? '已给' : '未给'}，其余为面板自算`,
+      `ledger 双字段 acked/ackedAt（唯一写点 bus.ts:137）· 本灯表不代替总线`))}
+
+    <div class="grp-h">未确认 —— 驱动灯的活故障与预警</div>
+    ${live.length ? tbl(live.map(row).join('')) : '<div class="empty"><b>没有未确认的故障或预警</b><span>这只说明面板能看见的那几项正常，总线那几项要看上面 kind 表与三分出处。</span></div>'}
+    ${grp(`计划内空档 · ${planned.length}`, '有因由码，不算故障', planned.map(row).join('') || '<tr><td colspan="3" class="muted">现在没有任何带因由码的空档。</td></tr>')}
+    ${shown.length ? grp(`只展示 · 不驱动灯 · ${shown.length}`, '后端从源头消灭的那类', shown.map(row).join('')) : ''}
     <div class="alert" style="margin-top:14px"><svg viewBox="0 0 24 24"><path d="M12 16v-4M12 8h.01"/><circle cx="12" cy="12" r="9"/></svg>
-      <div><b>这几项还没接上，界面无法代替它们变绿：</b>${notWired}。它们要等后端的期望驱动告警总线（应发 vs 实发、回执比对、缺图、降级、放大被挡）。总线一落到 <code>/api/status.alerts</code>，这一层换源、渲染不动。</div></div>
-    ${ackedRows.length ? `<div class="sub" style="margin:14px 0 4px">已确认（同类 24 小时内静默）</div><div class="tw"><table><tbody>${ackedRows.map(row).join('')}</tbody></table></div>` : ''}
+      <div><b>这几项还没接上，界面无法代替它们变绿：</b>${notWired}。总线一落到 <code>/api/status.alerts</code>，这一层换源、渲染不动。</div></div>
+    ${ackedRows.length ? grp(`已确认 · ${ackedRows.length}`, '同类 24 小时内静默', ackedRows.map(row).join('')) : ''}
   </div>
   <div class="card" style="margin-top:14px">
-    <div class="card-hd"><h3>旧告警码（brain_alarms）</h3><span class="sub">总线上线前还在写的这一批，读得到就一并摆出来，不假装是新的信封</span></div>
+    <div class="card-hd"><h3>旧告警码（brain_alarms）</h3><span class="sub">总线上线前还在写的这一批，读得到就一并摆出来 · 尺＝最近 20 行（LIMIT 20，不是全表）</span></div>
     <div class="tw"><table><thead><tr><th class="num">时间</th><th>码</th><th>说明</th></tr></thead>
-      <tbody>${legacy.length ? legacy.map(a => `<tr><td class="num">${esc(fmtTs(a.at))}</td><td><span class="pill ${a.code === 'breaker' ? 'bad' : 'info'}">${esc(a.code)}</span></td><td>${esc(a.detail)}</td></tr>`).join('') : '<tr><td colspan="3" class="muted">最近 20 条里没有未消化的旧告警。</td></tr>'}</tbody></table></div>
-    <div class="hint">color 灯用的是契约等级：${color === '#e5484d' ? '红 = fault/breach' : color === '#f5a524' ? '黄 = warning' : '绿 = 一切正常'}。</div>
+      <tbody>${legacy?.length ? legacy.map(a => `<tr><td class="num">${esc(fmtTs(a.at))}</td><td>${legacyCodeCell(a.code)}</td><td class="dline" title="${esc(a.detail)}">${esc(a.detail)}</td></tr>`).join('')
+        : '<tr><td colspan="3" class="muted">' + (legacy ? '最近 20 条里没有未消化的旧告警（读到的是空集，不推"无挡止"）。' : '/api/brain 没读到 ⇒ 旧告警码面不可判（这一面缺位时禁推"无挡止"）。') + '</td></tr>'}</tbody></table></div>
+    <div class="hint">${esc(GATE_KIND_NOTE.breaker_tripped)}。反过来说：旧码面那枚 <code>breaker</code> 的谓词是浏览中位数低于 floor（<code>sentinel.ts:29-34</code>），它<b>不是</b>发布门条件里的那一枚，签它也不解除总线那枚。</div>
   </div>`;
 }
 

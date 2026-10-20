@@ -19,7 +19,8 @@ const bars = (n: number): Kline[] =>
 test('the chart header names the span its percentage covers and is drawn in Chinese', () => {
   const svg = renderKlineSvg(bars(72), { title: 'AEROUSDT 永续 · 1H', lastPrice: 1, changePct: 26.47, changeLabel: '近72小时', stats: { chips: ['24 小时涨跌 +15.86%'] } });
   assert.match(svg, /近72小时 \+26\.47%/);
-  assert.match(svg, /24 小时涨跌 \+15\.86%/);
+  // chip numbers are wrapped in tinted tspans; assert on the visible text
+  assert.match(svg.replace(/<[^>]+>/g, ''), /24 小时涨跌 \+15\.86%/);
   assert.match(svg, /Microsoft YaHei/);
 });
 

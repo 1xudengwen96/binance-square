@@ -3,6 +3,7 @@ import type { Settings } from '../config.ts';
 import { brainFor, callsSince } from './brain.ts';
 import { buildSnapshot, snapshotText, type BrainSnapshot } from './snapshot.ts';
 import { SENTINEL_SYSTEM, withOperatorNotes } from './prompts.ts';
+import { fileFromReply, stripUpgrades } from './upgrades.ts';
 
 /**
  * The sentinel: code watches, the model is woken only when something happens.
@@ -159,11 +160,12 @@ export async function runSentinel(store: Store, settings: Settings, now = Date.n
 
   const rep = store.db
     .prepare("INSERT INTO brain_reports (kind, created_at, title, body, snapshot_json, actions_json, status) VALUES ('sentinel', ?, ?, ?, ?, '[]', 'pending')")
-    .run(now, `哨兵：${head.code}`, r.text, JSON.stringify(snap));
+    .run(now, `哨兵：${head.code}`, stripUpgrades(r.text), JSON.stringify(snap));
   report.reportId = Number(rep.lastInsertRowid);
   report.woke = true;
   const mark = store.db.prepare('UPDATE brain_alarms SET woke = 1, report_id = ? WHERE id = ?');
   for (const id of ids) mark.run(report.reportId, id);
+  fileFromReply(store, r.text, { source: 'sentinel', reportId: report.reportId, now });
   store.log('brain_sentinel', { codes: fresh.map(a => a.code), reportId: report.reportId });
   return report;
 }

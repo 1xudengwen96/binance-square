@@ -5,7 +5,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { Store } from '../src/db/index.ts';
 import Database from 'better-sqlite3';
-import { CHECK_OFFSETS_MS, nextCheckDue } from '../src/stats/backfill.ts';
+import { CHECK_OFFSETS_MS, backfillStats, nextCheckDue } from '../src/stats/backfill.ts';
 
 const HOUR = 3_600_000;
 
@@ -98,6 +98,42 @@ test('stat checkpoints round-trip through the database', async () => {
     assert.equal((store.db.prepare('SELECT views FROM post_stats WHERE post_id = ?').get(id) as { views: number }).views, 200);
     assert.equal(nextCheckDue(row.posted_at, store.statCheckpoints(id)), -1);
   } finally {
+    store.close();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('a missing commentCount is stored as NULL, while an explicit zero stays zero', async () => {
+  // The read route answered without commentCount on some posts. Coercing it to 0 made «not read»
+  // and «read as zero» the same number, which is how a fortnight of missing counters became the
+  // finding «comments are always 0». The two cases must stay distinguishable in the database.
+  const dir = mkdtempSync(join(tmpdir(), 'sf-comments-'));
+  const store = Store.open(join(dir, 't.db'));
+  const realFetch = globalThis.fetch;
+  try {
+    const at = Date.now() - 25 * HOUR;
+    const mk = (text: string, sq: string): number => {
+      const id = store.addPost({ materialId: null, templateId: null, text, status: 'published', scheduledAt: null });
+      store.updatePost(id, { status: 'published', squarePostId: sq, publishedAt: at });
+      return id;
+    };
+    const silent = mk('没返回评论数的帖子', '900123456');
+    const zero = mk('平台明确零评论的帖子', '900123457');
+    globalThis.fetch = (async (input: unknown) => {
+      const id = String(input).split('/').pop();
+      const body = id === '900123456'
+        ? { data: { id, viewCount: 120, likeCount: 3 } }
+        : { data: { id, viewCount: 80, likeCount: 0, commentCount: 0 } };
+      return new Response(JSON.stringify(body), { status: 200, headers: { 'content-type': 'application/json' } });
+    }) as typeof fetch;
+
+    const rep = await backfillStats(store);
+    assert.equal(rep.updated, 2);
+    const read = (pid: number): number | null => store.statsByPost([pid]).get(pid)!.comments;
+    assert.equal(read(silent), null, '读不到 ≠ 零评论');
+    assert.equal(read(zero), 0, '平台明确说的 0 要存 0');
+  } finally {
+    globalThis.fetch = realFetch;
     store.close();
     rmSync(dir, { recursive: true, force: true });
   }

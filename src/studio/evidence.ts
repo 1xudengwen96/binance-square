@@ -219,12 +219,20 @@ export async function checkClaims(
 
       if (broken) {
         contradicted++;
-        store.addLesson({
-          articleId: a.id,
-          conceptId: a.concept_id,
-          kind: 'contradicted',
-          detail: `《${a.title}》断言「${claim.phrase}」，现在 ${claim.field} = ${now.toFixed(3)}，已不成立。该措辞在后续同概念文章中需加时限。`,
-        });
+        // The check runs every pass over every published article, so the same broken claim used to
+        // be written again each time — 868 lessons, 48 distinct. One lesson per article and claim.
+        const head = `《${a.title}》断言「${claim.phrase}」`;
+        const known = store.db
+          .prepare("SELECT 1 FROM studio_lessons WHERE article_id IS ? AND kind = 'contradicted' AND substr(detail, 1, ?) = ? LIMIT 1")
+          .get(a.id, head.length, head);
+        if (!known) {
+          store.addLesson({
+            articleId: a.id,
+            conceptId: a.concept_id,
+            kind: 'contradicted',
+            detail: `${head}，现在 ${claim.field} = ${now.toFixed(3)}，已不成立。该措辞在后续同概念文章中需加时限。`,
+          });
+        }
         store.markConceptStale(a.concept_id, a.track_id);
       } else {
         held++;

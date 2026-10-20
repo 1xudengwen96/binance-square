@@ -7,6 +7,7 @@ import { propose } from '../rank/registry.ts';
 import { proposeChange } from '../rank/params.ts';
 import { isSafeVariant, COLUMN_KINDS, type ColumnKind, type VariantSlot } from '../content/columns.ts';
 import { remember } from './memory.ts';
+import { fileFromReply, stripUpgrades } from './upgrades.ts';
 
 /**
  * The weekly review and what happens to its recommendations.
@@ -96,7 +97,7 @@ export async function runWeekly(store: Store, settings: Settings, now = Date.now
   if (!r.ok) return { ok: false, reportId: null, note: `调用失败：${r.error.slice(0, 160)}` };
 
   const actions = parseActions(r.text);
-  const body = stripActions(r.text);
+  const body = stripUpgrades(stripActions(r.text));
   const gaps = missingSections(body);
   const incomplete = !recommendationComplete(body);
   const flags = [gaps.length ? `缺少章节：${gaps.join('、')}` : '', incomplete ? '第 5 节缺证据 / 反例 / 到期日' : ''].filter(Boolean);
@@ -105,8 +106,13 @@ export async function runWeekly(store: Store, settings: Settings, now = Date.now
   const rep = store.db
     .prepare("INSERT INTO brain_reports (kind, created_at, title, body, snapshot_json, actions_json, status) VALUES ('weekly', ?, ?, ?, ?, ?, 'pending')")
     .run(now, `周复盘 ${new Date(now + 8 * 3600_000).toISOString().slice(0, 10)}${flags.length ? '（有缺项）' : ''}`, flags.length ? `> 系统检查：${flags.join('；')}\n\n${body}` : body, JSON.stringify(snap), JSON.stringify(held));
-  store.log('brain_weekly', { reportId: Number(rep.lastInsertRowid), actions: held.length, flags });
-  return { ok: true, reportId: Number(rep.lastInsertRowid), note: flags.length ? `已生成，但有缺项：${flags.join('；')}` : '已生成' };
+  const reportId = Number(rep.lastInsertRowid);
+  // Requests for a code change are filed whatever state the recommendation is in: they are records
+  // for the operator, not actions, so there is nothing for the three-part check to protect.
+  const filed = fileFromReply(store, r.text, { source: 'weekly', reportId, now });
+  store.log('brain_weekly', { reportId, actions: held.length, flags, upgrades: filed.length });
+  const extra = filed.length ? `；登记了 ${filed.length} 条需要改代码的事` : '';
+  return { ok: true, reportId, note: `${flags.length ? `已生成，但有缺项：${flags.join('；')}` : '已生成'}${extra}` };
 }
 
 export interface ApplyOutcome {

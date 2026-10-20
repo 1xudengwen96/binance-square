@@ -11,9 +11,9 @@ import { hashString, mulberry32 } from '../engine/prng.ts';
  * re-check rate instead of zero — an algorithm that changed last month would otherwise be
  * discovered by our numbers quietly getting worse with no experiment left to explain why.
  *
- * While nothing is believed the draw is uniform across arms rather than rationed by an explore
- * share: there is no winner to hold traffic back for, and sampling every hypothesis more slowly
- * at that stage buys nothing.
+ * While nothing is believed the draw goes to the arm with the fewest recorded samples rather than
+ * being rationed by an explore share: there is no winner to hold traffic back for, and a uniform
+ * draw is only balanced in expectation — at ten posts a side the expectation is not what happened.
  */
 
 /** How much traffic we keep spending re-testing rules we already believe. */
@@ -42,6 +42,18 @@ export interface ArmPlan {
   [hypothesisId: string]: string;
 }
 
+export interface ArmPlanOptions {
+  seed: number;
+  verdicts: Verdict[];
+  recheckShare?: number;
+  only?: readonly string[] | null;
+  exclude?: readonly string[];
+  /** Arms this lane can actually carry this round, per experiment (the column knows which shapes
+   *  its material supports). A shape that cannot be written is not a draw — it is a sample the
+   *  comparison never receives, which is how recap stayed at three while anomaly reached fifteen. */
+  allow?: Record<string, readonly string[]>;
+}
+
 /**
  * Draw this post's arms.
  *
@@ -49,7 +61,7 @@ export interface ArmPlan {
  * registered in the database get its arms assigned with no change here. Every hypothesis the
  * registry knows appears in the verdict list even at zero samples, so nothing is skipped.
  */
-export function planArms(opts: { seed: number; verdicts: Verdict[]; recheckShare?: number; only?: readonly string[] | null; exclude?: readonly string[] }): ArmPlan {
+export function planArms(opts: ArmPlanOptions): ArmPlan {
   const plan: ArmPlan = {};
   for (const v of opts.verdicts) {
     if (v.mode !== 'experiment') continue;
@@ -61,9 +73,20 @@ export function planArms(opts: { seed: number; verdicts: Verdict[]; recheckShare
     // advances by a different amount depending on which branch a hypothesis takes, so adding or
     // removing one would quietly reassign every arm after it.
     const rnd = mulberry32(hashString(`${opts.seed}:${v.id}`));
-    const arms = v.arms.map(a => a.arm);
+    const allowed = opts.allow?.[v.id];
+    const arms = v.arms.map(a => a.arm).filter(a => !allowed || allowed.includes(a));
     if (!arms.length) continue;
-    const pick = () => arms[Math.floor(rnd() * arms.length)]!;
+    // Fewest-samples-first. A uniform draw is balanced in expectation, but ten posts a side is
+    // not enough for the expectation to be what happened: the column ran 15 anomaly against 3
+    // recap, the polish arm 22 raw against 6 polished, and both comparisons stayed one-sided for
+    // weeks. Ties stay random, so the arm is still decided before the post exists and recorded
+    // with it — this changes how often an arm is drawn, never how its outcome is measured.
+    const samples = new Map(v.arms.map(a => [a.arm, a.n]));
+    const pick = () => {
+      const fewest = Math.min(...arms.map(a => samples.get(a) ?? 0));
+      const pool = arms.filter(a => (samples.get(a) ?? 0) === fewest);
+      return pool[Math.floor(rnd() * pool.length)]!;
+    };
     const roll = rnd();
     if (v.status === 'rule' && v.winner) {
       plan[v.id] = roll < (opts.recheckShare ?? RECHECK_SHARE) ? pick() : v.winner;

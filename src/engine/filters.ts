@@ -67,6 +67,25 @@ export const filters: Record<string, FilterFn> = {
     return n === null ? String(v ?? '') : `${Math.abs(n).toFixed(2)}%`;
   },
   rate: formatRate,
+  /**
+   * A move the way a person says it: the sign is carried by the verb next to it (涨/跌), and the
+   * precision shrinks as the number grows — nobody says 「涨了 22.22%」 out loud.
+   */
+  apct: v => {
+    const n = num(v);
+    if (n === null) return String(v ?? '');
+    const a = Math.abs(n);
+    if (a >= 10) return `${Math.round(a)}%`;
+    if (a >= 1) return `${a.toFixed(1).replace(/\.0$/, '')}%`;
+    return `${a.toFixed(2)}%`;
+  },
+  /** A raw funding rate as a bare magnitude (0.00353 → 0.35%); who pays is said in words. */
+  hrate: v => {
+    const n = num(v);
+    if (n === null) return String(v ?? '');
+    const p = Math.abs(n * 100);
+    return `${p >= 0.1 ? p.toFixed(2) : p.toFixed(3)}%`;
+  },
   fixed: (v, arg) => {
     const n = num(v);
     return n === null ? String(v ?? '') : n.toFixed(Number(arg ?? 2));

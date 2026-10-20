@@ -125,5 +125,8 @@ export const wordBank: Record<string, string> = {
   /* -------------------------------------------------- disclaimer --- */
   'disclaimer.default': '内容仅供参考，不构成投资建议，DYOR。',
   'disclaimer.soft': '个人观察记录，不构成任何建议。',
+  // The column rotates its compliance line: the same sentence under every post is the single most
+  // visible sign that a machine is posting. Every option still says «not advice» in words the gate reads.
+  'disclaimer.column': '{个人看盘笔记，不构成任何建议。|随手记录，仅供参考。|只是个人观察，不构成投资建议。|数据来自公开行情，仅供参考。|个人观察记录，不构成任何建议。}',
   'disclaimer.data': '数据来自公开信息，请自行判断。',
 };

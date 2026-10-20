@@ -6,7 +6,7 @@ import { join } from 'node:path';
 import { Store } from '../src/db/index.ts';
 import { DEFAULT_SETTINGS } from '../src/config.ts';
 import { observeDistribution } from '../src/rank/observations.ts';
-import { scoreAll, revokeStaleRules } from '../src/rank/score.ts';
+import { scoreAll, revokeStaleRules, heatBand, heatProfile } from '../src/rank/score.ts';
 import { registry } from '../src/rank/registry.ts';
 import { planArms, recordArms } from '../src/rank/experiments.ts';
 import { playbook } from '../src/rank/playbook.ts';
@@ -23,7 +23,7 @@ function tempStore(): { store: Store; close: () => void } {
 
 /** A published post with a full checkpoint curve, which is the only way the engine can be probed. */
 let seq = 0;
-function post(store: Store, opts: { views: (number | null)[]; arms?: Record<string, string>; at: number; chart?: boolean; text?: string; heat?: number; category?: string; eng?: { likes: number; comments: number; shares: number } }): number {
+function post(store: Store, opts: { views: (number | null)[]; arms?: Record<string, string>; at: number; chart?: boolean; text?: string; heat?: number; qv?: number; category?: string; eng?: { likes: number; comments: number; shares: number } }): number {
   // Verdicts only read the 24-hour checkpoint (index 4). A fixture written as a short curve on a
   // post a few hours old stands for «this is how it ended»: carry its last reading to 24h and age
   // it by a day, which keeps relative order. Fixtures under 3h old stay young on purpose.
@@ -38,7 +38,7 @@ function post(store: Store, opts: { views: (number | null)[]; arms?: Record<stri
   const symbol = `TOK${seq++}`;
   store.insertMaterial(makeMaterial({
     category: (opts.category ?? 'funding') as never, subType: 'funding_extreme', title: `${symbol} 费率极端`, symbol,
-    source: 'test', at: opts.at, score: opts.heat ?? 60, facts: {},
+    source: 'test', at: opts.at, score: opts.heat ?? 60, facts: opts.qv != null ? { quoteVolume24h: opts.qv } : {},
   }));
   const row = store.db.prepare('SELECT id FROM materials WHERE symbol = ?').get(symbol) as { id: string };
   const id = store.addPost({
@@ -172,6 +172,38 @@ test('a gap that is really the coin\'s heat disappears once strata hold heat con
   }
 });
 
+test('heat bands come from the coin\'s 24h volume, and each stratum\'s arms are on record', () => {
+  // The old bands read the collector's score, which on a funding row is how extreme the rate is —
+  // a thin small cap and a top-10 coin could share «高热». Volume is the same measure in every lane.
+  const { store, close } = tempStore();
+  try {
+    const now = Date.now();
+    let i = 0;
+    for (const [qv, base] of [[2e9, 600], [2e7, 120]] as const) {
+      for (let k = 0; k < 6; k++, i++) {
+        const arm = k % 2 ? 'two' : 'one';
+        post(store, { views: [arm === 'two' ? base * 1.5 : base], at: now - 10 * 3600_000 - i * 1000, arms: { h_hashtag_count: arm }, qv, heat: 90 });
+      }
+    }
+    observeDistribution(store);
+    const v = scoreAll(store, { writeMemory: false }).find(x => x.id === 'h_hashtag_count')!;
+    assert.equal(v.stratified.strata, 2, 'big caps and small caps are separate strata even at the same collector score');
+    assert.equal(v.stratified.agree, 2, 'the same arm leads in both');
+    assert.deepEqual(v.stratified.detail.map(s => s.stratum).sort(), ['funding|大盘', 'funding|小盘']);
+    assert.ok(v.stratified.detail.every(s => s.winner === 'two' && s.arms.every(a => a.n === 3)));
+
+    const h = heatProfile(store);
+    const band = (k: string) => h.bands.find(b => b.band === k)!;
+    assert.equal(band('大盘').n, 6);
+    assert.equal(band('小盘').n, 6);
+    assert.equal(band('中盘').n, 0);
+    assert.ok(band('大盘').medianViews! > band('小盘').medianViews!, 'the profile shows how much heat alone moves views');
+    assert.equal(heatBand({ quote_volume: null, material_score: 90 }), '评分高', 'no volume falls back to the score, under a name that says so');
+  } finally {
+    close();
+  }
+});
+
 test('an observed hypothesis can lean but never rule', () => {
   // Caught on the first live run: the pooled comparison said "posting late at night gets 2× the
   // views", which was really "the posts that went out at midnight happened to be about hot coins
@@ -279,7 +311,7 @@ test('arm assignment is reproducible and exploits a rule once it exists', () => 
       id: 'h_hashtag_count', claim: 'x', metric: 'views24h' as const, mode: 'experiment' as const,
       how: '', risk: '', arms: [{ arm: 'one', n: 9, median: 100, best: 120 }, { arm: 'two', n: 9, median: 900, best: 1000 }],
       winner: 'two', loser: 'one', effect: 0.9, confidence: 0.9, status: 'rule' as const, action: null, missing: 0,
-      stratified: { gap: 800, rel: 0.9, strata: 3, dropped: 0, winner: 'two' }, replicated: true, note: null,
+      stratified: { gap: 800, rel: 0.9, strata: 3, dropped: 0, winner: 'two', agree: 3, detail: [] }, replicated: true, note: null,
     }];
     const a = planArms({ seed: 12345, verdicts });
     const b = planArms({ seed: 12345, verdicts });

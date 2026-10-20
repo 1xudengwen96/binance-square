@@ -22,3 +22,11 @@ _tick.json
 /shots/01-accounts.png
 # Canvas artifacts from the same teardown, written by tooling rather than by hand.
 /.qoder-credits/
+
+# Agent session state: conversation context and index caches. This repo is public and
+# none of it is code; committing it would publish the operator's working notes.
+/.qoder/
+/.qoder-collab-runtime/
+
+# UI audit screenshots: they show the live panel (account labels, masked keys, real counts).
+/shots/

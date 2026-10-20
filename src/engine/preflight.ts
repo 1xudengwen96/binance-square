@@ -61,6 +61,15 @@ const FABRICATED_POSITION: { pattern: RegExp; why: string }[] = [
 
 export type PreFlightResult = { ok: true; text: string; note?: string } | { ok: false; reason: string };
 
+/**
+ * The same position gate, for copy that is not about to be sent yet: a wording variant, or a
+ * rewrite from the polish layer. Checking it there keeps a phrase that the publish boundary would
+ * refuse from ever entering the pool.
+ */
+export function claimsPosition(text: string): string | null {
+  return FABRICATED_POSITION.find(d => d.pattern.test(text))?.why ?? DIRECTIVE.find(d => d.pattern.test(text))?.why ?? null;
+}
+
 export function preFlight(opts: {
   text: string;
   facts: Fact[] | null;
