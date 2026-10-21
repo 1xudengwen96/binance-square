@@ -832,3 +832,33 @@ details.fold[open] > summary { color: var(--text); border-bottom: 1px solid var(
 /* 说明文字整体再退半步：行距加大、更安静的排版。 */
 .hint, .how { line-height: 1.72; letter-spacing: .1px; }
 
+/* Backup and migration workspace. */
+.backup-intro { display: flex; justify-content: space-between; align-items: center; gap: 24px; padding: 4px 0 24px; }
+.backup-intro h2 { margin: 9px 0; font-size: clamp(22px, 2.5vw, 30px); font-weight: 650; letter-spacing: -.7px; }
+.backup-intro p { color: var(--text-2); max-width: 700px; line-height: 1.7; }
+.backup-eyebrow { display: block; color: var(--text-3); font-size: 10px; letter-spacing: 1.5px; font-weight: 650; }
+.backup-summary { grid-template-columns: repeat(3, minmax(0, 1fr)); margin-bottom: 16px; }
+.backup-summary strong { display: block; font-family: var(--font-num); font-size: 25px; margin: 14px 0 7px; letter-spacing: -.5px; }
+.backup-summary .card > span:last-child { color: var(--text-3); font-size: 12px; }
+.backup-summary .card + .card { margin-top: 0; }
+#backup-form { margin-top: 22px; }
+.backup-actions { display: flex; align-items: center; flex-wrap: wrap; gap: 12px; margin-top: 12px; }
+.backup-actions > label { display: flex; align-items: center; gap: 8px; font-size: 13px; color: var(--text-2); }
+.backup-advanced { color: var(--text-3); font-size: 12px; margin: 8px 0 16px; }
+.backup-advanced summary { cursor: pointer; margin-bottom: 12px; }
+.backup-job { padding: 12px 15px; margin: 16px 0; border: 1px solid var(--green-line); background: var(--green-bg); color: var(--green); border-radius: 8px; line-height: 1.6; font-size: 13px; overflow-wrap: anywhere; }
+.backup-job.backup-error { border-color: var(--red-line); background: var(--red-bg); color: var(--red); }
+.backup-migration-note { color: var(--text-2); line-height: 1.75; font-size: 12px; margin: 0 0 20px; max-width: 940px; }
+.backup-key { max-width: 380px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; color: var(--text-3); font-size: 11px; }
+.backup-dialog { color: var(--text); background: var(--surface-2); border: 1px solid var(--border-3); border-radius: 14px; width: min(560px, calc(100vw - 32px)); padding: 28px; margin: auto; box-shadow: var(--sh-3); }
+.backup-dialog::backdrop { background: rgba(0, 0, 0, .65); backdrop-filter: blur(4px); }
+.backup-dialog h3 { font-size: 20px; margin: 0 0 18px; }
+.backup-dialog p { color: var(--text-2); font-size: 13px; line-height: 1.8; margin: 12px 0; overflow-wrap: anywhere; }
+.backup-dialog .backup-actions { justify-content: flex-end; margin-top: 24px; }
+@media (max-width: 800px) {
+  .backup-intro { align-items: flex-start; flex-direction: column; gap: 10px; }
+  .backup-summary { grid-template-columns: 1fr; }
+  .backup-summary strong { font-size: 22px; }
+  .backup-key { max-width: 160px; }
+}
+

@@ -55,6 +55,7 @@ const ICON = {
   settings: '<path d="M4 6h16M4 12h16M4 18h16M9 4v4M15 10v4M7 16v4"/>',
   connect: '<path d="M9 3v5M15 3v5M6 8h12v4a6 6 0 01-12 0zM12 18v3"/>',
   brain: '<path d="M9 4a3 3 0 00-3 3v.5A3 3 0 004 10.5 3 3 0 005 13a3.5 3.5 0 004 5.5V20h2V4zM15 4a3 3 0 013 3v.5a3 3 0 012 3 3 3 0 01-1 2.5 3.5 3.5 0 01-4 5.5V20h-2V4z"/>',
+  backup: '<path d="M4 7h16v14H4zM3 3h18v4H3zM9 11h6M12 15v4M9 17l3 3 3-3"/>',
 };
 
 /**
@@ -81,6 +82,7 @@ const NAV = [
     ['accounts', '账号', '每个号的岗位、节奏、密钥与出口', ICON.accounts],
   ]],
   ['系统', [
+    ['backup', '备份与迁移', 'S3 自动备份、30 天保留与新服务器一键导入', ICON.backup],
     ['settings', '设置', '全局规则：额度、节奏、敏感词、保留期', ICON.settings],
     ['brain', 'AI 大脑', '算法大脑的连接、任务、关卡、熔断和周报', ICON.brain],
     ['connect', '接入与 AI', '广场 Key、代理', ICON.connect],
@@ -675,6 +677,7 @@ async function render() {
   else if (TAB === 'templates') el.innerHTML = await templatesView();
   else if (TAB === 'settings') el.innerHTML = settingsView();
   else if (TAB === 'brain') el.innerHTML = await brainView();
+  else if (TAB === 'backup') { el.innerHTML = await backupView(); backupPoll(); }
   else el.innerHTML = await connectView();
 }
 

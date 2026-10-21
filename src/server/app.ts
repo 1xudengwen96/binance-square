@@ -19,6 +19,8 @@ import { boardComposition } from '../stats/benchmarks.ts';
 import { currentTarget } from '../rank/gates.ts';
 import { registerBrainRoutes } from './brainRoutes.ts';
 import { backupAgeHours, BACKUP_STALE_HOURS } from '../backup.ts';
+import { BackupManager } from '../backup/manager.ts';
+import { registerBackupRoutes } from './backupRoutes.ts';
 import { attributeConversions } from '../money/conversion.ts';
 import { heatProfile, scoreAll } from '../rank/score.ts';
 import { distributionRows } from '../rank/observations.ts';
@@ -58,6 +60,22 @@ registerAccessGuard(app, ALLOW_REMOTE_ACCESS, {
   password: process.env.PUBLIC_AUTH_PASSWORD ?? '',
 });
 
+const activeWriters = new Set<string>();
+const backups = new BackupManager(store, {
+  canRestore: () => !running,
+  onRestored: () => { store.syncTemplates(builtinTemplates); lastTick = null; startLoop(store); },
+});
+app.addHook('preHandler', (req, reply, done) => {
+  if (!['GET', 'HEAD', 'OPTIONS'].includes(req.method) || req.url.startsWith('/api/pool')) {
+    if (backups.restoring) return reply.code(503).send({ error: '正在导入备份，请稍后操作' });
+    activeWriters.add(req.id);
+  }
+  done();
+});
+app.addHook('onResponse', async req => { activeWriters.delete(req.id); });
+registerBackupRoutes(app, backups, activeWriters);
+app.addHook('onClose', async () => { await backups.stop(); });
+
 function llmConfigFrom(s: Settings, override?: Partial<LlmConfig>): LlmConfig {
   const provider = (override?.provider ?? s.llmProvider) as ProviderKind;
   const keyName: SecretName = provider === 'anthropic' ? 'anthropicApiKey' : 'openaiApiKey';
@@ -85,6 +103,7 @@ const ASSETS: Record<string, { file: string; type: string }> = {
   '/app.css': { file: 'app.css', type: 'text/css; charset=utf-8' },
   '/app.js': { file: 'app.js', type: 'text/javascript; charset=utf-8' },
   '/brain.js': { file: 'brain.js', type: 'text/javascript; charset=utf-8' },
+  '/backup.js': { file: 'backup.js', type: 'text/javascript; charset=utf-8' },
   '/login.css': { file: 'login.css', type: 'text/css; charset=utf-8' },
   '/login.js': { file: 'login.js', type: 'text/javascript; charset=utf-8' },
   '/favicon.svg': { file: 'favicon.svg', type: 'image/svg+xml' },
@@ -797,7 +816,7 @@ async function runTick(store: Store, opts: { force?: boolean; live?: boolean } =
   const s = settingsFrom(store);
   // One tick at a time: two overlapping passes read the same unused-material list and
   // draft the same event twice, which is exactly the duplication the matrix forbids.
-  if (running || (!s.autoRun && !opts.force)) return null;
+  if (running || backups.restoring || (!s.autoRun && !opts.force)) return null;
   running = true;
   try {
     const r = await tick(store, { live: opts.live ?? true, tickNo: ++tickNo });
@@ -988,8 +1007,16 @@ app
       );
     }
     startLoop(store);
+    backups.start();
   })
   .catch(err => {
     console.error(err);
     process.exit(1);
   });
+
+for (const signal of ['SIGTERM', 'SIGINT'] as const) {
+  process.once(signal, () => {
+    if (loopTimer) clearInterval(loopTimer);
+    void app.close().then(() => { store.close(); process.exit(0); }).catch(() => process.exit(1));
+  });
+}

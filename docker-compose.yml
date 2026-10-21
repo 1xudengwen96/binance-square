@@ -5,6 +5,8 @@ services:
     container_name: squareforge
     restart: unless-stopped
     init: true
+    # Allow an in-flight snapshot/upload to finish during a planned restart.
+    stop_grace_period: 5m
 
     # Public deployment: the application also permits same-origin remote mutations.
     ports:
@@ -23,6 +25,11 @@ services:
       PORT: "8787"
       DB_PATH: /app/data/squareforge.db
       TZ: Asia/Shanghai
+      AWS_REGION: ${AWS_REGION:-ap-northeast-1}
+      S3_BACKUP_BUCKET: ${S3_BACKUP_BUCKET:-}
+      AWS_ACCESS_KEY_ID: ${AWS_ACCESS_KEY_ID:-}
+      AWS_SECRET_ACCESS_KEY: ${AWS_SECRET_ACCESS_KEY:-}
+      AWS_SESSION_TOKEN: ${AWS_SESSION_TOKEN:-}
       # Keys are configured in the panel and stored in the mounted database. Only set
       # these if you would rather supply them from the host environment:
       # OPENAI_API_KEY: ${OPENAI_API_KEY}

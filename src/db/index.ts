@@ -1,5 +1,5 @@
 import Database from 'better-sqlite3';
-import { mkdirSync } from 'node:fs';
+import { copyFileSync, mkdirSync, renameSync, rmSync } from 'node:fs';
 import { dirname, resolve } from 'node:path';
 import type { Material } from '../material/types.ts';
 import type { TemplateDef } from '../engine/types.ts';
@@ -609,18 +609,20 @@ CREATE INDEX IF NOT EXISTS upgrade_requests_status ON upgrade_requests(status, l
 `;
 
 export class Store {
-  constructor(readonly db: Database.Database) {}
+  constructor(public db: Database.Database) {}
 
   static open(path: string): Store {
     const abs = resolve(path);
     mkdirSync(dirname(abs), { recursive: true });
     const db = new Database(abs);
-    db.pragma('journal_mode = WAL');
-    db.pragma('foreign_keys = ON');
-    db.exec(SCHEMA);
-    const s = new Store(db);
-    s.migrate();
-    return s;
+    try {
+      db.pragma('journal_mode = WAL');
+      db.pragma('foreign_keys = ON');
+      db.exec(SCHEMA);
+      const s = new Store(db);
+      s.migrate();
+      return s;
+    } catch (error) { db.close(); throw error; }
   }
 
   /**
@@ -706,6 +708,28 @@ export class Store {
 
   close(): void {
     this.db.close();
+  }
+
+  /** All writers must be excluded by the caller. Reuse this Store so routes retain their handle. */
+  replaceDatabase(snapshot: string, rollback: string): void {
+    const path = this.db.name;
+    const checkpoint = this.db.pragma('wal_checkpoint(TRUNCATE)') as { busy: number }[];
+    if (checkpoint.some(r => r.busy)) throw new Error('数据库仍在被其他进程使用，请停止其他调度进程后重试');
+    this.db.close();
+    let moved = false;
+    try {
+      renameSync(path, rollback);
+      moved = true;
+      copyFileSync(snapshot, path);
+      this.db = Store.open(path).db;
+    } catch (error) {
+      if (moved) {
+        for (const suffix of ['', '-wal', '-shm']) rmSync(path + suffix, { force: true });
+        renameSync(rollback, path);
+      }
+      this.db = Store.open(path).db;
+      throw error;
+    }
   }
 
   /* ------------------------------------------------------------ materials */

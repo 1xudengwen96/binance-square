@@ -22,6 +22,7 @@ import { ALERT_KINDS, noteGapReason, dayGapReason, raise as raiseAlert, clear as
 import { runStudio } from './studio/runner.ts';
 import { getSecret } from './secrets.ts';
 import { backupDatabase } from './backup.ts';
+import { BackupManager } from './backup/manager.ts';
 import { observeRollingSeam, ROLLING_SEAM_OBS_LIMIT } from './obs/rolling.ts';
 import { buildInfo, stampRunningBuild } from './build.ts';
 import { currentTarget, evaluateBreaker } from './rank/gates.ts';
@@ -463,6 +464,8 @@ export function reconcileGapDay(store: Store, settings: Settings, prevDayStart: 
 
 export async function runLoop(intervalMinutes: number, live: boolean): Promise<never> {
   const store = Store.open(process.env.DB_PATH ?? './data/squareforge.db');
+  const backups = new BackupManager(store);
+  backups.start();
   const settings = settingsFrom(store);
   console.log(`\n  调度启动：每 ${intervalMinutes} 分钟一轮 · ${live && settings.autoPublish ? '真实发布' : '演练/人工审核'}\n`);
   let n = 0;

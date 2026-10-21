@@ -6,7 +6,7 @@ data/
 
 # A database backup is the same material as the live database: every account's Square key
 # row is in it. `data/` was never the only copy that could be committed by accident.
-backup/
+/backup/
 *.db
 *.db-wal
 *.db-shm
