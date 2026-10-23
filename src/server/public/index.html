@@ -5,7 +5,7 @@
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>squareforge · 广场内容工厂</title>
 <link rel="icon" href="/favicon.svg" type="image/svg+xml">
-<link rel="stylesheet" href="/app.css?v=1019f">
+<link rel="stylesheet" href="/app.css?v=1021-mobile">
 </head>
 <body>
 <div class="app">
@@ -17,7 +17,11 @@
         <span>币安广场内容工厂</span>
       </div>
     </div>
-    <nav id="nav" class="nav"></nav>
+    <button class="btn nav-toggle" id="navToggle" type="button" aria-controls="nav" aria-expanded="false" onclick="toggleNavigation()">
+      <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 6h16M4 12h16M4 18h16"/></svg>
+      栏目
+    </button>
+    <nav id="nav" class="nav" aria-label="栏目导航"></nav>
     <div class="side-foot" id="sideFoot"></div>
   </aside>
 
@@ -44,7 +48,7 @@
 </div>
 
 <div class="toast" id="toast"></div>
-<script src="/app.js"></script>
+<script src="/app.js?v=1021-mobile"></script>
 <script src="/brain.js"></script>
 <script src="/backup.js"></script>
 </body>

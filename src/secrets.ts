@@ -6,7 +6,7 @@ import type { Store } from './db/index.ts';
  * a leaked GET response cannot expose a key.
  */
 
-export type SecretName = 'squareApiKey' | 'squareApiSecret' | 'openaiApiKey' | 'anthropicApiKey' | 'llmApiKey';
+export type SecretName = 'squareApiKey' | 'squareApiSecret' | 'openaiApiKey' | 'anthropicApiKey' | 'llmApiKey' | 'brainSecondaryApiKey';
 
 export const SECRET_LABELS: Record<SecretName, string> = {
   squareApiKey: '币安广场 OpenAPI Key',
@@ -14,6 +14,7 @@ export const SECRET_LABELS: Record<SecretName, string> = {
   openaiApiKey: 'OpenAI / 兼容接口 Key',
   anthropicApiKey: 'Anthropic Key',
   llmApiKey: '所选 AI 供应商的 Key',
+  brainSecondaryApiKey: '备用 / 审查模型 Key',
 };
 
 const NAMES = Object.keys(SECRET_LABELS) as SecretName[];
@@ -39,6 +40,7 @@ export function getSecret(store: Store, name: SecretName): string {
     squareApiSecret: process.env.SQUARE_API_SECRET,
     openaiApiKey: process.env.OPENAI_API_KEY,
     anthropicApiKey: process.env.ANTHROPIC_API_KEY,
+    brainSecondaryApiKey: process.env.BRAIN_SECONDARY_API_KEY,
   };
   return fromEnv[name] ?? '';
 }
@@ -93,6 +95,7 @@ export function secretViews(store: Store): SecretView[] {
       squareApiSecret: 'SQUARE_API_SECRET',
       openaiApiKey: 'OPENAI_API_KEY',
       anthropicApiKey: 'ANTHROPIC_API_KEY',
+      brainSecondaryApiKey: 'BRAIN_SECONDARY_API_KEY',
     };
     const envVar = envNames[name];
     return {

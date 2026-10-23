@@ -72,13 +72,51 @@ test('gate B pools comments over views instead of taking a median that is always
   const { store, close } = tempStore();
   try {
     const now = Date.UTC(2026, 9, 20, 6, 0);
-    for (let i = 0; i < 9; i++) post(store, now - (i + 1) * 3600_000 * 6, 1000, { comments: 0 });
-    post(store, now - 7 * 3600_000, 1000, { comments: 2 });
+    for (let i = 0; i < 9; i++) post(store, now - DAY - i * 3600_000 * 6, 1000, { comments: 0 });
+    post(store, now - DAY - 7 * 3600_000, 1000, { comments: 2 });
     const g = gateReport(store, now);
     assert.equal(g.B.views, 10_000);
     assert.equal(g.B.comments, 2);
+    assert.equal(g.B.posts, 10);
     assert.equal(g.B.commentsPer1k, 0.2);
     assert.equal(g.B.passed, false);
+  } finally { close(); }
+});
+
+test('gate B counts the posts gate A counts: a day old, at the 24h reading', () => {
+  const { store, close } = tempStore();
+  try {
+    const now = Date.UTC(2026, 9, 20, 6, 0);
+    // The first weekly review's case: two posts a few hours old, nothing mature. A read «nothing
+    // yet» while B already pooled 129 views out of these two.
+    for (const [age, views] of [[3, 64], [5, 65]] as const) {
+      const young = post(store, now - age * 3600_000, views, { comments: 0 });
+      store.db.prepare('UPDATE post_distribution SET v24h = NULL, v8h = NULL WHERE post_id = ?').run(young);
+    }
+    let g = gateReport(store, now);
+    assert.equal(g.A.median7d, null);
+    assert.equal(g.B.views, 0, 'a post under 24h is not in gate B');
+    assert.equal(g.B.posts, 0);
+    assert.equal(g.B.immature, 2);
+    assert.equal(g.B.commentsPer1k, null, 'nothing to judge is unknown, not a rate of 0');
+
+    // A mature post is pooled at its 24h reading, not its latest one.
+    const id = post(store, now - 2 * DAY, 400, { comments: 1 });
+    store.db.prepare('UPDATE post_stats SET views = 900 WHERE post_id = ?').run(id);
+    // A mature post whose comment counter was never read is left out, not pooled as zero.
+    const blind = post(store, now - 3 * DAY, 600);
+    store.db.prepare('UPDATE post_stats SET comments = NULL WHERE post_id = ?').run(blind);
+    g = gateReport(store, now);
+    assert.equal(g.B.views, 400);
+    assert.equal(g.B.comments, 1);
+    assert.equal(g.B.posts, 1);
+    assert.equal(g.B.immature, 2);
+    assert.equal(g.B.commentsPer1k, 2.5);
+    assert.equal(g.A.median7d, 500, 'A still reads both mature posts');
+
+    const snap = buildSnapshot(store, DEFAULT_SETTINGS, now);
+    assert.equal(snap.gates.B.views, 400);
+    assert.ok(snap.definitions.some(d => d.includes('gates.B')), 'the snapshot says what B counts');
   } finally { close(); }
 });
 

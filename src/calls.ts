@@ -25,6 +25,7 @@ import { binance } from './collectors/binance.ts';
 export const CHECK_AFTER_MS = 24 * 3600_000;
 export const VOID_AFTER_MS = 72 * 3600_000;
 export const HOLD_FRACTION = 0.5;
+export const FUNDING_PERSISTS = 'funding_persists';
 export const PAYER_PERSISTS = 'payer_persists';
 
 export interface CallInput {
@@ -159,6 +160,55 @@ export function tally(store: Store): CallTally {
   const faded = r.faded ?? 0;
   const flipped = r.flipped ?? 0;
   return { total: held + faded + flipped, held, faded, flipped, open: r.open ?? 0 };
+}
+
+export interface CallCohort extends CallTally {
+  /** held / total; no rulings means unknown, not a success rate of zero. */
+  heldRate: number | null;
+  void: number;
+  firstRegisteredAt: number | null;
+  lastRegisteredAt: number | null;
+}
+
+export interface CallStats extends CallTally {
+  currentKind: typeof PAYER_PERSISTS;
+  byKind: Record<string, CallCohort>;
+}
+
+/** Separate the rules recorded on each call; never rejudge old outcomes or guess a cutover date. */
+export function callStats(store: Store): CallStats {
+  const empty = (): CallCohort => ({
+    total: 0, held: 0, faded: 0, flipped: 0, open: 0, void: 0, heldRate: null,
+    firstRegisteredAt: null, lastRegisteredAt: null,
+  });
+  const byKind: Record<string, CallCohort> = {
+    [FUNDING_PERSISTS]: empty(),
+    [PAYER_PERSISTS]: empty(),
+  };
+  const rows = store.db.prepare(`
+    SELECT kind, COALESCE(SUM(outcome = 'held'), 0) AS held,
+           COALESCE(SUM(outcome = 'faded'), 0) AS faded,
+           COALESCE(SUM(outcome = 'flipped'), 0) AS flipped,
+           COALESCE(SUM(status = 'open'), 0) AS open,
+           COALESCE(SUM(status = 'void'), 0) AS void,
+           MIN(check_at - ?) AS firstRegisteredAt, MAX(check_at - ?) AS lastRegisteredAt
+    FROM column_calls GROUP BY kind
+  `).all(CHECK_AFTER_MS, CHECK_AFTER_MS) as (Omit<CallCohort, 'total' | 'heldRate'> & { kind: string })[];
+  const all: CallTally = { total: 0, held: 0, faded: 0, flipped: 0, open: 0 };
+  for (const { kind, ...counts } of rows) {
+    const total = counts.held + counts.faded + counts.flipped;
+    // defineProperty also treats an unexpected kind such as "__proto__" as an ordinary key.
+    Object.defineProperty(byKind, kind, {
+      value: { ...counts, total, heldRate: total ? counts.held / total : null },
+      enumerable: true, configurable: true, writable: true,
+    });
+    all.total += total;
+    all.held += counts.held;
+    all.faded += counts.faded;
+    all.flipped += counts.flipped;
+    all.open += counts.open;
+  }
+  return { ...all, currentKind: PAYER_PERSISTS, byKind };
 }
 
 export interface Unrecapped {

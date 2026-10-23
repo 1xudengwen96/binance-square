@@ -98,6 +98,30 @@ test('rows past the retention horizon are deleted, not just flagged', () => {
   }
 });
 
+test('a material a post was written from outlives the horizon, and the rest of the sweep still runs', () => {
+  const { store, dir, charts } = temp();
+  try {
+    const now = Date.now();
+    const old = now - 40 * 24 * 3_600_000;
+    const used = mat('funding', 'funding_extreme', 'POSTED', now - 3 * HOUR);
+    store.insertMaterial(used);
+    store.insertMaterial(mat('funding', 'funding_extreme', 'UNUSED', now - 3 * HOUR));
+    store.db.prepare('UPDATE materials SET collected_at = ?').run(old);
+    store.addPost({ materialId: used.id, templateId: null, text: 't', status: 'published', scheduledAt: null });
+    store.db.prepare("INSERT INTO events (at, kind, detail) VALUES (?, 'tick', '{}')").run(old);
+
+    // Before: the FK aborted the DELETE, retire() threw, and events/charts/board rows never aged out.
+    const r = retire(store, S, charts, now);
+    assert.equal(r.deletedMaterials, 1);
+    assert.equal(r.deletedEvents, 1, 'the prunes after the materials one still ran');
+    const left = store.db.prepare('SELECT symbol FROM materials').all() as { symbol: string }[];
+    assert.deepEqual(left.map(m => m.symbol), ['POSTED']);
+  } finally {
+    store.close();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
 function touch(file: string, ageMs: number): void {
   const t = new Date(Date.now() - ageMs);
   utimesSync(file, t, t);

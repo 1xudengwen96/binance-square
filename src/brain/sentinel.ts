@@ -1,6 +1,7 @@
+import { pendingJob, enqueueJob, claimJob, failJob, finishJob } from './jobs.ts';
 import type { Store } from '../db/index.ts';
 import type { Settings } from '../config.ts';
-import { brainFor, callsSince } from './brain.ts';
+import { brainFor } from './brain.ts';
 import { buildSnapshot, snapshotText, type BrainSnapshot } from './snapshot.ts';
 import { SENTINEL_SYSTEM, withOperatorNotes } from './prompts.ts';
 import { fileFromReply, stripUpgrades } from './upgrades.ts';
@@ -34,9 +35,11 @@ export function detectAlarms(s: BrainSnapshot, settings: Settings): Alarm[] {
     });
   }
 
-  const w14 = s.account.w14;
-  if (w14.measured >= 10 && w14.commentsPer1k === 0 && !s.gates.B.passed) {
-    out.push({ code: 'no_comments', detail: `近 14 天 ${w14.measured} 条有读数的帖子，评论一条都没有（合并评论率 0）。关卡 B 没有任何进展。` });
+  // Judged on gate B's own cohort (a day old, read at 24h): w14 also holds posts a few hours old,
+  // and an alarm that names gate B must count the posts gate B counts.
+  const B = s.gates.B;
+  if (B.posts >= 10 && B.commentsPer1k === 0 && !B.passed) {
+    out.push({ code: 'no_comments', detail: `近 ${B.windowDays} 天 ${B.posts} 条满 24 小时的帖子（${B.views} 次 24h 浏览），评论一条都没有（合并评论率 0）。关卡 B 没有任何进展。` });
   }
 
   const med = s.account.w7.medianViews;
@@ -49,8 +52,10 @@ export function detectAlarms(s: BrainSnapshot, settings: Settings): Alarm[] {
     out.push({ code: 'gate_a_cleared', detail: `关卡 A 连续 ${s.gates.A.streakDays} 天过线，优化目标已自动切到互动质量。请确认这个切换合理。` });
   }
 
-  const flipped = s.calls.total >= 5 && s.calls.held / Math.max(1, s.calls.total) < 0.3;
-  if (flipped) out.push({ code: 'calls_failing', detail: `已裁决 ${s.calls.total} 条判断，只有 ${s.calls.held} 条成立。栏目的判断方式可能有问题。` });
+  const currentCalls = s.calls.byKind[s.calls.currentKind];
+  if (currentCalls && currentCalls.total >= 5 && currentCalls.heldRate != null && currentCalls.heldRate < 0.3) {
+    out.push({ code: 'calls_failing', detail: `当前口径 ${s.calls.currentKind}（隔天仍是同一边付费即成立）已裁决 ${currentCalls.total} 条判断，只有 ${currentCalls.held} 条成立；历史旧口径未计入。栏目的判断方式可能有问题。` });
+  }
 
   if (settings.llmEnabled === false) return out.filter(a => a.code === 'breaker');
   return out;
@@ -134,29 +139,47 @@ export async function runSentinel(store: Store, settings: Settings, now = Date.n
     return !last.t || now - last.t >= REPEAT_QUIET_MS;
   });
   const report: SentinelReport = { raised: fresh, woke: false, skippedWhy: null, reportId: null };
-  if (!fresh.length) return report;
 
   const ins = store.db.prepare('INSERT INTO brain_alarms (at, code, detail, woke) VALUES (?,?,?,0)');
   const ids = fresh.map(a => Number(ins.run(now, a.code, a.detail).lastInsertRowid));
   // The panel only helps an operator who opens it. A webhook reaches one who does not.
   for (const a of fresh) await pushAlarm(store, settings, a, now);
 
+  if (fresh.length) enqueueJob(store, 'sentinel', { alarmIds: ids }, { key: `sentinel:${ids.join(',')}`, now });
   if (!settings.brainSentinel) { report.skippedWhy = '哨兵唤醒已在配置里关闭'; return report; }
-  const brain = brainFor(store, settings);
-  if (!brain) { report.skippedWhy = '大脑没有配置好'; return report; }
-  if (callsSince(store, now - DAY, ['sentinel']) >= settings.brainWakeCapPerDay) {
-    report.skippedWhy = `今天已唤醒 ${settings.brainWakeCapPerDay} 次，达到上限`;
+  const queued = pendingJob(store, 'sentinel', now);
+  if (!queued) return report;
+  const payload = JSON.parse(queued.payload_json) as { alarmIds: number[] };
+  const alarms = payload.alarmIds.map(id => store.db.prepare('SELECT id, code FROM brain_alarms WHERE id=? AND report_id IS NULL').get(id) as { id: number; code: string } | undefined)
+    .filter((a): a is { id: number; code: string } => Boolean(a));
+  const active = all.filter(a => alarms.some(old => old.code === a.code));
+  if (!active.length) {
+    store.db.prepare("UPDATE brain_jobs SET status='expired', resolved_at=? WHERE id=?").run(now, queued.id);
+    report.skippedWhy = '警报条件已消失，取消过期分析';
     return report;
   }
-
-  const head = fresh[0]!;
+  const brain = brainFor(store, settings);
+  if (!brain) { report.skippedWhy = '大脑没有配置好'; return report; }
+  // One logical wake may have up to two delayed retries; transport attempts have a separate cap.
+  const wakes = (store.db.prepare("SELECT COUNT(*) AS n FROM brain_jobs WHERE purpose='sentinel' AND created_at>=? AND runs>0 AND id<>?")
+    .get(now - DAY, queued.id) as { n: number }).n;
+  const legacy = (store.db.prepare("SELECT COUNT(*) AS n FROM brain_calls WHERE purpose='sentinel' AND at>=? AND call_key IS NULL").get(now - DAY) as { n: number }).n;
+  if (queued.runs === 0 && wakes + legacy >= settings.brainWakeCapPerDay) {
+    report.skippedWhy = `今天已达到 ${settings.brainWakeCapPerDay} 次唤醒上限`;
+    return report;
+  }
+  const job = claimJob(store, queued.id, now);
+  if (!job) { report.skippedWhy = '分析正在执行或等待补跑时间'; return report; }
+  const head = active[0]!;
   const r = await brain.ask({
     purpose: 'sentinel',
     system: withOperatorNotes(SENTINEL_SYSTEM, store.getSetting<string>('brainNotes', '')),
-    context: `警报：\n${fresh.map(a => `- [${a.code}] ${a.detail}`).join('\n')}\n\n快照：\n${snapshotText(snap)}`,
+    context: `警报：\n${active.map(a => `- [${a.code}] ${a.detail}`).join('\n')}\n\n快照：\n${snapshotText(snap)}`,
     maxTokens: settings.brainMaxTokensSentinel,
   });
-  if (!r.ok) { report.skippedWhy = `调用失败：${r.error.slice(0, 120)}`; return report; }
+  if (!r.ok) { failJob(store, job.id, r.error, now, r.retryAt); report.skippedWhy = `调用失败，已登记有限补跑：${r.error.slice(0, 120)}`; return report; }
+
+  return store.db.transaction(() => {
 
   const rep = store.db
     .prepare("INSERT INTO brain_reports (kind, created_at, title, body, snapshot_json, actions_json, status) VALUES ('sentinel', ?, ?, ?, ?, '[]', 'pending')")
@@ -164,8 +187,10 @@ export async function runSentinel(store: Store, settings: Settings, now = Date.n
   report.reportId = Number(rep.lastInsertRowid);
   report.woke = true;
   const mark = store.db.prepare('UPDATE brain_alarms SET woke = 1, report_id = ? WHERE id = ?');
-  for (const id of ids) mark.run(report.reportId, id);
+  for (const a of alarms) if (active.some(current => current.code === a.code)) mark.run(report.reportId, a.id);
   fileFromReply(store, r.text, { source: 'sentinel', reportId: report.reportId, now });
-  store.log('brain_sentinel', { codes: fresh.map(a => a.code), reportId: report.reportId });
+  finishJob(store, job.id, report.reportId, now);
+  store.log('brain_sentinel', { codes: active.map(a => a.code), reportId: report.reportId });
   return report;
+  })();
 }

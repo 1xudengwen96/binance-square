@@ -20,7 +20,7 @@ export const GATE_LINES = {
   /** Distinct calendar days (Beijing) in a row the median must hold, each with enough posts. */
   daysInARow: 7,
   minPostsPerDay: 3,
-  /** Comments per 1,000 views, pooled across the window. */
+  /** Comments per 1,000 24h views, pooled across the window's mature posts (A's cohort). */
   commentsPer1k: 0.5,
   commentWindowDays: 14,
   /** A post counts as second-round when it kept at least doubling its 3h reading. */
@@ -98,7 +98,19 @@ export interface GateReport {
     daysNeeded: number;
     line: number;
   };
-  B: { passed: boolean; commentsPer1k: number | null; views: number; comments: number; line: number; windowDays: number };
+  B: {
+    passed: boolean;
+    commentsPer1k: number | null;
+    /** Sum of 24h readings over `posts` — the same posts gate A counts, never a younger reading. */
+    views: number;
+    comments: number;
+    /** Mature posts in the window that carried a comment reading. */
+    posts: number;
+    /** Posts in the window left out for want of a 24h reading: too young, or that checkpoint was missed. */
+    immature: number;
+    line: number;
+    windowDays: number;
+  };
   C: { passed: boolean; secondRound: number; needed: number };
   /** Metric the experiments should be judged by right now. */
   target: 'views' | 'engagement';
@@ -112,6 +124,10 @@ export interface GateReport {
  * A post is "mature" once its 24h reading exists; judging a 2-hour-old post against a 24h line
  * would fail every gate for the wrong reason. Days with fewer than `minPostsPerDay` mature posts
  * break the streak, so a day with one lucky post cannot pass the gate.
+ *
+ * B pools the same mature posts at their 24h reading. It used to pool every post's latest reading,
+ * so on a week with no mature post A read «nothing yet» while B was already judging two posts a
+ * few hours old — the first weekly review caught B's 129 views being exactly those two.
  */
 export function gateReport(store: Store, now = Date.now()): GateReport {
   const all = rows(store, now - 30 * DAY);
@@ -134,9 +150,12 @@ export function gateReport(store: Store, now = Date.now()): GateReport {
   const last7 = mature.filter(r => r.published_at >= now - 7 * DAY).map(r => r.v24h!);
   const aPassed = streak >= GATE_LINES.daysInARow;
 
-  const cWin = all.filter(r => r.published_at >= now - GATE_LINES.commentWindowDays * DAY && r.views != null);
-  const views = cWin.reduce((s, r) => s + (r.views ?? 0), 0);
-  const comments = cWin.reduce((s, r) => s + (r.comments ?? 0), 0);
+  const bSince = now - GATE_LINES.commentWindowDays * DAY;
+  const inWin = all.filter(r => r.published_at >= bSince);
+  // A null comment counter is «not read», not «zero comments» — the snapshot's rule too.
+  const cWin = mature.filter(r => r.published_at >= bSince && r.comments != null);
+  const views = cWin.reduce((s, r) => s + r.v24h!, 0);
+  const comments = cWin.reduce((s, r) => s + r.comments!, 0);
   const rate = views > 0 ? (comments / views) * 1000 : null;
   const bPassed = rate != null && rate >= GATE_LINES.commentsPer1k;
 
@@ -153,7 +172,11 @@ export function gateReport(store: Store, now = Date.now()): GateReport {
   return {
     asOf: now,
     A: { passed: aPassed, median7d: median(last7), streakDays: streak, daysNeeded: GATE_LINES.daysInARow, line: GATE_LINES.viewsMedian },
-    B: { passed: bPassed, commentsPer1k: rate == null ? null : Number(rate.toFixed(2)), views, comments, line: GATE_LINES.commentsPer1k, windowDays: GATE_LINES.commentWindowDays },
+    B: {
+      passed: bPassed, commentsPer1k: rate == null ? null : Number(rate.toFixed(2)), views, comments,
+      posts: cWin.length, immature: inWin.filter(r => !mature.includes(r)).length,
+      line: GATE_LINES.commentsPer1k, windowDays: GATE_LINES.commentWindowDays,
+    },
     C: { passed: cPassed, secondRound: second, needed: GATE_LINES.secondRoundNeeded },
     target,
     reason,

@@ -113,19 +113,27 @@ function renderNav() {
         const n = navCount(id);
         // 运行台那枚角标的题注必须带三分拆法，否则"3"会被读成"三面都证实了 3 枚"。
         const title = id === 'ops' ? `${label} —— ${opsBadge().title}` : label;
-        return `<button class="${id === TAB ? 'on' : ''}" onclick="go('${id}')" title="${esc(title)}">
+        return `<button class="${id === TAB ? 'on' : ''}" ${id === TAB ? 'aria-current="page"' : ''} onclick="go('${id}')" title="${esc(title)}">
           <svg viewBox="0 0 24 24" stroke-linecap="round" stroke-linejoin="round">${icon}</svg>
           <span>${esc(label)}</span>${n ? `<span class="cnt">${n}</span>` : ''}
         </button>`;
       }).join('')}
     </div>`).join('');
 }
+function toggleNavigation(open = !$('.side').classList.contains('nav-open')) {
+  $('.side').classList.toggle('nav-open', open);
+  $('#navToggle').setAttribute('aria-expanded', String(open));
+}
 async function go(tab) {
+  const mobile = matchMedia('(max-width: 760px)').matches;
+  toggleNavigation(false);
+  if (mobile) $('#navToggle').focus({ preventScroll: true });
   TAB = tab;
   // The tab survives a reload, and a page can be linked to as /#brain.
   if (location.hash !== '#' + tab) history.replaceState(null, '', '#' + tab);
   renderNav();
   await render();
+  if (mobile) window.scrollTo({ top: 0, behavior: 'instant' });
 }
 
 function fmtTs(ms, withSeconds = false) {
@@ -824,7 +832,7 @@ function accountCard(a) {
 
     <details class="grp"><summary class="gh">高级设置 <span class="muted">素材来源、币种黑白名单、模版屏蔽、代理、人设、错峰</span></summary>
       <div class="field"><span class="cap">素材来源 <span class="muted">至少选一个</span></span><div class="chips">${chipGroup(`cats-${a.id}`, CATEGORY_CHOICES, cats)}</div></div>
-      <div class="grid" style="grid-template-columns:repeat(auto-fit,minmax(240px,1fr));gap:12px">
+      <div class="grid" style="grid-template-columns:repeat(auto-fit,minmax(min(100%,240px),1fr));gap:12px">
         <div class="field"><span class="cap">只发这些币（留空=自动分配）</span><input type="text" id="ac-syms-${a.id}" value="${esc(pinned.join(', '))}" placeholder="BTC, ETH"></div>
         <div class="field"><span class="cap">不发这些币</span><input type="text" id="ac-deny-${a.id}" value="${esc(blockedSyms.join(', '))}" placeholder="垃圾币、出事币"></div>
         <div class="field"><span class="cap">两帖最小间隔（分）</span><input type="number" id="ac-minint-${a.id}" min="5" max="720" value="${a.min_interval_minutes ?? STATE.settings.minIntervalMinutes}"></div>
@@ -2094,7 +2102,7 @@ async function rankView() {
     </div>`;
   const heatCard = `<div class="card" style="margin-top:14px">
     <div class="card-hd"><h3>币的热度对浏览有多大影响</h3><span class="sub">24h 浏览中位数，只算满 24 小时的帖子。各档差得越多，下面的实验就越要看「分层比」，而不是混在一起的中位数</span></div>
-    <div class="grid" style="grid-template-columns:repeat(auto-fit,minmax(280px,1fr));gap:18px;margin-top:8px">
+    <div class="grid" style="grid-template-columns:repeat(auto-fit,minmax(min(100%,280px),1fr));gap:18px;margin-top:8px">
       <div><div class="cap">按币的 24h 成交额</div><div class="hbars">${heat.bands.map(b => heatBar(b.band, b.label, b.medianViews, b.n)).join('')}</div></div>
       <div><div class="cap">按账号</div><div class="hbars">${heat.byAccount.map(a => heatBar(a.label || String(a.accountId), '', a.medianViews, a.n)).join('') || '<div class="muted">还没有满 24 小时的帖子</div>'}</div></div>
     </div>
@@ -2358,7 +2366,7 @@ function traceHtml(p) {
   const ledger = (p.factLedger || []).filter(f => f.field !== 'literal');
   return `
   <div class="card" style="background:var(--panel2);margin-top:12px;padding:12px 14px">
-    <div class="grid" style="grid-template-columns:repeat(auto-fit,minmax(260px,1fr));gap:14px">
+    <div class="grid" style="grid-template-columns:repeat(auto-fit,minmax(min(100%,260px),1fr));gap:14px">
       <div>
         <div class="lbl">素材</div>
         ${m ? `<div style="margin-top:4px"><span class="tag">${esc(m.category)}/${esc(m.subType)}</span>
@@ -2996,6 +3004,12 @@ async function opsView() {
 }
 
 document.documentElement.dataset.theme = localStorage.getItem('sf-theme') || 'dark';
+document.addEventListener('keydown', event => {
+  if (event.key === 'Escape' && $('.side').classList.contains('nav-open')) {
+    toggleNavigation(false);
+    $('#navToggle').focus();
+  }
+});
 api('/api/auth/session').then(session => {
   $('#logoutBtn').hidden = !session.enabled;
 }).catch(() => {});

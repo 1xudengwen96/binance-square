@@ -5,7 +5,7 @@ import { scoreAll, heatProfile, MATURITY_FLOOR_MS, type Verdict } from '../rank/
 import { changeLedger, liveKnobs, currentKnob } from '../rank/params.ts';
 import { settingsFrom } from '../schedule.ts';
 import { boardComposition, type BoardComposition } from '../stats/benchmarks.ts';
-import { tally, type CallTally } from '../calls.ts';
+import { callStats, type CallStats } from '../calls.ts';
 import { upgradesForSnapshot } from './upgrades.ts';
 
 /**
@@ -61,7 +61,7 @@ export interface BrainSnapshot {
   knobs: { key: string; label: string; current: number | null; judgedBy: string }[];
   failures: { key: string; text: string; at: number }[];
   benchmark: { zh: BoardComposition; poolZh: number; poolOther: number };
-  calls: CallTally;
+  calls: CallStats;
   alerts: { code: string; detail: string; at: number }[];
   /** What the brain already filed as needing a code change, and what the operator did with it. */
   upgrades: ReturnType<typeof upgradesForSnapshot>;
@@ -161,13 +161,16 @@ function columnStats(rows: Row[], now: number): ColumnStats[] {
  * at 24 hours); the rest are said here so the model reads the difference as designed.
  */
 const DEFINITIONS = [
-  'account.wN.posts：窗口内发布的帖子数；measured：其中已读到浏览数的（含未满 24 小时的，用最新读数）；medianViews 也是这批。',
+  'account.wN.posts：窗口内发布的帖子数；measured：其中已读到浏览数的（含未满 24 小时的，用最新读数）；medianViews 也是这批。它是账号概况，不是关卡口径。',
+  'gates.A / gates.B / gates.C 同一批帖子：发布满 24 小时且有 24h 读数的。B 的 views 是这些帖子 24h 读数之和，posts 是参与合并的条数（评论没读到的不算），immature 是窗口内没有 24h 读数而被排除的条数（未满 24 小时，或 24h 那次回抓错过了）。B 和 account.w14 对不上是口径不同，不是数据错。',
   'account.publishedTotal：有史以来全部已发布条数，不限窗口。',
   'columns[].posts：近 30 天该栏目发布条数；matured：其中满 24 小时且有 24h 读数的；medianViews、commentsPer1k 只算 matured。',
   'hypotheses[].arms[].n：近 30 天、满 24 小时、有 24h 读数、且登记了这个实验臂的帖子；和 columns.matured、chart 同一口径，只是没登记臂的帖子不算。',
   'chart：与 h_chart 同口径（满 24 小时、有 24h 读数）。',
   'hypotheses[].stratified：在同一素材类别、同一成交额档（见 heat.bands）内比较；strata 是两边都有数据的层数，agree 是领先那一臂在几层里排第一，detail 是每层各臂的样本数和中位数。没有成交额的素材退回用采集评分分档（档名以「评分」开头）。',
   'heat：各成交额档、各账号的 24h 浏览中位数，同上口径。档与档差得越多，不分层的比较越不可信；差得少，热度就不是主要干扰。',
+  'calls 顶层 total / held / faded / flipped / open 是历史合计，混合新旧口径，不能据此评价当前成立率；按 byKind 分开看，currentKind 指向当前口径。funding_persists（旧）：隔天同一边付费且费率幅度至少保留一半才成立，否则为减弱或反转；payer_persists（新）：隔天仍是同一边付费即成立。分组依据每条记录的 kind，历史裁决不重算。',
+  'calls.byKind 各组 total 只含已裁决的 held + faded + flipped；heldRate = held / total（0–1），无已裁决样本时为 null；open 待裁决、void 作废均不进分母。firstRegisteredAt / lastRegisteredAt 是该组登记时间范围（check_at 减 24 小时），不代表裁决日期或精确升级日期。calls_failing 告警只看 currentKind，至少 5 条裁决才判断。',
   'alerts 里的条数是哨兵触发当时的计数，可能比现在的少。',
 ];
 
@@ -200,6 +203,7 @@ export function buildSnapshot(store: Store, settings: Settings, now = Date.now()
     '榜上的帖子是被分发之后才采到的，形态占比不能当成「这样写就会被分发」。',
   ];
   if (!gates.A.median7d) unknowns.push('最近 7 天没有满 24 小时的帖子，关卡 A 的中位数读不到。');
+  if (!gates.B.posts) unknowns.push(`最近 ${GATE_LINES.commentWindowDays} 天没有满 24 小时且读到评论数的帖子，关卡 B 的评论率读不到（不是 0）。`);
   if (comp.n < 50) unknowns.push(`中文榜样本只有 ${comp.n} 条，形态占比不稳。`);
   if (!by.zh) unknowns.push('库里还没有中文榜样本。');
 
@@ -208,7 +212,7 @@ export function buildSnapshot(store: Store, settings: Settings, now = Date.now()
     mission: {
       gates: {
         A: `连续 ${GATE_LINES.daysInARow} 天，每天 ≥ ${GATE_LINES.minPostsPerDay} 条满 24 小时的帖子且浏览中位数 ≥ ${GATE_LINES.viewsMedian}`,
-        B: `近 ${GATE_LINES.commentWindowDays} 天合并评论率 ≥ ${GATE_LINES.commentsPer1k} 条 / 千次浏览`,
+        B: `近 ${GATE_LINES.commentWindowDays} 天满 24 小时的帖子（与 A 同一批）合并评论率 ≥ ${GATE_LINES.commentsPer1k} 条 / 千次 24h 浏览`,
         C: `累计 ≥ ${GATE_LINES.secondRoundNeeded} 条帖子 24 小时浏览 ≥ ${GATE_LINES.secondRoundRatio} 倍的 3 小时浏览且 ≥ ${GATE_LINES.secondRoundMinViews}`,
       },
       target,
@@ -239,7 +243,7 @@ export function buildSnapshot(store: Store, settings: Settings, now = Date.now()
       .prepare("SELECT key, text, created_at FROM brain_memory WHERE status = 'active' AND (key LIKE 'param:%' OR key LIKE 'rank:stalled:%' OR key LIKE 'brain:rejected:%') ORDER BY created_at DESC LIMIT 12")
       .all() as { key: string; text: string; created_at: number }[]).map(f => ({ key: f.key, text: f.text, at: f.created_at })),
     benchmark: { zh: comp, poolZh: by.zh, poolOther: by.other },
-    calls: tally(store),
+    calls: callStats(store),
     alerts: (store.db.prepare('SELECT at, code, detail FROM brain_alarms WHERE at >= ? ORDER BY at DESC LIMIT 12').all(now - 7 * DAY) as { at: number; code: string; detail: string }[]),
     upgrades: upgradesForSnapshot(store, now),
     heat: heatProfile(store, { now }),

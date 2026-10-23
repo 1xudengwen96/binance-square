@@ -116,6 +116,14 @@ export interface Settings {
   llmPolish: boolean;
   /** Model for the brain's jobs; empty means the same model as polish. Judging usually wants a stronger one. */
   brainModel: string;
+  /** Independent second connection; its credential is stored as a secret, never in settings. */
+  brainSecondaryProvider: 'openai' | 'anthropic';
+  brainSecondaryBaseUrl: string;
+  brainSecondaryModel: string;
+  brainFallbackEnabled: boolean;
+  brainReviewEnabled: boolean;
+  brainAttemptCapPerDay: number;
+  brainTokenCapPerDay: number;
   /** Which jobs the brain is allowed to be woken for. The daily reflection is the existing one. */
   brainDaily: boolean;
   brainSentinel: boolean;
@@ -244,6 +252,13 @@ export const DEFAULT_SETTINGS: Settings = {
   llmTemperature: 0.7,
   llmPolish: true,
   brainModel: '',
+  brainSecondaryProvider: 'openai',
+  brainSecondaryBaseUrl: 'https://api.openai.com/v1',
+  brainSecondaryModel: '',
+  brainFallbackEnabled: false,
+  brainReviewEnabled: false,
+  brainAttemptCapPerDay: 40,
+  brainTokenCapPerDay: 200000,
   brainDaily: true,
   brainSentinel: true,
   brainWeekly: true,

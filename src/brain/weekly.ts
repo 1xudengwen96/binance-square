@@ -8,6 +8,8 @@ import { proposeChange } from '../rank/params.ts';
 import { isSafeVariant, COLUMN_KINDS, type ColumnKind, type VariantSlot } from '../content/columns.ts';
 import { remember } from './memory.ts';
 import { fileFromReply, stripUpgrades } from './upgrades.ts';
+import { enqueueJob, claimJob, failJob, finishJob } from './jobs.ts';
+import { reviewWeekly, reviewText } from './review.ts';
 
 /**
  * The weekly review and what happens to its recommendations.
@@ -84,6 +86,13 @@ export async function runWeekly(store: Store, settings: Settings, now = Date.now
   const brain = brainFor(store, settings);
   if (!brain) return { ok: false, reportId: null, note: '大脑没有配置好（需要启用、Key 和模型）' };
 
+  // A cycle begins Sunday 22:00 Beijing. Manual requests share the same idempotency key.
+  const cycle = Math.floor((now - (3 * 86_400_000 + 14 * 3600_000)) / WEEK);
+  const queued = enqueueJob(store, 'weekly', {}, { key: `weekly:${cycle}`, now });
+  if (queued.status === 'done') return { ok: true, reportId: queued.report_id, note: '本期周报已经生成' };
+  const job = claimJob(store, queued.id, now);
+  if (!job) return { ok: false, reportId: null, note: '本期周报正在执行或等待有限补跑' };
+
   const snap = buildSnapshot(store, settings, now);
   const previous = store.db
     .prepare("SELECT created_at, body FROM brain_reports WHERE kind = 'weekly' ORDER BY id DESC LIMIT 1")
@@ -94,25 +103,33 @@ export async function runWeekly(store: Store, settings: Settings, now = Date.now
     context: `快照：\n${snapshotText(snap)}\n\n上一份周报（没有就是第一份）：\n${previous ? previous.body.slice(0, 3000) : '无'}`,
     maxTokens: settings.brainMaxTokensWeekly,
   });
-  if (!r.ok) return { ok: false, reportId: null, note: `调用失败：${r.error.slice(0, 160)}` };
+  if (!r.ok) {
+    failJob(store, job.id, r.error, now, r.retryAt);
+    return { ok: false, reportId: null, note: `调用失败，已登记有限补跑：${r.error.slice(0, 160)}` };
+  }
 
+  const review = settings.brainReviewEnabled ? await reviewWeekly(store, settings, snap, r.text, r.connection) : null;
+
+  return store.db.transaction(() => {
   const actions = parseActions(r.text);
   const body = stripUpgrades(stripActions(r.text));
   const gaps = missingSections(body);
   const incomplete = !recommendationComplete(body);
   const flags = [gaps.length ? `缺少章节：${gaps.join('、')}` : '', incomplete ? '第 5 节缺证据 / 反例 / 到期日' : ''].filter(Boolean);
   // A recommendation without its three parts is a feeling; it is shown but cannot be approved.
-  const held = incomplete || gaps.includes('5 本周唯一建议') ? [] : actions;
+  const held = incomplete || gaps.includes('5 本周唯一建议') || (review && review.verdict !== 'supported') ? [] : actions;
   const rep = store.db
-    .prepare("INSERT INTO brain_reports (kind, created_at, title, body, snapshot_json, actions_json, status) VALUES ('weekly', ?, ?, ?, ?, ?, 'pending')")
-    .run(now, `周复盘 ${new Date(now + 8 * 3600_000).toISOString().slice(0, 10)}${flags.length ? '（有缺项）' : ''}`, flags.length ? `> 系统检查：${flags.join('；')}\n\n${body}` : body, JSON.stringify(snap), JSON.stringify(held));
+    .prepare("INSERT INTO brain_reports (kind, created_at, title, body, snapshot_json, actions_json, status, review_json) VALUES ('weekly', ?, ?, ?, ?, ?, 'pending', ?)")
+    .run(now, `周复盘 ${new Date(now + 8 * 3600_000).toISOString().slice(0, 10)}${flags.length ? '（有缺项）' : ''}`, (flags.length ? `> 系统检查：${flags.join('；')}\n\n${body}` : body) + (review ? reviewText(review) : ''), JSON.stringify(snap), JSON.stringify(held), review ? JSON.stringify(review) : null);
   const reportId = Number(rep.lastInsertRowid);
   // Requests for a code change are filed whatever state the recommendation is in: they are records
   // for the operator, not actions, so there is nothing for the three-part check to protect.
   const filed = fileFromReply(store, r.text, { source: 'weekly', reportId, now });
   store.log('brain_weekly', { reportId, actions: held.length, flags, upgrades: filed.length });
   const extra = filed.length ? `；登记了 ${filed.length} 条需要改代码的事` : '';
+  finishJob(store, job.id, reportId, now);
   return { ok: true, reportId, note: `${flags.length ? `已生成，但有缺项：${flags.join('；')}` : '已生成'}${extra}` };
+  })();
 }
 
 export interface ApplyOutcome {

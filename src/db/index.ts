@@ -505,9 +505,53 @@ CREATE TABLE IF NOT EXISTS brain_calls (
   in_chars    INTEGER NOT NULL,
   out_chars   INTEGER NOT NULL,
   error       TEXT,
-  reply       TEXT
+  reply       TEXT,
+  call_key TEXT,
+  connection TEXT,
+  attempt_count INTEGER,
+  error_kind TEXT
 );
 CREATE INDEX IF NOT EXISTS brain_calls_at ON brain_calls(at DESC);
+
+CREATE TABLE IF NOT EXISTS brain_attempts (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  call_key TEXT NOT NULL,
+  at INTEGER NOT NULL,
+  purpose TEXT NOT NULL,
+  connection TEXT NOT NULL,
+  provider TEXT NOT NULL,
+  model TEXT NOT NULL,
+  ok INTEGER NOT NULL,
+  ms INTEGER NOT NULL,
+  error_kind TEXT,
+  error TEXT,
+  status INTEGER,
+  request_id TEXT,
+  endpoint TEXT,
+  content_type TEXT,
+  input_tokens INTEGER,
+  output_tokens INTEGER,
+  reserved_tokens INTEGER NOT NULL DEFAULT 0
+);
+CREATE INDEX IF NOT EXISTS brain_attempts_at ON brain_attempts(at DESC);
+CREATE INDEX IF NOT EXISTS brain_attempts_call ON brain_attempts(call_key, id);
+
+CREATE TABLE IF NOT EXISTS brain_jobs (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  job_key TEXT NOT NULL UNIQUE,
+  purpose TEXT NOT NULL,
+  status TEXT NOT NULL DEFAULT 'pending',
+  created_at INTEGER NOT NULL,
+  expires_at INTEGER NOT NULL,
+  next_at INTEGER NOT NULL,
+  lease_until INTEGER,
+  runs INTEGER NOT NULL DEFAULT 0,
+  payload_json TEXT NOT NULL DEFAULT '{}',
+  error TEXT,
+  report_id INTEGER,
+  resolved_at INTEGER
+);
+CREATE INDEX IF NOT EXISTS brain_jobs_due ON brain_jobs(purpose, status, next_at);
 
 /*
  * The weekly review and sentinel diagnoses. actions_json holds the structured proposals the
@@ -524,7 +568,8 @@ CREATE TABLE IF NOT EXISTS brain_reports (
   actions_json TEXT NOT NULL DEFAULT '[]',
   status       TEXT NOT NULL DEFAULT 'pending',   -- pending | approved | dismissed | failed
   resolved_at  INTEGER,
-  result_json  TEXT
+  result_json  TEXT,
+  review_json TEXT
 );
 CREATE INDEX IF NOT EXISTS brain_reports_status ON brain_reports(status, created_at DESC);
 
@@ -632,6 +677,10 @@ export class Store {
   private migrate(): void {
     const has = (table: string, column: string): boolean =>
       (this.db.prepare(`PRAGMA table_info(${table})`).all() as { name: string }[]).some(c => c.name === column);
+    for (const [col, decl] of [['call_key', 'TEXT'], ['connection', 'TEXT'], ['attempt_count', 'INTEGER'], ['error_kind', 'TEXT']]) {
+      if (!has('brain_calls', col!)) this.db.exec(`ALTER TABLE brain_calls ADD COLUMN ${col} ${decl}`);
+    }
+    if (!has('brain_reports', 'review_json')) this.db.exec('ALTER TABLE brain_reports ADD COLUMN review_json TEXT');
     if (!has('posts', 'images_json')) this.db.exec('ALTER TABLE posts ADD COLUMN images_json TEXT');
     if (!has('posts', 'account_id')) this.db.exec('ALTER TABLE posts ADD COLUMN account_id INTEGER');
     if (!has('attention_claims', 'account_id')) this.db.exec('ALTER TABLE attention_claims ADD COLUMN account_id INTEGER');

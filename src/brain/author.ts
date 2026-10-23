@@ -1,3 +1,4 @@
+import { pendingJob, enqueueJob, claimJob, finishJob, failJob } from './jobs.ts';
 import type { Store, MemoryRow } from '../db/index.ts';
 import { recallBrief, remember } from './memory.ts';
 import { BRAIN_RULES, type Brain } from './brain.ts';
@@ -66,6 +67,10 @@ export async function reflect(store: Store, brain: Brain | null, opts: { days?: 
     return { stored, notes };
   }
 
+  const queued = pendingJob(store, 'reflect') ?? enqueueJob(store, 'reflect');
+  const job = claimJob(store, queued.id);
+  if (!job) { notes.push('每日反思已排队补跑或正在执行'); return { stored, notes }; }
+
   const registered = registry(store);
   const evidence = verdicts
     .map(v => `${v.id} [${v.status}] ${v.claim}｜${v.arms.map(a => `${a.arm}=${a.median == null ? '—' : Math.round(a.median)}/${a.n}`).join(' ')}`)
@@ -105,9 +110,11 @@ export async function reflect(store: Store, brain: Brain | null, opts: { days?: 
     maxTokens: settings.brainMaxTokensDaily,
   });
   if (!r.ok) {
-    notes.push(`大脑反思失败：${r.error.slice(0, 90)}`);
+    failJob(store, job.id, r.error, Date.now(), r.retryAt);
+    notes.push(`大脑反思失败，已登记有限补跑：${r.error.slice(0, 90)}`);
     return { stored, notes };
   }
+  return store.db.transaction(() => {
   const lines = r.text
     .split('\n')
     .map(l => l.replace(/^[-·\d.、\s]+/, '').trim())
@@ -181,7 +188,9 @@ export async function reflect(store: Store, brain: Brain | null, opts: { days?: 
   }
   if (!proposalsIn && !paramsIn && !prose && !upgradesIn) notes.push('大脑这轮没有给出可用输出（按规则，"还不知道"也是合法答案）。');
   else notes.push(`大脑本轮：${proposalsIn} 条新假设、${paramsIn} 条参数改动、${upgradesIn} 条升级需求、${prose} 条备注。`);
+  finishJob(store, job.id);
   return { stored, notes };
+  })();
 }
 
 /** What the writer is handed. Kept separate from `brief` so the AI path and the template path see the same thing. */

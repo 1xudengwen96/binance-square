@@ -145,13 +145,19 @@ export function retireStaleDrafts(store: Store, now = Date.now()): number {
 
 /**
  * The whole retention pass. Cheap enough to run every tick.
+ *
+ * A material a post was written from stays past the horizon: `posts.material_id` is a foreign key,
+ * so deleting it aborts the whole statement — and with it every prune after it (events, charts,
+ * board rows) — on every tick from the day the first post's material turns `dataRetentionDays` old.
  */
 export function retire(store: Store, settings: Settings, chartsDir = 'data/charts', now = Date.now()): RetireReport {
   const horizon = now - settings.dataRetentionDays * 86_400_000;
   const report: RetireReport = {
     discarded: retireMaterials(store, now),
     staleDrafts: retireStaleDrafts(store, now),
-    deletedMaterials: store.db.prepare('DELETE FROM materials WHERE collected_at < ?').run(horizon).changes,
+    deletedMaterials: store.db
+      .prepare('DELETE FROM materials WHERE collected_at < ? AND NOT EXISTS (SELECT 1 FROM posts p WHERE p.material_id = materials.id)')
+      .run(horizon).changes,
     deletedSamples: store.pruneSamples(horizon),
     deletedEvents: store.db.prepare('DELETE FROM events WHERE at < ?').run(horizon).changes,
     deletedCharts: pruneOrphanCharts(store, chartsDir, settings, now),

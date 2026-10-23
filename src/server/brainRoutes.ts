@@ -2,9 +2,11 @@ import type { FastifyInstance } from 'fastify';
 import type { Store } from '../db/index.ts';
 import { DEFAULT_SETTINGS, type Settings } from '../config.ts';
 import { saveSettings, settingsFrom } from '../schedule.ts';
-import { DEFAULT_BASE, listModels, type LlmConfig, type ProviderKind } from '../llm/providers.ts';
+import { DEFAULT_BASE, listModels, validateBaseUrl, type LlmConfig, type ProviderKind } from '../llm/providers.ts';
+import { connectionConfig, connectionView, type BrainConnection } from '../brain/connections.ts';
+import { reliability } from '../brain/reliability.ts';
 import { getSecret, mask, secretViews, setSecret, type SecretName } from '../secrets.ts';
-import { brainFor, callsSince, type BrainTask } from '../brain/brain.ts';
+import { brainFor, type BrainTask } from '../brain/brain.ts';
 import { buildSnapshot } from '../brain/snapshot.ts';
 import { runSentinel } from '../brain/sentinel.ts';
 import { approveReport, dismissReport, runWeekly } from '../brain/weekly.ts';
@@ -12,7 +14,7 @@ import { SENTINEL_SYSTEM, WEEKLY_SYSTEM, BRAIN_RULES } from '../brain/prompts.ts
 import { effectiveTarget, evaluateBreaker, gateReport, resetBreaker, GATE_LINES, BREAKER } from '../rank/gates.ts';
 import { BUILTIN_VARIANTS, isSafeVariant, seedVariants } from '../content/columns.ts';
 import { boardComposition } from '../stats/benchmarks.ts';
-import { tally } from '../calls.ts';
+import { callStats } from '../calls.ts';
 import { UPGRADE_AREAS, listUpgrades, resolveUpgrade, upgradesMarkdown, type UpgradeStatus } from '../brain/upgrades.ts';
 
 /**
@@ -27,6 +29,8 @@ import { UPGRADE_AREAS, listUpgrades, resolveUpgrade, upgradesMarkdown, type Upg
 const BRAIN_KEYS = [
   'llmEnabled', 'llmPolish', 'llmProvider', 'llmBaseUrl', 'llmModel', 'llmMaxTokens', 'llmTemperature',
   'brainModel', 'brainDaily', 'brainSentinel', 'brainWeekly',
+  'brainSecondaryProvider', 'brainSecondaryBaseUrl', 'brainSecondaryModel', 'brainFallbackEnabled', 'brainReviewEnabled',
+  'brainAttemptCapPerDay', 'brainTokenCapPerDay',
   'brainMaxTokensDaily', 'brainMaxTokensSentinel', 'brainMaxTokensWeekly', 'brainTemperature', 'brainWakeCapPerDay',
   'breakerEnabled', 'targetMode', 'columnMode', 'columnPostsPerDay', 'activeExperiments', 'alertWebhook',
 ] as const;
@@ -50,16 +54,17 @@ export function sanitizeBrainSettings(body: Record<string, unknown>, cur: Settin
     if (!(k in body)) continue;
     const v = body[k];
     switch (k) {
-      case 'llmProvider':
+      case 'llmProvider': case 'brainSecondaryProvider':
         if (v === 'openai' || v === 'anthropic') set(k, v); else errors.push('接口类型只能是 openai 或 anthropic');
         break;
-      case 'llmBaseUrl': {
-        const u = String(v ?? '').trim().replace(/\/+$/, '');
-        if (!/^https?:\/\/[^\s]+$/i.test(u)) { errors.push('Base URL 必须是 http(s) 地址'); break; }
-        set(k, u);
+      case 'llmBaseUrl': case 'brainSecondaryBaseUrl': {
+        try { set(k, validateBaseUrl(String(v ?? ''))); }
+        catch (err) { errors.push(err instanceof Error ? err.message : 'Base URL 无效'); }
         break;
       }
-      case 'llmModel': case 'brainModel': set(k, String(v ?? '').trim().slice(0, 120)); break;
+      case 'llmModel': case 'brainModel': case 'brainSecondaryModel': set(k, String(v ?? '').trim().slice(0, 120)); break;
+      case 'brainAttemptCapPerDay': set(k, Math.round(clamp(v, 1, 200, cur.brainAttemptCapPerDay))); break;
+      case 'brainTokenCapPerDay': set(k, Math.round(clamp(v, 1000, 2000000, cur.brainTokenCapPerDay))); break;
       case 'alertWebhook': {
         const u = String(v ?? '').trim();
         if (u && !/^https:\/\/[^\s]+$/i.test(u)) { errors.push('报警 Webhook 必须是 https 地址（留空表示不推送）'); break; }
@@ -113,7 +118,7 @@ export function registerBrainRoutes(app: FastifyInstance, store: Store): void {
     const keyView = keys.find(k => k.name === (provider === 'anthropic' ? 'anthropicApiKey' : 'openaiApiKey'));
     const gates = gateReport(store);
     const day = 86_400_000;
-    const calls = store.db.prepare('SELECT id, at, purpose, provider, model, ok, ms, in_chars, out_chars, error FROM brain_calls ORDER BY id DESC LIMIT 25').all();
+    const calls = store.db.prepare('SELECT id, at, purpose, provider, model, ok, ms, in_chars, out_chars, error, call_key, connection, attempt_count, error_kind FROM brain_calls ORDER BY id DESC LIMIT 25').all();
     const tokens = store.db
       .prepare("SELECT purpose, COUNT(*) AS n, SUM(in_chars) AS inChars, SUM(out_chars) AS outChars, SUM(ok = 0) AS failed FROM brain_calls WHERE at >= ? GROUP BY purpose")
       .all(Date.now() - 7 * day);
@@ -123,17 +128,22 @@ export function registerBrainRoutes(app: FastifyInstance, store: Store): void {
       key: { provider, set: Boolean(keyView?.set), masked: keyView?.masked ?? '', fromEnv: Boolean(keyView?.fromEnv) },
       ready: Boolean(brainFor(store, s)),
       readyWhy: brainReadiness(store, s),
+      connections: { primary: connectionView(store, s, 'primary'), secondary: connectionView(store, s, 'secondary') },
+      reliability: reliability(store),
       gates,
       gateLines: GATE_LINES,
       breaker: { ...evaluateBreaker(store, s), line: BREAKER },
       target: effectiveTarget(s, gates),
       calls,
       usage7d: tokens,
-      wakesToday: callsSince(store, Date.now() - day, ['sentinel']),
+      wakesToday: (store.db.prepare(`SELECT
+        (SELECT COUNT(*) FROM brain_jobs WHERE purpose='sentinel' AND created_at>=? AND runs>0) +
+        (SELECT COUNT(*) FROM brain_calls WHERE purpose='sentinel' AND at>=? AND call_key IS NULL) AS n`)
+        .get(Date.now() - day, Date.now() - day) as { n: number }).n,
       reports: store.db.prepare('SELECT id, kind, created_at, title, status, resolved_at FROM brain_reports ORDER BY id DESC LIMIT 20').all(),
       alarms: store.db.prepare('SELECT id, at, code, detail, woke, report_id FROM brain_alarms ORDER BY id DESC LIMIT 20').all(),
       variants: store.db.prepare('SELECT id, kind, slot, text, status, origin, off_reason FROM column_variants ORDER BY kind, slot, id').all(),
-      calls_ledger: { tally: tally(store), recent: store.db.prepare('SELECT id, symbol, payer, rate_at, rate_after, outcome, status, check_at, judged_at FROM column_calls ORDER BY id DESC LIMIT 15').all() },
+      calls_ledger: { tally: callStats(store), recent: store.db.prepare('SELECT id, symbol, kind, payer, rate_at, rate_after, outcome, status, check_at, judged_at FROM column_calls ORDER BY id DESC LIMIT 15').all() },
       benchmark: { composition: boardComposition(store), byLang: store.boardCountByLang() },
       upgrades: { rows: listUpgrades(store, { limit: 40 }), areas: UPGRADE_AREAS },
       notes: store.getSetting<string>('brainNotes', ''),
@@ -147,18 +157,28 @@ export function registerBrainRoutes(app: FastifyInstance, store: Store): void {
     const cur = settingsFrom(store);
     const { next, changed, errors } = sanitizeBrainSettings(body, cur);
     if (errors.length) return reply.code(400).send({ error: errors.join('；') });
-    if (changed.length) {
-      saveSettings(store, next);
-      store.log('brain_config', { changed });
+    for (const name of ['primaryApiKey', 'secondaryApiKey']) {
+      if (name in body && (typeof body[name] !== 'string' || (body[name] as string).length > 4096)) {
+        return reply.code(400).send({ error: 'Key 必须是文本且不超过 4096 字符' });
+      }
     }
+    store.db.transaction(() => {
+      if (changed.length) saveSettings(store, next);
+      if ('primaryApiKey' in body) setSecret(store, next.llmProvider === 'anthropic' ? 'anthropicApiKey' : 'openaiApiKey', String(body.primaryApiKey));
+      if ('secondaryApiKey' in body) setSecret(store, 'brainSecondaryApiKey', String(body.secondaryApiKey));
+      if (changed.length || 'primaryApiKey' in body || 'secondaryApiKey' in body) store.log('brain_config', {
+        changed, primaryKeyChanged: 'primaryApiKey' in body, secondaryKeyChanged: 'secondaryApiKey' in body,
+      });
+    })();
     reply.send({ ok: true, changed });
   });
 
   /** Store a key without echoing it; the response carries the mask only. */
   app.post('/api/brain/key', (req, reply) => {
-    const b = (req.body ?? {}) as { provider?: ProviderKind; value?: string };
+    const b = (req.body ?? {}) as { provider?: ProviderKind; value?: string; connection?: BrainConnection };
+    if (b.connection && !['primary', 'secondary'].includes(b.connection)) return reply.code(400).send({ error: '未知的连接' });
     const provider: ProviderKind = b.provider === 'anthropic' ? 'anthropic' : 'openai';
-    const name: SecretName = provider === 'anthropic' ? 'anthropicApiKey' : 'openaiApiKey';
+    const name: SecretName = b.connection === 'secondary' ? 'brainSecondaryApiKey' : provider === 'anthropic' ? 'anthropicApiKey' : 'openaiApiKey';
     const value = String(b.value ?? '').trim();
     setSecret(store, name, value);
     store.log('brain_key', { provider, cleared: !value });
@@ -166,10 +186,14 @@ export function registerBrainRoutes(app: FastifyInstance, store: Store): void {
   });
 
   app.post('/api/brain/models', async (req, reply) => {
-    const b = (req.body ?? {}) as { provider?: ProviderKind; baseUrl?: string; apiKey?: string };
+    const b = (req.body ?? {}) as { provider?: ProviderKind; baseUrl?: string; apiKey?: string; connection?: BrainConnection };
+    if (b.connection && !['primary', 'secondary'].includes(b.connection)) return reply.code(400).send({ error: '未知的连接' });
     const s = settingsFrom(store);
     try {
-      const models = await listModels(cfgFor(s, store, { provider: b.provider, baseUrl: b.baseUrl?.trim() || undefined, apiKey: b.apiKey?.trim() || undefined }));
+      const cfg = b.connection === 'secondary' ? { ...connectionConfig(store, s, 'secondary'),
+        ...(b.provider ? { provider: b.provider } : {}), ...(b.baseUrl?.trim() ? { baseUrl: b.baseUrl.trim() } : {}), ...(b.apiKey?.trim() ? { apiKey: b.apiKey.trim() } : {}) }
+        : cfgFor(s, store, { provider: b.provider, baseUrl: b.baseUrl?.trim() || undefined, apiKey: b.apiKey?.trim() || undefined });
+      const models = await listModels(cfg);
       reply.send({ models, count: models.length });
     } catch (err) {
       reply.code(502).send({ error: err instanceof Error ? err.message : String(err) });
@@ -177,15 +201,20 @@ export function registerBrainRoutes(app: FastifyInstance, store: Store): void {
   });
 
   /** A real round trip through the brain path, so the ledger and the temperature are exercised. */
-  app.post('/api/brain/test', async (_req, reply) => {
+  app.post('/api/brain/test', async (req, reply) => {
     const s = settingsFrom(store);
-    const brain = brainFor(store, s);
+    const b = (req.body ?? {}) as { connection?: BrainConnection };
+    if (b.connection && !['primary', 'secondary'].includes(b.connection)) return reply.code(400).send({ error: '未知的连接' });
+    const slot = b.connection ?? 'primary';
+    const view = connectionView(store, s, slot);
+    if (!view.ready) return reply.code(400).send({ error: view.error });
+    const brain = brainFor(store, s, { connection: slot, allowFallback: false });
     if (!brain) return reply.code(400).send({ error: brainReadiness(store, s) ?? '大脑没有配置好' });
     const task: BrainTask = { purpose: 'test', system: '你在做连通性测试。', context: '只回复两个字：收到', maxTokens: 40 };
     const started = Date.now();
     const r = await brain.ask(task);
     if (!r.ok) return reply.code(502).send({ error: r.error });
-    reply.send({ ok: true, reply: r.text.slice(0, 80), model: brain.model, provider: brain.provider, ms: Date.now() - started });
+    reply.send({ ok: true, reply: r.text.slice(0, 80), connection: slot, model: r.model ?? brain.model, provider: r.provider ?? brain.provider, ms: Date.now() - started });
   });
 
   app.get('/api/brain/snapshot', (_req, reply) => reply.send(buildSnapshot(store, settingsFrom(store))));
@@ -263,8 +292,7 @@ export function registerBrainRoutes(app: FastifyInstance, store: Store): void {
 /** Why the brain is not usable right now, in the operator's words; null when it is. */
 export function brainReadiness(store: Store, s: Settings): string | null {
   if (!s.llmEnabled) return '连接没有启用（勾选「启用连接」）';
-  const keyName = s.llmProvider === 'anthropic' ? 'anthropicApiKey' : 'openaiApiKey';
-  if (!getSecret(store, keyName)) return '还没有保存 Key';
-  if (!(s.brainModel.trim() || s.llmModel.trim())) return '还没有选模型（点「拉取模型」）';
-  return null;
+  const primary = connectionView(store, s, 'primary');
+  if (primary.ready || (s.brainFallbackEnabled && connectionView(store, s, 'secondary').ready)) return null;
+  return primary.error;
 }

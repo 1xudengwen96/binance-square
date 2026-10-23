@@ -152,6 +152,7 @@ code { font-family: var(--font-mono); font-size: .92em; }
 
 /* ----------------------------------------------------------- app shell --- */
 .app { display: flex; min-height: 100vh; }
+.side > .nav-toggle { display: none; }
 
 .side {
   width: var(--side-w);
@@ -252,10 +253,10 @@ main { padding: 20px 26px 80px; max-width: 1480px; width: 100%; margin: 0 auto; 
   .app { flex-direction: column; }
   .side { width: auto; height: auto; position: static; flex-direction: row; align-items: center; border-right: 0; border-bottom: 1px solid var(--border); overflow-x: auto; }
   .brand { border-bottom: 0; border-right: 1px solid var(--border); flex: none; }
-  .nav { display: flex; gap: 2px; padding: 6px 8px; overflow-x: auto; }
+  .nav { display: flex; gap: 2px; min-width: 0; padding: 6px 8px; overflow-x: auto; }
   .nav-group { display: flex; gap: 2px; margin: 0; padding-right: 10px; flex: none; }
   .nav-group > i { display: none; }
-  .nav button { flex: none; white-space: nowrap; }
+  .nav button { flex: none; width: auto; white-space: nowrap; }
   .nav button.on { background: none; box-shadow: inset 0 -2px 0 var(--accent); border-radius: 0; }
   .nav button.on::before { display: none; }
   .side-foot { display: none; }
@@ -283,12 +284,14 @@ main { padding: 20px 26px 80px; max-width: 1480px; width: 100%; margin: 0 auto; 
 
 .grid { display: grid; gap: 14px; }
 /* 双列卡片按内容各自定高：一高一矮时不再把矮卡撑出一大片空洞。 */
-.g2 { grid-template-columns: repeat(auto-fit, minmax(360px, 1fr)); align-items: start; }
-.g3 { grid-template-columns: repeat(auto-fit, minmax(260px, 1fr)); }
-.gkpi { grid-template-columns: repeat(auto-fit, minmax(178px, 1fr)); }
+.g2 { grid-template-columns: repeat(auto-fit, minmax(min(100%, 360px), 1fr)); align-items: start; }
+.g3 { grid-template-columns: repeat(auto-fit, minmax(min(100%, 260px), 1fr)); }
+.gkpi { grid-template-columns: repeat(auto-fit, minmax(min(100%, 178px), 1fr)); }
+.grid > *, .stack > * { min-width: 0; }
+.grid > .card + .card { margin-top: 0; }
 .stack { display: grid; gap: 14px; }
 .spacer { flex: 1; min-width: 8px; }
-.tablewrap { overflow-x: auto; -webkit-overflow-scrolling: touch; }
+.tablewrap, .table-wrap { overflow-x: auto; -webkit-overflow-scrolling: touch; }
 
 /* 入场：卡片按 DOM 顺序轻微错峰浮现，一次页面加载只演一遍。 */
 @media (prefers-reduced-motion: no-preference) {
@@ -860,5 +863,67 @@ details.fold[open] > summary { color: var(--text); border-bottom: 1px solid var(
   .backup-summary { grid-template-columns: 1fr; }
   .backup-summary strong { font-size: 22px; }
   .backup-key { max-width: 160px; }
+}
+
+/* Phone navigation stays in document flow so opening it cannot cover the page. */
+@media (max-width: 760px) {
+  .side { flex-wrap: wrap; justify-content: space-between; overflow: visible; }
+  .brand { padding: 12px 14px; border-right: 0; }
+  .side > .nav-toggle { display: inline-flex; min-height: 44px; margin-right: 14px; }
+  .nav { display: none; flex: 0 0 100%; padding: 4px 14px 16px; overflow: visible; }
+  .nav-open .nav { display: grid; gap: 14px; }
+  .nav-group { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 4px; padding: 0; }
+  .nav-group > i { display: flex; grid-column: 1 / -1; padding: 0 2px 4px; }
+  .nav button { width: 100%; min-width: 0; min-height: 44px; gap: 7px; padding: 9px; border-radius: var(--r-sm); }
+  .nav button > span:not(.cnt) { white-space: normal; overflow-wrap: anywhere; }
+  .nav button.on { background: var(--accent-bg); box-shadow: inset 0 0 0 1px var(--accent-dim); border-radius: var(--r-sm); }
+  .nav button .cnt { flex: none; padding-inline: 5px; }
+
+  .top { position: static; gap: 10px; padding: 14px; }
+  .top-title { flex: 1 1 100%; min-width: 0; }
+  .top > .top-spacer { display: none; }
+  .top-actions { width: 100%; gap: 6px; }
+  .top-actions .btn { justify-content: center; min-height: 44px; flex: 1 1 auto; }
+  main { padding: 14px 12px 40px; }
+  .card { padding: 16px 14px; }
+  .card, .post, .tile, .alert, .top { overflow-wrap: anywhere; }
+  .card-hd { align-items: flex-start; gap: 8px; }
+  .card-hd .sub { flex-basis: 100%; }
+  .card-hd .right { margin-left: 0; min-width: 0; max-width: 100%; flex-wrap: wrap; }
+  .grid.g2, .grid.g3, .form-grid { grid-template-columns: minmax(0, 1fr); }
+  .grid.gkpi { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .tile { padding: 12px; }
+  .tile .v { font-size: 25px; }
+  .tile .lbl { letter-spacing: .3px; }
+  .first3 .q { padding: 14px; }
+  .grid, .stack { gap: 12px; }
+  .tw { margin-inline: -14px; padding-inline: 14px; }
+  .tablewrap, .table-wrap, .chartwrap { max-width: 100%; }
+  .tw table, .tablewrap table, .table-wrap table { min-width: 560px; }
+  .feed { margin-inline: -14px; }
+  .feed-row { grid-template-columns: minmax(0, 1fr) auto; gap: 4px 10px; padding: 10px 14px; }
+  .feed-x { grid-column: 1 / -1; grid-row: 2; white-space: normal; overflow-wrap: anywhere; }
+  .feed-a { white-space: normal; }
+  .feed-v { grid-column: 2; grid-row: 1; }
+  .hbar, .hbar.big { grid-template-columns: minmax(0, 1fr) auto; gap: 5px 10px; }
+  .hbar .track { grid-column: 1 / -1; grid-row: 2; }
+  .hbar .v { grid-column: 2; grid-row: 1; }
+  .acct-hd { flex-wrap: wrap; }
+  .acct-next { flex-basis: 100%; margin-left: 0; white-space: normal; }
+  .acct-nums, .mgrid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .inputline input { min-width: min(180px, 100%); }
+  input:not([type=checkbox]):not([type=radio]), select, textarea { min-width: 0; max-width: 100%; font-size: 16px; }
+  .pill, .st, .gatechip { max-width: 100%; white-space: normal; }
+  .seg { max-width: 100%; flex-wrap: wrap; }
+  .seg button { min-height: 40px; padding-inline: 11px; }
+  .post { padding: 14px 12px; }
+  details.fold > summary { padding: 14px; }
+  .fold-in { padding: 14px; }
+  .toast { left: 12px; right: 12px; bottom: max(12px, env(safe-area-inset-bottom)); max-width: none; }
+  .tip { min-width: 0; max-width: calc(100vw - 24px); overflow-wrap: anywhere; }
+}
+
+@media (max-width: 380px) {
+  .grid.gkpi, .gatechips { grid-template-columns: minmax(0, 1fr); }
 }
 

@@ -1,3 +1,4 @@
+import { hasDueJob } from './brain/jobs.ts';
 import 'dotenv/config';
 import { Store, type AccountRow } from './db/index.ts';
 import { collect, generate, generateForMatrix, publishDue, pauseState } from './pipeline.ts';
@@ -356,7 +357,7 @@ export async function tick(store: Store, opts: { live?: boolean; statsEveryTicks
     const REFLECT_EVERY_MS = 20 * 3600_000;
     const lastReflect = store.getSetting<number>('lastReflectAt', 0);
     // brainDaily switches the *model* off; the deterministic half of reflect() still runs.
-    if (Date.now() - lastReflect >= REFLECT_EVERY_MS) {
+    if (Date.now() - lastReflect >= REFLECT_EVERY_MS || (settings.brainDaily && hasDueJob(store, 'reflect'))) {
       const r = await reflect(store, settings.brainDaily ? brainFor(store, settings) : null, { target: currentTarget(store, settings) });
       store.setSetting('lastReflectAt', Date.now());
       res.reflected = r.stored.length;
@@ -394,7 +395,7 @@ export async function tick(store: Store, opts: { live?: boolean; statsEveryTicks
     const day = bj.getUTCDay();
     const inWindow = (day === 0 && bj.getUTCHours() >= 22) || day === 1 || day === 2;
     const lastTry = store.getSetting<number>('lastWeeklyTryAt', 0);
-    if (inWindow && Date.now() - lastTry >= 2 * 3600_000) {
+    if ((inWindow && Date.now() - lastTry >= 2 * 3600_000) || (settings.brainWeekly && hasDueJob(store, 'weekly'))) {
       store.setSetting('lastWeeklyTryAt', Date.now());
       const w = await runWeekly(store, settings);
       if (w.ok) res.notes.push(`周复盘已生成（#${w.reportId}），等你在 AI 大脑页审阅`);

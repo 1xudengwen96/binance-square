@@ -15,6 +15,7 @@
 let BRAIN = null;
 let BRAIN_DRAFT = {};
 let BRAIN_MODELS = [];
+let BRAIN_SECONDARY_MODELS = [];
 let BRAIN_OPEN_REPORT = null;
 
 const BRAIN_PRESETS = [
@@ -42,7 +43,7 @@ function brainPill(ok, yes, no) {
 
 function brainDirty() {
   if (!BRAIN) return [];
-  return Object.keys(BRAIN_DRAFT).filter(k => k !== '__key' && JSON.stringify(BRAIN_DRAFT[k]) !== JSON.stringify(BRAIN.settings[k]));
+  return Object.keys(BRAIN_DRAFT).filter(k => !k.startsWith('__') && JSON.stringify(BRAIN_DRAFT[k]) !== JSON.stringify(BRAIN.settings[k]));
 }
 
 function brainCaptureForm() {
@@ -56,6 +57,16 @@ function brainCaptureForm() {
   read('bn-base', 'llmBaseUrl', 'text');
   read('bn-model', 'llmModel', 'text');
   read('bn-brainmodel', 'brainModel', 'text');
+  read('bs-provider', 'brainSecondaryProvider', 'text');
+  read('bs-base', 'brainSecondaryBaseUrl', 'text');
+  read('bs-model', 'brainSecondaryModel', 'text');
+  read('bs-fallback', 'brainFallbackEnabled', 'bool');
+  read('bs-review', 'brainReviewEnabled', 'bool');
+  read('bs-attemptcap', 'brainAttemptCapPerDay', 'num');
+  read('bs-tokencap', 'brainTokenCapPerDay', 'num');
+  const secondaryKey = document.getElementById('bs-key');
+  if (secondaryKey && secondaryKey.value.trim()) BRAIN_DRAFT.__secondaryKey = secondaryKey.value;
+  else if (secondaryKey) delete BRAIN_DRAFT.__secondaryKey;
   read('bn-enabled', 'llmEnabled', 'bool');
   read('bn-polish', 'llmPolish', 'bool');
   read('bn-polishtemp', 'llmTemperature', 'num');
@@ -87,7 +98,7 @@ function brainGateCards(d) {
     ${gateRow('关卡 A · 被分发', g.A.passed, `${g.A.streakDays}<small>/ ${g.A.daysNeeded} 天</small>`,
       `每天 ≥ ${L.minPostsPerDay} 条满 24 小时的帖子，浏览中位数 ≥ ${L.viewsMedian}。近 7 天中位数 ${fmtN(g.A.median7d == null ? null : Math.round(g.A.median7d))}`)}
     ${gateRow('关卡 B · 有人回应', g.B.passed, g.B.commentsPer1k == null ? '—' : `${g.B.commentsPer1k}<small>/ ${g.B.line}</small>`,
-      `近 ${g.B.windowDays} 天合并评论率（每千次浏览）。${g.B.comments} 条评论 / ${g.B.views} 次浏览`)}
+      `近 ${g.B.windowDays} 天满 24 小时的 ${fmtN(g.B.posts)} 条帖子（与 A 同一批）合并评论率。${g.B.comments} 条评论 / ${g.B.views} 次 24h 浏览${g.B.immature ? `；另有 ${g.B.immature} 条没有 24h 读数（未满 24 小时或错过回抓），不计入` : ''}`)}
     ${gateRow('关卡 C · 二次分发', g.C.passed, `${g.C.secondRound}<small>/ ${g.C.needed} 条</small>`,
       `发帖 3 小时后浏览仍翻倍的帖子。粉丝数读不到，用它代替`)}
     <div class="tile"><div class="lbl">现在按什么判定实验</div><div class="v" style="font-size:19px">${esc({ views: '浏览量', engagement: '互动质量', money: '返佣' }[d.target] || d.target)}</div>
@@ -114,7 +125,7 @@ function brainBreakerCard(d) {
     </div>
     <div class="row" style="margin-top:8px">
       <label class="kv" for="bn-webhook"><span>报警 Webhook</span></label>
-      <input id="bn-webhook" type="url" placeholder="https://…（飞书/钉钉/Slack 机器人，留空只在本页显示）" value="${esc(bdv('alertWebhook', d.settings.alertWebhook || ''))}" style="flex:1;min-width:260px">
+      <input id="bn-webhook" type="url" placeholder="https://…（飞书/钉钉/Slack 机器人，留空只在本页显示）" value="${esc(bdv('alertWebhook', d.settings.alertWebhook || ''))}" style="flex:1;min-width:min(260px,100%)">
     </div>
     <div class="row" style="margin-top:8px">
       ${b.tripped ? '<button class="btn primary" onclick="brainResetBreaker()">我看过了，恢复自动发布</button>' : ''}
@@ -123,13 +134,13 @@ function brainBreakerCard(d) {
 }
 function brainConnectionCard(d) {
   const s = d.settings;
-  const provider = s.llmProvider;
+  const provider = bdv('llmProvider', s.llmProvider);
   const dirty = brainDirty();
   const keyPending = BRAIN_DRAFT.__key || '';
   const modelVal = bdv('llmModel', s.llmModel || '');
   return `<div class="card" style="margin-bottom:14px">
-    <div class="card-hd"><h3>连接</h3>
-      <span class="sub">大脑、润色、长文润色共用这一个连接；大脑可以单独换一个更强的模型。</span>
+    <div class="card-hd"><h3>主模型</h3>
+      <span class="sub">日常反思、哨兵与周报优先使用这套连接；帖子润色与长文润色也使用它。第二模型在下方独立配置。</span>
       <span class="right">${d.ready ? '<span class="pill on">大脑可用</span>' : `<span class="pill warn">${esc(d.readyWhy || '未就绪')}</span>`}</span></div>
 
     <div class="field"><span class="cap">接口类型</span>
@@ -142,8 +153,8 @@ function brainConnectionCard(d) {
     <div class="field"><span class="cap">常用地址（点击填入）</span>
       <div class="kv">${BRAIN_PRESETS.map((g, i) => `<button class="btn" onclick="brainPreset(${i})">${esc(g.label)}</button>`).join('')}</div></div>
 
-    <div class="field"><span class="cap">Base URL（填到 /v1 为止）</span>
-      <input type="text" id="bn-base" value="${esc(bdv('llmBaseUrl', s.llmBaseUrl || ''))}" placeholder="https://api.anthropic.com/v1" autocomplete="off"></div>
+    <div class="field"><span class="cap">Base URL（API 根地址，例如 /v1）</span>
+      <input type="text" id="bn-base" value="${esc(bdv('llmBaseUrl', s.llmBaseUrl || ''))}" placeholder="https://api.anthropic.com/v1" autocomplete="off"><div class="hint">${esc(d.connections.primary.endpoint || d.connections.primary.error || '地址无效')}（已保存的请求路径）</div></div>
 
     <div class="field"><span class="cap">${provider === 'anthropic' ? 'Anthropic' : 'OpenAI / 兼容'} Key</span>
       <div class="inputline">
@@ -160,13 +171,13 @@ function brainConnectionCard(d) {
         <input type="text" id="bn-model" value="${esc(modelVal)}" placeholder="点「拉取模型」，或直接输入模型名" autocomplete="off">
         <button class="btn" onclick="brainFetchModels()">拉取模型</button>
       </div>
-      ${BRAIN_MODELS.length ? `<div class="modelgrid">${BRAIN_MODELS.map(m => `<label><input type="radio" name="bmdl" value="${esc(m.id)}" ${modelVal === m.id ? 'checked' : ''} onchange="brainPick('llmModel','${esc(m.id)}')">${esc(m.id)}</label>`).join('')}</div><div class="hint">共 ${BRAIN_MODELS.length} 个，点选即填入。</div>` : ''}</div>
+      ${BRAIN_MODELS.length ? `<div class="modelgrid"><select aria-label="选择主模型" onchange="brainPick('llmModel',this.value)">${BRAIN_MODELS.map(m => `<option value="${esc(m.id)}" ${modelVal === m.id ? 'selected' : ''}>${esc(m.id)}</option>`).join('')}</select></div><div class="hint">共 ${BRAIN_MODELS.length} 个，点选即填入。</div>` : ''}</div>
 
     <div class="field"><span class="cap">大脑用的模型（留空 = 同上）</span>
       <div class="inputline"><input type="text" id="bn-brainmodel" value="${esc(bdv('brainModel', s.brainModel || ''))}" placeholder="判断类任务建议用更强的模型" autocomplete="off">
         ${BRAIN_MODELS.length ? '<span class="hint" style="margin:0">在上面的列表里点选后会填进「模型」；这一栏手填。</span>' : ''}</div></div>
 
-    <div class="grid" style="grid-template-columns:repeat(auto-fit,minmax(150px,1fr))">
+    <div class="grid" style="grid-template-columns:repeat(auto-fit,minmax(min(100%,150px),1fr))">
       <div class="field"><span class="cap">润色最大输出 token</span><input type="number" id="bn-polishtok" value="${bnum(bdv('llmMaxTokens', s.llmMaxTokens))}"></div>
       <div class="field"><span class="cap">润色温度（0–2）</span><input type="number" step="0.1" min="0" max="2" id="bn-polishtemp" value="${bnum(bdv('llmTemperature', s.llmTemperature))}"></div>
     </div>
@@ -185,6 +196,54 @@ function brainConnectionCard(d) {
   </div>`;
 }
 
+function brainSecondaryCard(d) {
+  const s = d.settings, c = d.connections.secondary;
+  const provider = bdv('brainSecondaryProvider', s.brainSecondaryProvider);
+  const model = bdv('brainSecondaryModel', s.brainSecondaryModel);
+  return `<div class="card" style="margin-bottom:14px">
+    <div class="card-hd"><h3>第二模型 · 备用与独立审查</h3><span class="sub">地址、协议、Key、模型名都与主模型分开。可配置 OpenAI、Claude 或兼容网关。</span>
+      <span class="right">${brainPill(c.ready, '已配置', c.error || '未配置')}</span></div>
+    <div class="field"><span class="cap">接口协议</span><select id="bs-provider" onchange="brainSecondarySwitch(this.value)">
+      <option value="openai" ${provider === 'openai' ? 'selected' : ''}>OpenAI / 兼容接口</option>
+      <option value="anthropic" ${provider === 'anthropic' ? 'selected' : ''}>Anthropic / Claude</option></select></div>
+    <div class="field"><span class="cap">常用地址（只填入，不自动保存）</span><div class="kv">${BRAIN_PRESETS.map((p, i) => `<button class="btn" onclick="brainSecondaryPreset(${i})">${esc(p.label)}</button>`).join('')}</div></div>
+    <div class="field"><span class="cap">Base URL（API 根地址，例如 /v1）</span>
+      <input id="bs-base" value="${esc(bdv('brainSecondaryBaseUrl', s.brainSecondaryBaseUrl))}" autocomplete="off">
+      <div class="hint">${esc(c.endpoint || c.error || '地址无效')}（已保存的请求路径）</div></div>
+    <div class="field"><span class="cap">第二模型专用 Key</span><div class="inputline">
+      <input type="password" id="bs-key" value="${esc(BRAIN_DRAFT.__secondaryKey || '')}" autocomplete="off" placeholder="${c.key.set ? '已保存 ' + esc(c.key.masked) + ' · 留空不改动' : '粘贴独立 Key'}">
+      ${c.key.set && !c.key.fromEnv ? '<button class="btn danger" onclick="brainClearSecondaryKey()">清除第二模型 Key</button>' : ''}</div>
+      <div class="hint">独立保存，接口不回传明文；清除此 Key 不影响主模型。</div></div>
+    <div class="field"><span class="cap">模型名</span><div class="inputline">
+      <input id="bs-model" value="${esc(model)}" autocomplete="off" placeholder="直接填写模型名，或拉取后选择">
+      <button class="btn" onclick="brainSecondaryModels()">拉取第二模型列表</button></div>
+      ${BRAIN_SECONDARY_MODELS.length ? `<select aria-label="选择第二模型" onchange="brainPickSecondary(this.value)"><option value="">选择模型…</option>${BRAIN_SECONDARY_MODELS.map(m => `<option value="${esc(m.id)}" ${model === m.id ? 'selected' : ''}>${esc(m.name || m.id)}</option>`).join('')}</select>` : ''}</div>
+    <div class="kv"><label class="kv"><input type="checkbox" id="bs-fallback" style="width:auto" ${bdv('brainFallbackEnabled', s.brainFallbackEnabled) ? 'checked' : ''}>主模型失败时使用第二模型</label></div>
+    <div class="kv" style="margin-top:8px"><label class="kv"><input type="checkbox" id="bs-review" style="width:auto" ${bdv('brainReviewEnabled', s.brainReviewEnabled) ? 'checked' : ''}>周复盘启用第二模型独立审查</label></div>
+    <div class="hint">审查只做一轮：核对证据与口径。出现分歧、引用不符或审查失败时保留报告，建议动作暂停；两模型同意也仍需人工批准。若两个模型共用同一中转，中转故障可能同时影响它们。</div>
+    <div class="grid" style="grid-template-columns:repeat(auto-fit,minmax(min(100%,200px),1fr));margin-top:12px">
+      <div class="field"><span class="cap">每天最多请求尝试（含重试／审查）</span><input id="bs-attemptcap" type="number" min="1" max="200" value="${bnum(bdv('brainAttemptCapPerDay', s.brainAttemptCapPerDay))}"></div>
+      <div class="field"><span class="cap">每天 token 预算</span><input id="bs-tokencap" type="number" min="1000" max="2000000" value="${bnum(bdv('brainTokenCapPerDay', s.brainTokenCapPerDay))}"></div></div>
+    <div class="hint">单个任务主模型最多尝试 2 次，再给备用 1 次；同一任务最多补跑 2 轮。缺少实际 token 用量时按输入字节和最大输出来保守预留；费用以通道账单为准。</div>
+    <div class="kv" style="margin-top:10px"><button class="btn primary" onclick="brainSave()">保存全部修改</button><button class="btn" onclick="brainTestSecondary()">单独测试第二模型</button></div>
+    <div class="result" id="bs-result"></div>
+  </div>`;
+}
+
+function brainReliabilityCard(d) {
+  const r = d.reliability, budget = r.budget;
+  const windows = r.windows.map(w => `<tr><td>近 ${w.days === 1 ? '24 小时' : '7 天'}</td><td>${w.total}</td><td>${w.firstSuccess}</td><td>${w.retrySuccess}</td><td>${w.fallbackSuccess}</td><td>${w.failed}</td><td>${w.legacy}</td></tr>`).join('');
+  const states = { pending: '等待补跑', running: '执行中', done: '完成', failed: '已达补跑上限', expired: '已过期' };
+  const jobs = r.jobs.map(j => `<tr><td>${esc(PURPOSE_CN[j.purpose] || j.purpose)}</td><td>${esc(states[j.status] || j.status)}</td><td>${j.runs}/3</td><td>${j.status === 'pending' ? esc(fmtTs(j.next_at)) : '—'}</td><td>${esc(j.error || '')}</td></tr>`).join('');
+  const attempts = r.attempts.map(a => `<tr><td>${esc(fmtTs(a.at))}</td><td>${esc(PURPOSE_CN[a.purpose] || a.purpose)}</td><td>${a.connection === 'secondary' ? '第二模型' : '主模型'}<br>${esc(a.model)}</td><td>${a.ok ? '成功' : esc(a.error_kind === 'in_progress' ? '进行中／结果未记录' : a.error_kind || '失败')}</td><td>${a.ms} ms</td><td>${a.input_tokens == null || a.output_tokens == null ? '未提供（按预留计预算）' : `${a.input_tokens} / ${a.output_tokens}`}</td><td>${esc(a.error || '')}${a.endpoint ? `<details><summary>接口诊断</summary>${esc(a.endpoint)}<br>HTTP ${esc(a.status ?? '—')} · ${esc(a.content_type || '未知类型')}<br>Request ID: ${esc(a.request_id || '未提供')}</details>` : ''}</td></tr>`).join('');
+  return `<div class="card" style="margin-bottom:14px"><div class="card-hd"><h3>调用恢复与补跑</h3><span class="sub">业务任务统计不含手工测试和独立审查；每次 HTTP 尝试单独登记。历史失败保留。</span></div>
+    <div class="tablewrap"><table><thead><tr><th>窗口</th><th>任务调用</th><th>首试成功</th><th>重试成功</th><th>备用成功</th><th>最终失败</th><th>旧版无尝试明细</th></tr></thead><tbody>${windows}</tbody></table></div>
+    <div class="hint">旧记录仍计入总数与最终失败，但无法还原是否重试。最近 24 小时已用 ${budget.attempts}/${d.settings.brainAttemptCapPerDay} 次尝试，token 预算已用 ${fmtN(budget.tokens)}/${fmtN(d.settings.brainTokenCapPerDay)}${budget.estimated ? `（${budget.estimated} 次含保守预留）` : ''}；接口费用未提供时显示未知，不用字符数冒充费用。</div>
+    ${jobs ? `<details style="margin-top:10px"><summary>最近任务与补跑状态</summary><div class="tablewrap"><table><thead><tr><th>任务</th><th>状态</th><th>轮次</th><th>下次补跑</th><th>原因</th></tr></thead><tbody>${jobs}</tbody></table></div></details>` : ''}
+    ${attempts ? `<details style="margin-top:10px"><summary>最近请求尝试与错误原因</summary><div class="tablewrap"><table><thead><tr><th>时间</th><th>任务</th><th>连接 / 模型</th><th>结果</th><th>耗时</th><th>输入 / 输出 token</th><th>错误与诊断</th></tr></thead><tbody>${attempts}</tbody></table></div></details>` : '<div class="hint">新版本尚无请求尝试记录。</div>'}
+  </div>`;
+}
+
 function brainJobsCard(d) {
   const s = d.settings;
   const rows = BRAIN_JOBS.map(([on, tok, name, what]) => `<tr>
@@ -195,7 +254,7 @@ function brainJobsCard(d) {
   return `<div class="card" style="margin-bottom:14px">
     <div class="card-hd"><h3>任务</h3><span class="sub">关掉一项只是不叫模型；确定性的那一半（归纳、哨兵警报、熔断）照常跑。</span></div>
     <div class="tablewrap"><table><thead><tr><th>任务</th><th class="num">开关</th><th class="num">最大输出 token</th></tr></thead><tbody>${rows}</tbody></table></div>
-    <div class="grid" style="grid-template-columns:repeat(auto-fit,minmax(170px,1fr));margin-top:12px">
+    <div class="grid" style="grid-template-columns:repeat(auto-fit,minmax(min(100%,170px),1fr));margin-top:12px">
       <div class="field"><span class="cap">大脑温度（0–1）</span><input type="number" step="0.05" min="0" max="1" id="bn-temp" value="${bnum(bdv('brainTemperature', s.brainTemperature))}"></div>
       <div class="field"><span class="cap">哨兵每天最多唤醒几次</span><input type="number" min="0" max="10" id="bn-wake" value="${bnum(bdv('brainWakeCapPerDay', s.brainWakeCapPerDay))}"></div>
     </div>
@@ -225,7 +284,7 @@ function brainColumnCard(d) {
     <div class="hint">正在分配流量的实验：${d.settings.activeExperiments ? d.settings.activeExperiments.map(x => `<code>${esc(x)}</code>`).join(' ') : '全部已登记的'}。其余只做观察，不占样本。</div>
   </div>`;
 }
-const PURPOSE_CN = { reflect: '每日反思', sentinel: '哨兵', weekly: '周复盘', test: '测试' };
+const PURPOSE_CN = { reflect: '每日反思', sentinel: '哨兵', weekly: '周复盘', review: '独立审查', test: '测试' };
 const UPG_STATUS = { open: ['gold', '待处理'], doing: ['info', '处理中'], done: ['on', '已完成'], wontfix: ['plain', '不做'] };
 const UPG_SOURCE = { weekly: '周复盘', sentinel: '哨兵', reflect: '每日反思', operator: '手动' };
 
@@ -341,16 +400,23 @@ function brainVariantsCard(d) {
 
 function brainCallsCard(d) {
   const t = d.calls_ledger.tally;
+  const ruleName = kind => ({ funding_persists: '旧口径：费率至少保留一半', payer_persists: '新口径：同一边仍在付费' })[kind] || kind;
+  const cohorts = Object.entries(t.byKind).map(([kind, c]) => `<tr><td>${esc(ruleName(kind))}${kind === t.currentKind ? '（当前）' : ''}</td>
+    <td class="num">${c.total}</td><td class="num">${c.held}</td><td class="num">${c.heldRate == null ? '—' : (c.heldRate * 100).toFixed(1) + '%'}</td>
+    <td class="num">${c.faded}</td><td class="num">${c.flipped}</td><td class="num">${c.open}</td><td class="num">${c.void}</td>
+    <td>${c.firstRegisteredAt == null ? '暂无登记' : `${esc(fmtTs(c.firstRegisteredAt))} ～ ${esc(fmtTs(c.lastRegisteredAt))}`}</td></tr>`).join('');
   const recent = d.calls_ledger.recent.map(c => `<tr><td>$${esc(c.symbol)}</td><td>${esc(c.payer)}付</td><td class="num">${(c.rate_at * 100).toFixed(3)}%</td>
     <td class="num">${c.rate_after == null ? '—' : (c.rate_after * 100).toFixed(3) + '%'}</td>
-    <td>${c.outcome ? `<span class="pill ${c.outcome === 'held' ? 'on' : 'warn'}">${{ held: '成立', faded: '减弱', flipped: '反转', void: '作废', late: '作废' }[c.outcome] || esc(c.outcome)}</span>` : '<span class="pill plain">待裁决</span>'}</td></tr>`).join('');
+    <td>${c.outcome ? `<span class="pill ${c.outcome === 'held' ? 'on' : 'warn'}">${{ held: '成立', faded: '减弱', flipped: '反转', void: '作废', late: '作废' }[c.outcome] || esc(c.outcome)}</span>` : '<span class="pill plain">待裁决</span>'}</td><td>${esc(ruleName(c.kind))}</td></tr>`).join('');
   const use = d.usage7d.map(u => `<span class="pill plain">${esc(PURPOSE_CN[u.purpose] || u.purpose)} ${u.n} 次${u.failed ? `（失败 ${u.failed}）` : ''}</span>`).join(' ');
   const calls = d.calls.map(c => `<tr><td>${esc(fmtTs(c.at))}</td><td>${esc(PURPOSE_CN[c.purpose] || c.purpose)}</td><td>${esc(c.model)}</td>
-    <td class="num">${c.ms} ms</td><td class="num">${c.in_chars} / ${c.out_chars}</td><td>${c.ok ? '<span class="pill on">成功</span>' : `<span class="pill bad" title="${esc(c.error || '')}">失败</span>`}</td></tr>`).join('');
+    <td class="num">${c.ms} ms</td><td class="num">${c.in_chars} / ${c.out_chars}</td><td>${c.ok ? `<span class="pill on">${c.connection === 'secondary' && c.purpose !== 'review' && c.purpose !== 'test' ? '备用成功' : c.attempt_count > 1 ? '重试成功' : '成功'}</span>` : `<span class="pill bad" title="${esc(c.error || '')}">失败</span>`}</td></tr>`).join('');
   return `<div class="card" style="margin-bottom:14px">
     <div class="card-hd"><h3>判断记录与调用记录</h3><span class="sub">栏目帖子发出时登记一条可检验的判断，隔天由代码核对，「昨日对账」栏目用这些记录。</span></div>
-    <div class="kv" style="margin:6px 0"><span class="pill info">已裁决 ${t.total}</span><span class="pill on">成立 ${t.held}</span><span class="pill warn">减弱 ${t.faded}</span><span class="pill warn">反转 ${t.flipped}</span><span class="pill plain">待裁决 ${t.open}</span></div>
-    ${recent ? `<div class="tablewrap"><table><thead><tr><th>币</th><th>当时</th><th class="num">当时费率</th><th class="num">隔天费率</th><th>结果</th></tr></thead><tbody>${recent}</tbody></table></div>` : ''}
+    <div class="kv" style="margin:6px 0"><span class="pill info">历史合计（混合口径）已裁决 ${t.total}</span><span class="pill on">成立 ${t.held}</span><span class="pill warn">减弱 ${t.faded}</span><span class="pill warn">反转 ${t.flipped}</span><span class="pill plain">待裁决 ${t.open}</span></div>
+    <div class="tablewrap"><table><thead><tr><th>成立口径</th><th>已裁决</th><th>成立</th><th>成立率</th><th>减弱</th><th>反转</th><th>待裁决</th><th>作废</th><th>登记时间范围</th></tr></thead><tbody>${cohorts}</tbody></table></div>
+    <div class="hint">成立率只计算该口径的已裁决记录；待裁决和作废不进分母，没有裁决时显示 —。旧结果按原口径保留；低成立率告警只评估当前口径，至少 5 条裁决才判断。</div>
+    ${recent ? `<div class="tablewrap"><table><thead><tr><th>币</th><th>当时</th><th class="num">当时费率</th><th class="num">隔天费率</th><th>结果</th><th>口径</th></tr></thead><tbody>${recent}</tbody></table></div>` : ''}
     <div class="hint" style="margin-top:12px"><b>近 7 天的模型调用：</b> ${use || '没有'}</div>
     ${calls ? `<div class="tablewrap"><table><thead><tr><th>时间</th><th>任务</th><th>模型</th><th class="num">耗时</th><th class="num">输入 / 输出（字）</th><th></th></tr></thead><tbody>${calls}</tbody></table></div>` : ''}
   </div>`;
@@ -371,14 +437,18 @@ function brainBenchmarkCard(d) {
   </div>`;
 }
 
+let BRAIN_SKIP_CAPTURE = false;
 async function brainView() {
-  brainCaptureForm();
+  if (!BRAIN_SKIP_CAPTURE) brainCaptureForm();
+  BRAIN_SKIP_CAPTURE = false;
   BRAIN = await api('/api/brain');
   const d = BRAIN;
   return `
     ${brainGateCards(d)}
     ${brainUpgradesCard(d)}
     ${brainConnectionCard(d)}
+    ${brainSecondaryCard(d)}
+    ${brainReliabilityCard(d)}
     ${brainJobsCard(d)}
     ${brainColumnCard(d)}
     ${brainBreakerCard(d)}
@@ -410,29 +480,36 @@ function brainPayload() {
   return out;
 }
 
-async function brainSave() {
+async function brainSave(quiet = false) {
   try {
-    if (BRAIN_DRAFT.__key) await brainSaveKey(true);
-    const r = await api('/api/brain/config', bjson(brainPayload()));
+    const body = brainPayload();
+    if (BRAIN_DRAFT.__key) body.primaryApiKey = BRAIN_DRAFT.__key;
+    if (BRAIN_DRAFT.__secondaryKey) body.secondaryApiKey = BRAIN_DRAFT.__secondaryKey;
+    const r = await api('/api/brain/config', bjson(body));
     BRAIN_DRAFT = {};
-    toast(r.changed.length ? `已保存（${r.changed.length} 项）` : '没有改动');
+    for (const id of ['bn-key', 'bs-key']) { const el = document.getElementById(id); if (el) el.value = ''; }
+    if (!quiet) toast(`配置已保存（${r.changed.length} 项，密钥独立保存）`);
     await render();
-  } catch (e) { brainResult('bn-result', 'bad', '保存失败：' + esc(e.message)); toast(e.message, true); }
+    return true;
+  } catch (e) {
+    brainResult('bn-result', 'bad', '保存失败：' + esc(e.message));
+    brainResult('bs-result', 'bad', '保存失败：' + esc(e.message));
+    toast(e.message, true);
+    return false;
+  }
 }
 
 async function brainSaveKey(quiet) {
-  const el = document.getElementById('bn-key');
-  const value = (el && el.value.trim()) || BRAIN_DRAFT.__key || '';
-  if (!value) return toast('输入框是空的', true);
-  await api('/api/brain/key', bjson({ provider: BRAIN.settings.llmProvider, value }));
-  delete BRAIN_DRAFT.__key;
-  if (el) el.value = '';
-  if (!quiet) { toast('Key 已保存'); await render(); }
+  brainCaptureForm();
+  if (!BRAIN_DRAFT.__key) { toast('输入框是空的', true); return false; }
+  return brainSave(Boolean(quiet));
 }
 
 async function brainClearKey() {
   if (!confirm('清除本机保存的这个 Key？')) return;
   await api('/api/brain/key', bjson({ provider: BRAIN.settings.llmProvider, value: '' }));
+  delete BRAIN_DRAFT.__key;
+  const el = document.getElementById('bn-key'); if (el) el.value = '';
   toast('已清除'); await render();
 }
 
@@ -444,6 +521,7 @@ function brainPick(key, id) {
 
 function brainDiscard() {
   BRAIN_DRAFT = {};
+  BRAIN_SKIP_CAPTURE = true;
   render();
 }
 
@@ -452,24 +530,21 @@ async function brainSwitch(p) {
   const cur = bdv('llmBaseUrl', BRAIN.settings.llmBaseUrl || '');
   const stock = BRAIN_PRESETS.some(g => g.provider !== p && g.url === cur);
   const url = stock || !cur.trim() ? (BRAIN_PRESETS.find(g => g.provider === p)?.url || cur) : cur;
+  BRAIN_DRAFT.llmProvider = p;
   BRAIN_DRAFT.llmBaseUrl = url;
-  try {
-    await api('/api/brain/config', bjson({ llmProvider: p, llmBaseUrl: url }));
-    BRAIN_MODELS = [];
-    delete BRAIN_DRAFT.llmBaseUrl;
-    await render();
-  } catch (e) { toast('切换失败：' + e.message, true); }
+  const el = document.getElementById('bn-base'); if (el) el.value = url;
+  BRAIN_MODELS = [];
+  await render();
 }
 
 async function brainPreset(i) {
   const g = BRAIN_PRESETS[i];
   brainCaptureForm();
-  try {
-    await api('/api/brain/config', bjson({ llmProvider: g.provider, llmBaseUrl: g.url }));
-    delete BRAIN_DRAFT.llmBaseUrl;
-    BRAIN_MODELS = [];
-    await render();
-  } catch (e) { toast(e.message, true); }
+  BRAIN_DRAFT.llmProvider = g.provider;
+  BRAIN_DRAFT.llmBaseUrl = g.url;
+  const el = document.getElementById('bn-base'); if (el) el.value = g.url;
+  BRAIN_MODELS = [];
+  await render();
 }
 
 async function brainFetchModels() {
@@ -477,7 +552,7 @@ async function brainFetchModels() {
   brainResult('bn-result', 'busy', '正在拉取模型列表…');
   try {
     const typed = document.getElementById('bn-key');
-    const r = await api('/api/brain/models', bjson({ provider: BRAIN.settings.llmProvider, baseUrl: bdv('llmBaseUrl', BRAIN.settings.llmBaseUrl), apiKey: typed ? typed.value.trim() : '' }));
+    const r = await api('/api/brain/models', bjson({ provider: bdv('llmProvider', BRAIN.settings.llmProvider), baseUrl: bdv('llmBaseUrl', BRAIN.settings.llmBaseUrl), apiKey: typed ? typed.value.trim() : '' }));
     BRAIN_MODELS = r.models;
     await render();
     brainResult('bn-result', r.count ? 'good' : 'bad', r.count ? `✓ 拉到 ${r.count} 个模型，在上方列表里点选` : '该接口返回了 0 个模型，可直接手填模型名');
@@ -487,8 +562,9 @@ async function brainFetchModels() {
 async function brainTest() {
   brainResult('bn-result', 'busy', '正在请求一次对话…');
   try {
-    if (brainDirty().length || BRAIN_DRAFT.__key) await brainSave();
-    const r = await api('/api/brain/test', bjson({}));
+    brainCaptureForm();
+    if (brainDirty().length || BRAIN_DRAFT.__key || BRAIN_DRAFT.__secondaryKey) { if (!await brainSave(true)) return; }
+    const r = await api('/api/brain/test', bjson({ connection: 'primary' }));
     brainResult('bn-result', 'good', `✓ ${esc(r.provider)} / ${esc(r.model)} 回复「${esc(r.reply)}」（${r.ms} ms）`);
     toast('大脑连通');
     const list = await api('/api/brain'); BRAIN = list;
@@ -593,6 +669,65 @@ async function brainCopyUpgrades() {
   } catch (e) { toast(e.message, true); }
 }
 
+function brainSecondarySwitch(provider) {
+  brainCaptureForm();
+  const current = bdv('brainSecondaryBaseUrl', BRAIN.settings.brainSecondaryBaseUrl);
+  const stock = BRAIN_PRESETS.some(p => p.url === current && p.provider !== provider);
+  const url = stock ? BRAIN_PRESETS.find(p => p.provider === provider).url : current;
+  BRAIN_DRAFT.brainSecondaryProvider = provider;
+  BRAIN_DRAFT.brainSecondaryBaseUrl = url;
+  document.getElementById('bs-base').value = url;
+  BRAIN_SECONDARY_MODELS = [];
+  render();
+}
+function brainSecondaryPreset(index) {
+  brainCaptureForm();
+  const preset = BRAIN_PRESETS[index];
+  BRAIN_DRAFT.brainSecondaryProvider = preset.provider;
+  BRAIN_DRAFT.brainSecondaryBaseUrl = preset.url;
+  document.getElementById('bs-provider').value = preset.provider;
+  document.getElementById('bs-base').value = preset.url;
+  BRAIN_SECONDARY_MODELS = [];
+  render();
+}
+function brainPickSecondary(model) {
+  BRAIN_DRAFT.brainSecondaryModel = model;
+  document.getElementById('bs-model').value = model;
+}
+async function brainSecondaryModels() {
+  brainCaptureForm();
+  brainResult('bs-result', 'busy', '正在拉取第二模型列表…');
+  try {
+    const result = await api('/api/brain/models', bjson({ connection: 'secondary',
+      provider: bdv('brainSecondaryProvider', BRAIN.settings.brainSecondaryProvider),
+      baseUrl: bdv('brainSecondaryBaseUrl', BRAIN.settings.brainSecondaryBaseUrl), apiKey: BRAIN_DRAFT.__secondaryKey || '' }));
+    BRAIN_SECONDARY_MODELS = result.models;
+    await render();
+    brainResult('bs-result', result.count ? 'good' : 'bad', `返回 ${result.count} 个模型，可选择或手填模型名`);
+  } catch (e) { brainResult('bs-result', 'bad', '拉取失败：' + esc(e.message)); }
+}
+async function brainTestSecondary() {
+  brainCaptureForm();
+  if (brainDirty().length || BRAIN_DRAFT.__key || BRAIN_DRAFT.__secondaryKey) { if (!await brainSave(true)) return; }
+  brainResult('bs-result', 'busy', '正在单独请求第二模型…');
+  try {
+    const result = await api('/api/brain/test', bjson({ connection: 'secondary' }));
+    brainResult('bs-result', 'good', `✓ ${esc(result.provider)} / ${esc(result.model)} 回复「${esc(result.reply)}」（${result.ms} ms）`);
+  } catch (e) { brainResult('bs-result', 'bad', '测试失败：' + esc(e.message)); }
+}
+async function brainClearSecondaryKey() {
+  if (!confirm('清除第二模型的 Key？主模型不受影响。')) return;
+  await api('/api/brain/key', bjson({ connection: 'secondary', value: '' }));
+  delete BRAIN_DRAFT.__secondaryKey;
+  const el = document.getElementById('bs-key'); if (el) el.value = '';
+  await render();
+}
+window.brainSecondarySwitch = brainSecondarySwitch;
+window.brainSecondaryPreset = brainSecondaryPreset;
+window.brainPickSecondary = brainPickSecondary;
+window.brainSecondaryModels = brainSecondaryModels;
+window.brainTestSecondary = brainTestSecondary;
+window.brainClearSecondaryKey = brainClearSecondaryKey;
 window.brainView = brainView;
 window.brainUpgrade = brainUpgrade;
 window.brainCopyUpgrades = brainCopyUpgrades;
