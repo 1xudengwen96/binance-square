@@ -80,10 +80,12 @@ export function detectStalls(store: Store, settings: Settings, now = Date.now())
     }
   }
   const calls = store.db
-    .prepare('SELECT ok FROM brain_calls WHERE at >= ? ORDER BY at DESC LIMIT 5')
-    .all(now - DAY) as { ok: number }[];
+    .prepare('SELECT ok,error_kind,attempt_count FROM brain_calls WHERE at >= ? ORDER BY at DESC LIMIT 5')
+    .all(now - DAY) as { ok: number; error_kind: string | null; attempt_count: number | null }[];
   if (calls.length >= 3 && calls.every(c => !c.ok)) {
-    out.push({ code: 'brain_failing', detail: `大脑最近 ${calls.length} 次调用全部失败。检查 Key、Base URL、模型名和余额。` });
+    out.push({ code: 'brain_failing', detail: calls.every(c => c.attempt_count === 0 && ['budget', 'input_limit'].includes(c.error_kind ?? ''))
+      ? `大脑最近 ${calls.length} 次任务都被本地预算或输入上限拦下，没有请求模型；检查输入摘要和预算占用。`
+      : `大脑最近 ${calls.length} 次调用全部失败。检查 Key、Base URL、模型名、余额及请求尝试明细。` });
   }
   const recentPosts = one<{ n: number }>("SELECT COUNT(*) AS n FROM posts WHERE status = 'published' AND published_at BETWEEN ? AND ?", now - 3 * DAY, now - 3600_000).n;
   const lastStat = one<{ t: number | null }>('SELECT MAX(checked_at) AS t FROM post_stats').t;
@@ -174,7 +176,7 @@ export async function runSentinel(store: Store, settings: Settings, now = Date.n
   const r = await brain.ask({
     purpose: 'sentinel',
     system: withOperatorNotes(SENTINEL_SYSTEM, store.getSetting<string>('brainNotes', '')),
-    context: `警报：\n${active.map(a => `- [${a.code}] ${a.detail}`).join('\n')}\n\n快照：\n${snapshotText(snap)}`,
+    context: `警报：\n${active.map(a => `- [${a.code}] ${a.detail}`).join('\n')}\n\n快照：\n${snapshotText(snap, 'sentinel')}`,
     maxTokens: settings.brainMaxTokensSentinel,
   });
   if (!r.ok) { failJob(store, job.id, r.error, now, r.retryAt); report.skippedWhy = `调用失败，已登记有限补跑：${r.error.slice(0, 120)}`; return report; }

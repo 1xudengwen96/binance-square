@@ -352,3 +352,39 @@ test('weekly review failure preserves the report; a failed primary draft never g
     assert.deepEqual(JSON.parse(report.actions_json), []);
   } finally { close(); }
 });
+
+
+test('explicit weekly recovery links the original failed cycle and labels current-data supplementation', async () => {
+  const { store, close } = fixture(); let n = 0;
+  try {
+    const now = Date.UTC(2026, 10, 11, 8);
+    const original = enqueueJob(store, 'weekly', {}, { key: 'weekly:2965', now: now - 8 * 86400000 });
+    store.db.prepare("UPDATE brain_jobs SET status='failed',runs=3,error='budget' WHERE id=?").run(original.id);
+    const inside = Date.UTC(2026, 9, 30, 8);
+    for (const at of [inside, now]) {
+      const id = store.addPost({ materialId: null, templateId: null, text: 'test', status: 'published', scheduledAt: at });
+      store.updatePost(id, { publishedAt: at });
+    }
+    await stubFetch((_url, init) => {
+      n++;
+      const input = JSON.parse(String(init?.body)).messages.map((m: any) => m.content).join('\n');
+      assert.match(input, /延后补做/);
+      assert.match(input, /"historicalStateAvailable":false/);
+      assert.match(input, /"published":1/);
+      return reply(WEEKLY);
+    }, async () => {
+      const r = await runWeekly(store, { ...SETTINGS, brainReviewEnabled: false }, now, true, { originalJobId: original.id });
+      assert.equal(r.ok, true, r.note);
+      const row = store.db.prepare('SELECT * FROM brain_reports WHERE id=?').get(r.reportId) as any;
+      assert.match(row.title, /补做周复盘 2026-11-01/);
+      assert.match(row.body, /当前快照不代表原定日期的历史状态/);
+      assert.equal(row.created_at, now);
+      const old = store.db.prepare('SELECT status,runs,report_id FROM brain_jobs WHERE id=?').get(original.id) as any;
+      assert.deepEqual(old, { status: 'done', runs: 3, report_id: r.reportId });
+      const again = await runWeekly(store, SETTINGS, now, true, { originalJobId: original.id });
+      assert.equal(again.reportId, r.reportId);
+      assert.equal(n, 1);
+    });
+    assert.equal((store.db.prepare('SELECT COUNT(*) n FROM events WHERE kind=?').get('brain_weekly_recovered') as any).n, 1);
+  } finally { close(); }
+});

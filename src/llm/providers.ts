@@ -14,7 +14,7 @@ export const DEFAULT_BASE: Record<ProviderKind, string> = {
   openai: 'https://api.openai.com/v1', anthropic: 'https://api.anthropic.com/v1',
 };
 export const ANTHROPIC_VERSION = '2023-06-01';
-export type ErrorKind = 'configuration' | 'auth' | 'quota' | 'rate_limit' | 'upstream' | 'network' | 'timeout' | 'html' | 'invalid_response' | 'budget';
+export type ErrorKind = 'configuration' | 'auth' | 'quota' | 'rate_limit' | 'upstream' | 'network' | 'timeout' | 'html' | 'invalid_response' | 'budget' | 'input_limit';
 export interface ResponseMeta { endpoint?: string; contentType?: string; requestId?: string; status?: number }
 export class LlmError extends Error {
   constructor(message: string, readonly status?: number, readonly kind: ErrorKind = 'configuration',
@@ -157,7 +157,7 @@ export async function chat(cfg: LlmConfig, messages: ChatMessage[], options: Cha
     } catch (err) {
       const e = err instanceof LlmError ? err : new LlmError(redact(String(err), [cfg.apiKey]), undefined, 'invalid_response', undefined, meta);
       emit({ ...e.meta, ok: false, ms: Date.now() - started, errorKind: e.kind, error: redact(e.message, [cfg.apiKey]) });
-      const temp = e.status === 400 && /temperature/i.test(e.message) && /non-default|unsupported|not support|only.*default/i.test(e.message) && withTemperature;
+      const temp = e.status === 400 && /temperature/i.test(e.message) && /non-default|unsupported|not support|only.*default|deprecated|must.*omit|not allowed/i.test(e.message) && withTemperature;
       const tokenParam = cfg.provider === 'openai' && e.status === 400 && /max_tokens/i.test(e.message)
         && /max_completion_tokens/i.test(e.message) && !completionTokens;
       if (temp) tempUnsupported.add(key);

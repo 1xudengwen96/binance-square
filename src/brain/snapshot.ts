@@ -269,12 +269,35 @@ export function buildSnapshot(store: Store, settings: Settings, now = Date.now()
   };
 }
 
-/**
- * The snapshot as text for the prompt. JSON, not prose: the model reads structure better than a
- * paragraph, and a reviewer can paste the same block into a diff.
- */
-export function snapshotText(s: BrainSnapshot): string {
-  return JSON.stringify(s, (_k, v) => (v === undefined ? null : v), 1);
+/** Model input is a bounded summary; the full audit snapshot stays in reports and the panel. */
+export function snapshotForModel(s: BrainSnapshot, purpose: 'sentinel' | 'weekly' | 'review' = 'weekly') {
+  const detailLimit = purpose === 'sentinel' ? 0 : 6;
+  const idsLimit = 5;
+  return {
+    ...s,
+    gates: { ...s.gates, B: { ...s.gates.B, missingCommentPostIds: s.gates.B.missingCommentPostIds?.slice(0, idsLimit) } },
+    columns: s.columns.map(c => ({
+      ...c,
+      maturityExcluded: { tooYoung: c.maturityExcluded?.tooYoung.slice(0, idsLimit), missing24h: c.maturityExcluded?.missing24h.slice(0, idsLimit) },
+      registration: { matched: c.registration?.matched.slice(0, idsLimit), missing: c.registration?.missing.slice(0, idsLimit), mismatched: c.registration?.mismatched.slice(0, idsLimit) },
+      auditCounts: { tooYoung: (c.maturityExcluded?.tooYoung.length ?? null), missing24h: (c.maturityExcluded?.missing24h.length ?? null),
+        matched: (c.registration?.matched.length ?? null), missing: (c.registration?.missing.length ?? null), mismatched: (c.registration?.mismatched.length ?? null) },
+    })),
+    hypotheses: s.hypotheses.map(h => {
+      const { cells, detail, ...summary } = h.stratified;
+      return { ...h, stratified: { ...summary, detail: detail?.slice(0, detailLimit),
+        auditCounts: { cells: cells?.length ?? null, comparable: cells?.filter(c => c.comparable).length ?? null, detail: detail?.length ?? null } } };
+    }),
+    contextCoverage: {
+      purpose, fullAuditRetained: true,
+      note: '这是模型摘要：未发送交叉层 cells 及其逐帖 postIds；分层总体统计完整保留。detail 仅保留原顺序前几层，不能据此替代完整分层统计或推断被省略层。栏目及缺评论的 ID 数组仅为示例，长度不代表总数；用 auditCounts 或原有计数字段。完整明细留在面板和报告。',
+      detailLimit, idExamplesLimit: idsLimit, missingCommentPosts: s.gates.B.missingCommentPostIds?.length ?? null,
+    },
+  };
+}
+
+export function snapshotText(s: BrainSnapshot, purpose: 'sentinel' | 'weekly' | 'review' = 'weekly'): string {
+  return JSON.stringify(snapshotForModel(s, purpose), (_k, v) => (v === undefined ? null : v));
 }
 
 export { breaker };

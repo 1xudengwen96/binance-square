@@ -1,5 +1,6 @@
 import type { Store } from '../db/index.ts';
 import type { Settings } from '../config.ts';
+import { ATTEMPT_TOKENS_SQL } from './budget.ts';
 import { randomUUID } from 'node:crypto';
 import { connectionConfig, connectionView, type BrainConnection } from './connections.ts';
 import { chat, LlmError, redact, type ChatMessage, type LlmConfig, type ChatAttempt } from '../llm/providers.ts';
@@ -16,6 +17,11 @@ import { chat, LlmError, redact, type ChatMessage, type LlmConfig, type ChatAtte
  */
 
 export type BrainPurpose = 'reflect' | 'sentinel' | 'weekly' | 'test' | 'review';
+
+/** Character limits apply to prepared input, never to measured token usage or cost. */
+export const BRAIN_INPUT_CHAR_LIMITS: Record<BrainPurpose, number> = {
+  sentinel: 24_000, weekly: 40_000, review: 56_000, reflect: 16_000, test: 4_000,
+};
 
 export interface BrainTask {
   /** Shown in logs and in the panel, so a human can see what was asked of the model. */
@@ -67,14 +73,17 @@ export function brainFor(store: Store, settings: Settings, options: { connection
           text ? redact(text, secrets).slice(0, 4000) : null, callKey, finalSlot, count, errorKind ?? null);
         } catch { /* telemetry must not trigger another generation after a usable response */ }
       };
+      if (inChars > BRAIN_INPUT_CHAR_LIMITS[task.purpose]) {
+        const error = `准备输入 ${inChars} 字符，超过 ${task.purpose} 的 ${BRAIN_INPUT_CHAR_LIMITS[task.purpose]} 字符上限；未发送，请检查上下文摘要`;
+        record(false, undefined, error, 'input_limit');
+        return { ok: false, error };
+      }
       const candidates: { slot: BrainConnection; cfg: LlmConfig; attempts: number; deadline: number }[] = [
         { slot, cfg, attempts: task.purpose === 'review' ? 1 : 2,
           deadline: useFallback ? deadline - (task.purpose === 'weekly' ? 60_000 : 40_000) : deadline },
         ...(useFallback && task.purpose !== 'test' ? [{ slot: 'secondary' as const, cfg: secondary, attempts: 1, deadline }] : []),
       ];
       for (const candidate of candidates) {
-        finalCfg = candidate.cfg;
-        finalSlot = candidate.slot;
         let attemptId: number | null = null;
         const reserve = Buffer.byteLength(task.system + task.context, 'utf8') + (task.maxTokens ?? 600);
         try {
@@ -84,12 +93,13 @@ export function brainFor(store: Store, settings: Settings, options: { connection
             beforeAttempt: () => {
               attemptId = store.db.transaction(() => {
                 const used = store.db.prepare(`SELECT COUNT(*) AS n,
-                  COALESCE(SUM(CASE WHEN input_tokens IS NOT NULL AND output_tokens IS NOT NULL
-                    THEN input_tokens + output_tokens ELSE reserved_tokens END), 0) AS tokens
+                  COALESCE(SUM(${ATTEMPT_TOKENS_SQL}), 0) AS tokens
                   FROM brain_attempts WHERE at >= ?`).get(Date.now() - 86_400_000) as { n: number; tokens: number };
                 if (used.n >= settings.brainAttemptCapPerDay || used.tokens + reserve > settings.brainTokenCapPerDay) {
                   throw new LlmError('已达到大脑每日尝试次数或 token 预算，等待额度恢复', undefined, 'budget');
                 }
+                finalCfg = candidate.cfg;
+                finalSlot = candidate.slot;
                 count++;
                 return Number(store.db.prepare(`INSERT INTO brain_attempts
                   (call_key, at, purpose, connection, provider, model, ok, ms, error_kind, reserved_tokens)
@@ -111,7 +121,9 @@ export function brainFor(store: Store, settings: Settings, options: { connection
           record(true, text);
           return { ok: true, text, connection: candidate.slot, model: candidate.cfg.model, provider: candidate.cfg.provider };
         } catch (err) {
-          lastError = err;
+          if (err instanceof LlmError && err.kind === 'budget' && lastError instanceof Error) {
+            lastError = new LlmError(`${err.message}；上一请求失败：${lastError.message}`, undefined, 'budget');
+          } else lastError = err;
           if (err instanceof LlmError && err.retryAfterMs != null) retryAt = Math.max(retryAt ?? 0, Date.now() + err.retryAfterMs);
           if (err instanceof LlmError && err.kind === 'budget') break;
         }
