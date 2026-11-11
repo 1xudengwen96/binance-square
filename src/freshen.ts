@@ -358,7 +358,6 @@ export async function freshenForPublish(
   opts: FreshenOptions = {},
 ): Promise<FreshenResult> {
   const now = opts.now ?? Date.now();
-  if (now - post.created_at < FRESH_ENOUGH_MS) return { kind: 'keep', why: '草稿刚写好，数字还是新的' };
   if (!post.material_id) return { kind: 'keep', why: '没有关联素材' };
   const m = store.materialById(post.material_id);
   if (!m?.symbol) return { kind: 'keep', why: '素材不针对单一币种' };
@@ -369,6 +368,12 @@ export async function freshenForPublish(
     const age = Math.round((now - m.at) / 60_000);
     if (limit && age > limit) return { kind: 'drop', why: `这条异动发生在 ${age} 分钟前，帖子里「近 1 小时」的说法已经过时` };
     if (!printsLiveNumbers(post)) return { kind: 'keep', why: '帖子没有引用实时行情数字' };
+  }
+
+  // A newly rendered draft may quote an old material row. Check the data's clock too,
+  // and never let this shortcut bypass the event-window check above.
+  if (now - Math.min(post.created_at, m.at) < FRESH_ENOUGH_MS) {
+    return { kind: 'keep', why: '草稿与素材读数都在十分钟内' };
   }
 
   const q = await (opts.quote ?? liveQuote)(m.symbol).catch(() => null);

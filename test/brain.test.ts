@@ -120,6 +120,58 @@ test('gate B counts the posts gate A counts: a day old, at the 24h reading', () 
   } finally { close(); }
 });
 
+test('column coverage distinguishes maturity, missing arms and mismatched arms with auditable IDs', () => {
+  const { store, close } = tempStore();
+  try {
+    const now = Date.now();
+    const matched = post(store, now - 2 * DAY, 100, { template: 'column.recap' });
+    const missing = post(store, now - 2 * DAY, 200, { template: 'column.recap' });
+    const mismatch = post(store, now - 2 * DAY, 300, { template: 'column.recap' });
+    const young = post(store, now - 3600_000, 50, { template: 'column.recap' });
+    const unread = post(store, now - 3 * DAY, 60, { template: 'column.recap' });
+    store.db.prepare('UPDATE post_distribution SET v24h = NULL WHERE post_id = ?').run(unread);
+    store.db.prepare('INSERT INTO post_arms (post_id,experiment,arm,assigned_at) VALUES (?,?,?,?)').run(matched, 'h_column', 'recap', now);
+    store.db.prepare('INSERT INTO post_arms (post_id,experiment,arm,assigned_at) VALUES (?,?,?,?)').run(mismatch, 'h_column', 'question', now);
+    const snap = buildSnapshot(store, DEFAULT_SETTINGS, now);
+    const c = snap.columns.find(c => c.kind === 'recap')!;
+    assert.equal(c.posts, 5);
+    assert.equal(c.matured, 3);
+    assert.deepEqual(c.maturityExcluded, { tooYoung: [young], missing24h: [unread] });
+    assert.deepEqual(c.registration, { matched: [matched], missing: [missing], mismatched: [{ postId: mismatch, arm: 'question' }] });
+    assert.equal(snap.hypotheses.find(h => h.id === 'h_column')!.arms.find(a => a.arm === 'recap')!.n, 1);
+    assert.ok(snap.definitions.some(d => d.includes('sampleShortfall')));
+  } finally { close(); }
+});
+
+test('gate B reports its denominator and covers posts without any stats row', () => {
+  const { store, close } = tempStore();
+  try {
+    const now = Date.now();
+    post(store, now - 2 * DAY, 1000, { comments: 1 });
+    post(store, now - 2 * DAY, 500, { comments: 0 });
+    const missing = post(store, now - 2 * DAY, 3000);
+    store.db.prepare('DELETE FROM post_stats WHERE post_id = ?').run(missing);
+    const young = post(store, now - 3600_000, 100);
+    store.db.prepare('UPDATE post_distribution SET v24h = NULL WHERE post_id = ?').run(young);
+    const b = gateReport(store, now).B;
+    assert.equal(b.windowPosts, 4);
+    assert.equal(b.maturePosts, 3);
+    assert.equal(b.withComments, 2);
+    assert.equal(b.missingComments, 1);
+    assert.equal(b.immature, 1);
+    assert.deepEqual(b.missingCommentPostIds, [missing]);
+    assert.equal(b.posts, b.withComments);
+    assert.equal(b.views, b.commentViews);
+    assert.equal(b.commentViews, 1500);
+    assert.equal(b.commentsPer1k, Number((b.comments / b.commentViews * 1000).toFixed(2)));
+    store.db.prepare('UPDATE post_stats SET comments = NULL').run();
+    const unknown = gateReport(store, now).B;
+    assert.equal(unknown.withComments, 0);
+    assert.equal(unknown.missingComments, 3);
+    assert.equal(unknown.commentsPer1k, null);
+  } finally { close(); }
+});
+
 test('gate C counts posts whose views kept doubling after hour three', () => {
   const { store, close } = tempStore();
   try {
@@ -455,7 +507,7 @@ test('posted brain settings are validated and clamped; unknown keys are dropped'
   assert.equal(next.llmBaseUrl, 'https://api.anthropic.com/v1', 'trailing slash trimmed');
   assert.equal(next.brainTemperature, 1);
   assert.equal(next.brainWakeCapPerDay, 0);
-  assert.equal(next.columnPostsPerDay, 6);
+  assert.equal(next.columnPostsPerDay, 100);
   assert.equal(next.brainMaxTokensWeekly, 500);
   assert.equal(next.dailyCap, cur.dailyCap, 'cadence and caps are not reachable from the brain page');
   assert.equal(next.postsPerDay, cur.postsPerDay);

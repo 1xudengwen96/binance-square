@@ -40,6 +40,32 @@ export function nominalIntervalMinutes(s: Settings): number {
   return Math.max(s.minIntervalMinutes, Math.floor(spanMinutes / Math.max(1, s.postsPerDay)));
 }
 
+/** Recover missed slots within the remaining window, without crossing the minimum gap. */
+export function recoveryIntervalMinutes(s: Settings, published: number, now = Date.now()): number {
+  const nominal = nominalIntervalMinutes(s);
+  if (!insideActiveWindow(s, now)) return nominal;
+  const { start, end } = windowBounds(s);
+  const minute = beijingMinutes(now);
+  const remaining = end > start || minute < end ? end - minute : 1440 - minute + end;
+  const wanted = Math.max(1, s.postsPerDay - published);
+  return Math.max(s.minIntervalMinutes, Math.min(nominal, Math.floor(remaining / wanted)));
+}
+
+export interface SlotClaim { id: number; account_id: number | null; at: number }
+
+/** Find a free hole, rather than appending every account after the matrix's furthest booking. */
+function reserveSlot(s: Settings, from: number, claims: readonly SlotClaim[], accountId: number, ownGap: number, matrixGap: number): number {
+  let at = insideActiveWindow(s, from) ? from : rollIntoWindow(s, from);
+  const sorted = [...claims].sort((a, b) => a.at - b.at);
+  for (const claim of sorted) {
+    const gap = claim.account_id === accountId ? Math.max(ownGap, matrixGap) : matrixGap;
+    if (at >= claim.at + gap || at + gap <= claim.at) continue;
+    at = claim.at + gap;
+    if (!insideActiveWindow(s, at)) at = rollIntoWindow(s, at);
+  }
+  return at;
+}
+
 /**
  * How many posts a cadence can actually fit: the active window divided by the minimum gap.
  *
@@ -159,6 +185,7 @@ export function nextSlotFor(
   now = Date.now(),
   candidate?: { id: number; at: number } | null,
   queueAhead = false,
+  reservations?: readonly SlotClaim[],
 ): SlotDecision {
   const s = settingsForAccount(base, a);
   const mine = store.accountPostsToday(a.id, beijingDayStart(now));
@@ -175,19 +202,51 @@ export function nextSlotFor(
     return { allowed: false, at: now, reason: `${a.label} 达到币安单号 100 帖/天硬上限` };
   }
 
-  const horizon = queueAhead ? now + QUEUE_LOOKAHEAD_MS : now;
-  const gapMs = nominalIntervalMinutes(s) * 60_000;
-  // Both clocks must see drafts already scheduled, not only posts already published, or a
-  // batch generated in one tick collapses onto a single minute. The candidate excludes
-  // itself, otherwise a post due now would see its own slot as a prior claim and defer
-  // itself forever.
-  const atOwn = store.lastSlotClaimedAt(a.id, horizon, candidate) + Math.max(gapMs, s.minIntervalMinutes * 60_000);
-  // The shared clock counts every account, including this one.
-  const atMatrix = store.lastSlotClaimedAt(null, horizon, candidate) + base.crossAccountGapMinutes * 60_000;
+  const gapMs = recoveryIntervalMinutes(s, mine, now) * 60_000;
+  const atOwn = store.lastPublishAt(a.id, now) + gapMs;
+  const matrixGap = base.crossAccountGapMinutes * 60_000;
+  const atMatrix = store.lastPublishAt(null, now) + matrixGap;
   let at = Math.max(now, atOwn, atMatrix);
+
+  // Reservations constrain drafting, never delivery. A review draft is not a real publish.
+  if (queueAhead) {
+    const claims = reservations ?? store.slotClaims(now + QUEUE_LOOKAHEAD_MS);
+    at = reserveSlot(s, at, claims.filter(c => c.id !== candidate?.id), a.id, gapMs, matrixGap);
+    if (beijingDayStart(at) > beijingDayStart(now)) {
+      return { allowed: true, at, reason: `${a.label} 今日时段已满，已顺延到明天` };
+    }
+  }
 
   if (!insideActiveWindow(s, at)) {
     return { allowed: true, at: rollIntoWindow(s, at), reason: `${a.label} 当前不在该号发帖时段，已顺延` };
   }
   return { allowed: true, at, reason: 'ok' };
+}
+
+/** Reclaim holes left by expired/rejected automatic drafts. Human review schedules stay put. */
+export function reflowApproved(store: Store, base: Settings, now = Date.now()): number {
+  const accounts = store.activeAccounts(now).filter(a => settingsForAccount(base, a).autoPublish);
+  const byId = new Map(accounts.map(a => [a.id, a]));
+  const end = beijingDayStart(now) + 86_400_000;
+  const rows = (store.db.prepare(`SELECT id, account_id, scheduled_at FROM posts
+    WHERE status = 'approved' AND scheduled_at < ? AND json_extract(trace_json, '$.account') IS NOT NULL
+    ORDER BY scheduled_at, id`).all(end) as { id: number; account_id: number; scheduled_at: number }[])
+    .filter(p => byId.has(p.account_id));
+  const ids = new Set(rows.map(p => p.id));
+  const claims = store.slotClaims(now + QUEUE_LOOKAHEAD_MS).filter(c => !ids.has(c.id));
+  let moved = 0;
+  store.db.transaction(() => {
+    for (const row of rows) {
+      const slot = nextSlotFor(store, base, byId.get(row.account_id)!, now, null, true, claims);
+      // Only automatic drafts selected above move; tomorrow's reservations stay untouched.
+      const at = slot.allowed ? slot.at : row.scheduled_at;
+      if (at !== row.scheduled_at) {
+        store.db.prepare('UPDATE posts SET scheduled_at = ? WHERE id = ?').run(at, row.id);
+        moved++;
+      }
+      claims.push({ id: row.id, account_id: row.account_id, at });
+    }
+    if (moved) store.log('queue_reflow', { moved });
+  })();
+  return moved;
 }

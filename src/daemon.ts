@@ -3,7 +3,7 @@ import 'dotenv/config';
 import { Store, type AccountRow } from './db/index.ts';
 import { collect, generate, generateForMatrix, publishDue, pauseState } from './pipeline.ts';
 import { generateColumn } from './column.ts';
-import { settingsFrom } from './schedule.ts';
+import { reflowApproved, settingsFrom } from './schedule.ts';
 import { backfillStats, tuneTemplateWeights } from './stats/backfill.ts';
 import { observeDistribution } from './rank/observations.ts';
 import { revokeStaleRules, scoreAll } from './rank/score.ts';
@@ -103,6 +103,8 @@ export async function tick(store: Store, opts: { live?: boolean; statsEveryTicks
   // Expire before drafting, or a stale ratio gets dressed up as news.
   try {
     res.expired = retire(store, settings).discarded;
+    const moved = reflowApproved(store, settings);
+    if (moved) res.notes.push(`已为 ${moved} 条自动稿重新排期，回收空档`);
   } catch (err) {
     res.notes.push(`retire 失败：${String(err).slice(0, 100)}`);
   }

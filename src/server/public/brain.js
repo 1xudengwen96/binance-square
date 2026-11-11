@@ -98,7 +98,7 @@ function brainGateCards(d) {
     ${gateRow('关卡 A · 被分发', g.A.passed, `${g.A.streakDays}<small>/ ${g.A.daysNeeded} 天</small>`,
       `每天 ≥ ${L.minPostsPerDay} 条满 24 小时的帖子，浏览中位数 ≥ ${L.viewsMedian}。近 7 天中位数 ${fmtN(g.A.median7d == null ? null : Math.round(g.A.median7d))}`)}
     ${gateRow('关卡 B · 有人回应', g.B.passed, g.B.commentsPer1k == null ? '—' : `${g.B.commentsPer1k}<small>/ ${g.B.line}</small>`,
-      `近 ${g.B.windowDays} 天满 24 小时的 ${fmtN(g.B.posts)} 条帖子（与 A 同一批）合并评论率。${g.B.comments} 条评论 / ${g.B.views} 次 24h 浏览${g.B.immature ? `；另有 ${g.B.immature} 条没有 24h 读数（未满 24 小时或错过回抓），不计入` : ''}`)}
+      `近 ${g.B.windowDays} 天共 ${fmtN(g.B.windowPosts)} 条，其中 ${fmtN(g.B.maturePosts)} 条有 24h 读数；${fmtN(g.B.withComments)} 条有评论读数、${fmtN(g.B.missingComments)} 条缺评论读数。评论率 = ${g.B.comments} / ${g.B.commentViews} × 1000，仅合并有评论读数帖子的 24h 浏览；另有 ${g.B.immature} 条没有 24h 读数，不计入。`)}
     ${gateRow('关卡 C · 二次分发', g.C.passed, `${g.C.secondRound}<small>/ ${g.C.needed} 条</small>`,
       `发帖 3 小时后浏览仍翻倍的帖子。粉丝数读不到，用它代替`)}
     <div class="tile"><div class="lbl">现在按什么判定实验</div><div class="v" style="font-size:19px">${esc({ views: '浏览量', engagement: '互动质量', money: '返佣' }[d.target] || d.target)}</div>
@@ -268,11 +268,11 @@ function brainJobsCard(d) {
 function brainColumnCard(d) {
   const s = d.settings;
   return `<div class="card" style="margin-bottom:14px">
-    <div class="card-hd"><h3>栏目与实验</h3><span class="sub">开启后，账号只发固定栏目，不再发混合短帖。</span></div>
+    <div class="card-hd"><h3>栏目与实验</h3><span class="sub">优先生成固定栏目，空缺由事件短帖补充，共用账号每日目标。</span></div>
     <div class="kv" style="margin:6px 0">
       <label class="kv" style="cursor:pointer"><input type="checkbox" id="bn-colmode" style="width:auto" ${bdv('columnMode', s.columnMode) ? 'checked' : ''}> <span>启用固定栏目</span></label>
-      <span class="cap" style="margin-left:10px">每天最多</span>
-      <input type="number" min="1" max="6" id="bn-colper" style="width:70px" value="${bnum(bdv('columnPostsPerDay', s.columnPostsPerDay))}"> <span class="hint" style="margin:0">条（是上限，不是目标；市场没有够格的素材就不发）</span>
+      <span class="cap" style="margin-left:10px">每号栏目每天最多</span>
+      <input type="number" min="1" max="100" id="bn-colper" style="width:70px" value="${bnum(bdv('columnPostsPerDay', s.columnPostsPerDay))}"> <span class="hint" style="margin:0">条（包含在账号每日目标内；不超过该号目标和全局上限）</span>
     </div>
     <div class="field"><span class="cap">实验判定指标</span>
       <div class="targetbar">

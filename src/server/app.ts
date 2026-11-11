@@ -15,6 +15,7 @@ import { isStructuralDuplicate } from '../engine/guard.ts';
 import { line, tick, type TickResult } from '../daemon.ts';
 import { analyze, CATEGORY_LABELS, signalLabel } from '../stats/insight.ts';
 import { dashboard } from '../stats/dashboard.ts';
+import { queueSummary } from '../stats/queue.ts';
 import { boardComposition } from '../stats/benchmarks.ts';
 import { currentTarget } from '../rank/gates.ts';
 import { registerBrainRoutes } from './brainRoutes.ts';
@@ -27,6 +28,7 @@ import { distributionRows } from '../rank/observations.ts';
 import { armsOf } from '../rank/experiments.ts';
 import { playbook } from '../rank/playbook.ts';
 import { DIMENSION_NAMES, DIMENSIONS } from '../rank/hypotheses.ts';
+import { METRIC_DEFINITIONS, MEASUREMENT_SAMPLE } from '../rank/metrics.ts';
 import { propose, proposals, registry, resolveProposal, retire } from '../rank/registry.ts';
 import { changeLedger, currentKnob, KNOBS, liveKnobs, proposeChange } from '../rank/params.ts';
 import { brainFor } from '../brain/brain.ts';
@@ -301,12 +303,20 @@ app.get('/charts/:file', (req, reply) => {
   }
 });
 
+app.get('/api/posts/summary', (req, reply) => {
+  const id = Number((req.query as { accountId?: string }).accountId ?? 0);
+  if (!Number.isInteger(id) || id < 0) return reply.code(400).send({ error: 'accountId 必须是非负整数（0 为全部账号）' });
+  return reply.send(queueSummary(store, id || undefined));
+});
+
 app.get('/api/posts', (req, reply) => {
-  const q = req.query as { status?: string; sort?: string; limit?: string };
+  const q = req.query as { status?: string; sort?: string; limit?: string; accountId?: string };
   const ALL = ['draft', 'approved', 'published', 'uncertain', 'failed', 'rejected'];
-  const statuses = q.status && ALL.includes(q.status) ? [q.status] : ALL;
+  const statuses = q.status === 'pending' ? ['draft', 'approved'] : q.status && ALL.includes(q.status) ? [q.status] : ALL;
+  const accountId = Number(q.accountId ?? 0);
+  if (!Number.isInteger(accountId) || accountId < 0) return reply.code(400).send({ error: 'accountId 必须是非负整数' });
   const sort = q.sort === 'views' ? 'views' : 'recent';
-  const rows = store.postsForList({ statuses, sort, limit: Math.min(500, Number(q.limit) > 0 ? Number(q.limit) : 150) });
+  const rows = store.postsForList({ statuses, sort, accountId: accountId || undefined, limit: Math.min(500, Number(q.limit) > 0 ? Number(q.limit) : 150) });
   // Surfacing is reported separately from views because the two have different fixes; a post
   // that appeared on a public board is a different outcome than one that only got read.
   const surfaced = store.surfacedPostIds(rows.map(p => p.square_post_id).filter((x): x is string => Boolean(x)));
@@ -389,7 +399,9 @@ app.get('/api/rank', (req, reply) => {
   const arms = store.db.prepare('SELECT experiment, arm, COUNT(*) AS n FROM post_arms GROUP BY 1,2 ORDER BY 1,2').all();
   const pb = playbook(store, { verdicts });
   return reply.send({
-    verdicts,
+    verdicts: verdicts.map(v => ({ ...v, metricDefinition: METRIC_DEFINITIONS[v.metric] })),
+    measurementSample: MEASUREMENT_SAMPLE,
+    days,
     curve,
     arms,
     playbook: { hashtagTotal: pb.hashtagTotal, attachChart: pb.attachChart, opening: pb.opening, acting: pb.acting },

@@ -67,12 +67,12 @@ interface PostRow {
   comments: number | null;
 }
 
-function rows(store: Store, since: number): PostRow[] {
+function rows(store: Store, since: number, includeUnread = false): PostRow[] {
   return store.db
     .prepare(
       `SELECT p.id, p.published_at, s.views, s.comments, d.v3h, d.v24h
        FROM posts p
-       JOIN post_stats s ON s.post_id = p.id
+       ${includeUnread ? 'LEFT JOIN' : 'JOIN'} post_stats s ON s.post_id = p.id
        LEFT JOIN post_distribution d ON d.post_id = p.id
        WHERE p.status = 'published' AND p.published_at >= ?
        ORDER BY p.published_at ASC`,
@@ -108,6 +108,13 @@ export interface GateReport {
     posts: number;
     /** Posts in the window left out for want of a 24h reading: too young, or that checkpoint was missed. */
     immature: number;
+    windowPosts: number;
+    maturePosts: number;
+    withComments: number;
+    missingComments: number;
+    /** Explicit denominator of commentsPer1k; equal to views. */
+    commentViews: number;
+    missingCommentPostIds: number[];
     line: number;
     windowDays: number;
   };
@@ -130,7 +137,7 @@ export interface GateReport {
  * few hours old — the first weekly review caught B's 129 views being exactly those two.
  */
 export function gateReport(store: Store, now = Date.now()): GateReport {
-  const all = rows(store, now - 30 * DAY);
+  const all = rows(store, now - 30 * DAY, true);
   const mature = all.filter(r => r.v24h != null);
 
   const byDay = new Map<number, number[]>();
@@ -175,6 +182,12 @@ export function gateReport(store: Store, now = Date.now()): GateReport {
     B: {
       passed: bPassed, commentsPer1k: rate == null ? null : Number(rate.toFixed(2)), views, comments,
       posts: cWin.length, immature: inWin.filter(r => !mature.includes(r)).length,
+      windowPosts: inWin.length,
+      maturePosts: inWin.filter(r => r.v24h != null).length,
+      withComments: cWin.length,
+      missingComments: inWin.filter(r => r.v24h != null && r.comments == null).length,
+      commentViews: views,
+      missingCommentPostIds: inWin.filter(r => r.v24h != null && r.comments == null).map(r => r.id),
       line: GATE_LINES.commentsPer1k, windowDays: GATE_LINES.commentWindowDays,
     },
     C: { passed: cPassed, secondRound: second, needed: GATE_LINES.secondRoundNeeded },

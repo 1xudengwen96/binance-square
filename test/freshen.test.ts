@@ -106,6 +106,7 @@ test('nothing is touched when there is nothing to check or the quote is unavaila
     const id = anomalyDraft(store, now);
     const post = store.postById(id)!;
     assert.equal((await freshenForPublish(store, ALWAYS_OPEN, post, null, { quote: async () => null, now })).kind, 'keep', 'a failed quote never blocks a send');
+    store.db.prepare('UPDATE materials SET occurred_at = ? WHERE id = ?').run(now - 60_000, post.material_id);
     assert.equal((await freshenForPublish(store, ALWAYS_OPEN, { ...post, created_at: now - 60_000 }, null, { quote: async () => quote(), now })).kind, 'keep', 'a fresh draft is left alone');
     assert.equal((await freshenForPublish(store, ALWAYS_OPEN, { ...post, material_id: null }, null, { quote: async () => quote(), now })).kind, 'keep');
   } finally { close(); }
@@ -118,7 +119,7 @@ test('an event post past its window is dropped before the quote is even read', a
     const m = makeMaterial({ category: 'market_move', subType: 'volume_surge', title: 'x', symbol: 'SNDKB', source: 't', at: now - 3 * HOUR, facts: { volMultiple: 7.2, price: 1381.51, chg24h: 9.7 } });
     store.insertMaterial(m);
     const id = store.addPost({ materialId: m.id, templateId: 'move.volume', text: '$SNDKB 1 小时成交额放到 7.2 倍。不构成投资建议。', status: 'approved', scheduledAt: now - 60_000, trace: { seed: 1 } });
-    store.db.prepare('UPDATE posts SET created_at = ? WHERE id = ?').run(now - 3 * HOUR, id);
+    // Newly rendered text must not disguise the old event as a fresh signal.
     let asked = false;
     const fr = await freshenForPublish(store, ALWAYS_OPEN, store.postById(id)!, null, { quote: async () => { asked = true; return quote(); }, now });
     assert.equal(fr.kind, 'drop');
@@ -148,5 +149,21 @@ test('a drill without an injected quote never reaches for market data', async ()
     const r = await publishDue(store, ALWAYS_OPEN, { live: false });
     assert.equal(r.dropped.length, 0);
     assert.equal(store.postById(id)!.text, before);
+  } finally { close(); }
+});
+
+
+test('a newly drafted column quoting old material still rechecks the market', async () => {
+  const { store, close } = tempStore();
+  try {
+    const now = Date.now();
+    const id = anomalyDraft(store, now);
+    store.db.prepare('UPDATE posts SET created_at = ? WHERE id = ?').run(now - 60_000, id);
+    let asked = false;
+    const fr = await freshenForPublish(store, ALWAYS_OPEN, store.postById(id)!, null, {
+      now, quote: async () => { asked = true; return quote({ funding: 0.002 }); },
+    });
+    assert.equal(asked, true, 'freshness belongs to the data, not just the rendered text');
+    assert.equal(fr.kind, 'drop', 'the old paying-side premise has reversed');
   } finally { close(); }
 });

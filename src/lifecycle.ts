@@ -49,6 +49,19 @@ export function expiresAt(category: string, occurredAt: number): number {
   return occurredAt + ttlFor(category) * 60_000;
 }
 
+/** A scheduled minute is serviced by a polling loop, plus time spent collecting/rendering. */
+export function publishSafetyMarginMs(settings: Settings): number {
+  return (Math.max(3, Math.min(240, settings.tickMinutes)) + 1) * 60_000;
+}
+
+/** Draft automatic short posts only within one polling cycle of delivery.
+ * A TTL check alone still allows hours of market drift while a valid draft waits.
+ * Review-mode drafts and previews retain their existing scheduling behaviour.
+ */
+export function shouldWaitToDraft(settings: Settings, scheduledAt: number, now = Date.now()): boolean {
+  return settings.autoPublish && scheduledAt > now + publishSafetyMarginMs(settings);
+}
+
 export interface RetireReport {
   discarded: number;
   staleDrafts: number;
@@ -120,7 +133,13 @@ export function pruneOrphanCharts(store: Store, chartsDir: string, settings: Set
 const RETIRABLE = "'draft','approved'";
 
 export function retireStaleDrafts(store: Store, now = Date.now()): number {
-  let total = 0;
+  // Old duplicate refusals were parked in draft forever, including material-less recaps.
+  let total = store.db.prepare(`UPDATE posts SET status = 'rejected'
+    WHERE status = 'draft' AND (error = '发布前发现与已发帖子结构重复，已退回草稿'
+      OR error LIKE '与「%近期文案句式相同%已退回草稿')`).run().changes;
+  total += store.db.prepare(`UPDATE posts SET status = 'rejected', error = '对账草稿超过一天，自动作废'
+    WHERE template_id = 'column.recap' AND status IN (${RETIRABLE}) AND created_at < ?`)
+    .run(now - 86_400_000).changes;
   for (const [category, minutes] of Object.entries(TTL_MINUTES)) {
     total += store.db
       .prepare(

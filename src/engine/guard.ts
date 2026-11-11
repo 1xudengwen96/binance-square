@@ -61,6 +61,13 @@ export function isStructuralDuplicate(candidate: string, recent: readonly string
   return null;
 }
 
+/** Columns deliberately share a form; compare their content at both draft and publish time. */
+export function publicationDuplicate(text: string, recent: readonly string[], templateId: string | null): string | null {
+  return templateId?.startsWith('column.')
+    ? isDuplicate(text, recent, 0.8)
+    : isStructuralDuplicate(text, recent);
+}
+
 /**
  * A material fingerprint is what makes "same event, four outlets" collapse into
  * one post instead of four near-identical ones.

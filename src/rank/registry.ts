@@ -53,7 +53,24 @@ const toHypothesis = (r: HypoRow): Hypothesis => ({
  */
 export function seedRegistry(store: Store, now = Date.now()): number {
   const existing = (store.db.prepare('SELECT COUNT(*) AS n FROM hypotheses').get() as { n: number }).n;
-  if (existing > 0) return 0;
+  if (existing > 0) {
+    // Correct overstated legacy wording only; keep preregistered metrics and samples intact.
+    // Exact matching preserves operator edits and makes this migration idempotent.
+    const corrections = [
+      ['h_hook_form', '首句先给结论、把数字放到第二句，比直接以数据开头更能留住前三秒'],
+      ['h_hour_band', '发帖时刻决定第一小时的推送量'],
+    ];
+    store.db.transaction(() => {
+      for (const [id, oldClaim] of corrections) {
+        const h = HYPOTHESES.find(h => h.id === id)!;
+        const result = store.db.prepare(
+          "UPDATE hypotheses SET claim = ?, how = ? WHERE id = ? AND claim = ? AND origin = 'builtin' AND metric = 'views24h'",
+        ).run(h.claim, h.how, id, oldClaim);
+        if (result.changes) store.log('hypothesis_wording_corrected', { id, oldClaim, claim: h.claim, metric: h.metric });
+      }
+    })();
+    return 0;
+  }
   const ins = store.db.prepare(
     `INSERT INTO hypotheses (id, claim, mode, dimension, metric, min_samples, how, risk, origin, status, created_at)
      VALUES (?,?,?,?,?,?,?,?,?,?,?)

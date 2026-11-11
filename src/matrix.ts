@@ -136,13 +136,14 @@ export function collidesWithMatrix(
   accountId: number | null,
   text: string,
   now = Date.now(),
+  contentOnly = false,
 ): { ownerLabel: string; signature: number } | null {
   const since = now - settings.crossAccountCoinExclusionMinutes * 60_000;
   const rows = store.recentPostsFromOthers(accountId, since, 80);
-  const sig = structuralSignature(text);
+  const sig = contentOnly ? text : structuralSignature(text);
   for (const r of rows) {
-    const score = similarity(sig, structuralSignature(r.text));
-    if (score >= CROSS_ACCOUNT_THRESHOLD) return { ownerLabel: r.label ?? `账号 #${r.account_id ?? '?'}`, signature: score };
+    const score = similarity(sig, contentOnly ? r.text : structuralSignature(r.text));
+    if (score >= (contentOnly ? 0.8 : CROSS_ACCOUNT_THRESHOLD)) return { ownerLabel: r.label ?? `账号 #${r.account_id ?? '?'}`, signature: score };
   }
   return null;
 }

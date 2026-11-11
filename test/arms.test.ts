@@ -141,7 +141,7 @@ function verdict(id: string, arms: [string, number][], status: Verdict['status']
     id, claim: 'c', metric: 'views24h', mode: 'experiment', how: '', risk: '',
     arms: arms.map(([arm, n]) => ({ arm, n, median: 1, best: 1 })),
     winner: null, loser: null, effect: 0,
-    stratified: { gap: null, rel: null, strata: 0, dropped: 0, winner: null, agree: 0, detail: [] },
+    stratified: { controls: [], cells: [], gap: null, rel: null, strata: 0, dropped: 0, winner: null, agree: 0, detail: [] },
     replicated: null, confidence: 0, status, action: null, note: null, missing: 0,
   };
 }

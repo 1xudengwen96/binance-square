@@ -12,12 +12,14 @@ import {
 } from './content/columns.ts';
 import { renderTemplate } from './engine/render.ts';
 import { auditAgainstFacts } from './engine/verify.ts';
-import { isDuplicate } from './engine/guard.ts';
+import { publicationDuplicate } from './engine/guard.ts';
 import { hashString } from './engine/prng.ts';
 import { wordBank } from './content/wordbank.ts';
-import { expiresAt } from './lifecycle.ts';
+import { expiresAt, publishSafetyMarginMs, shouldWaitToDraft } from './lifecycle.ts';
 import { nextSlotFor, settingsForAccount } from './schedule.ts';
-import { personaSeed } from './matrix.ts';
+import { collidesWithMatrix, personaSeed } from './matrix.ts';
+import { laneRoom } from './lanes.ts';
+import { automaticDraftBlockReason } from './drafting.ts';
 import { applyPolish, carriesDisclaimer, withHashtags } from './pipeline.ts';
 import { buildChartFor, cardAnnotation } from './chart/forSymbol.ts';
 import { toContext } from './material/types.ts';
@@ -70,7 +72,7 @@ export async function generateColumn(
   store: Store,
   settings: Settings,
   account: AccountRow,
-  opts: { dryRun?: boolean; now?: number } = {},
+  opts: { dryRun?: boolean; now?: number; excluded?: readonly string[] } = {},
 ): Promise<ColumnReport> {
   const report: ColumnReport = { created: [], skipped: [] };
   const now = opts.now ?? Date.now();
@@ -87,14 +89,24 @@ export async function generateColumn(
     }
   }
   const eff = settingsForAccount(settings, account);
-  const perDay = Math.max(1, settings.columnPostsPerDay);
-  seedVariants(store, now);
+  const draftingBlock = opts.dryRun ? null : automaticDraftBlockReason(store, settings, eff, now);
+  if (draftingBlock) {
+    store.log('column_funnel', { outcome: 'dropped', drop: 'delivery_blocked', why: draftingBlock });
+    report.skipped.push(draftingBlock);
+    return report;
+  }
 
+  const perDay = Math.max(1, Math.min(settings.columnPostsPerDay, eff.postsPerDay, eff.dailyCap));
+  const excluded = opts.excluded ?? [];
+  if (excluded.length >= 8) {
+    report.skipped.push('本轮候选内容均未通过检查，等待新素材');
+    return report;
+  }
+  const retry = (key: string) => generateColumn(store, settings, account, { ...opts, now, excluded: [...excluded, key] });
+  seedVariants(store, now);
   // The ceiling is on posts that exist or are about to, not on what has already gone out: a draft
   // queued behind this tick is still a post the account will make today.
-  // 定稿口径写死「每号 4 条/北京日历日」（v1.6 裁定四配套）。这里原本是滚动 24 小时——既不切 08:00
-  // 也不切 00:00，跨日的两条相邻帖会互相挡额度，而租约面（lane_leases/laneUsage）切的是北京 00:00。
-  // 两处语义现在对齐到同一个北京日历日；生效要等重启窗，中途换日界会当场重置当日额度，属发布行为变更。
+  // Column share is bounded by the account's total target, on the same Beijing day as leases.
   const queued = store.columnPostsSince(account.id, beijingDayStart(now));
   if (!opts.dryRun && queued >= perDay) {
     store.log('column_funnel', { outcome: 'dropped', drop: 'queued_ceiling', queued, perDay });
@@ -144,6 +156,7 @@ export async function generateColumn(
   const pairs: { material: Material; kind: Kind }[] = [];
   for (const m of usable) {
     for (const k of shapesFor(m)) {
+      if (excluded.includes(`${k}:${m.id}`)) continue;
       if (payerCapped && angleOf(k, m.facts) === 'payer') { funnel.angleCapped++; continue; }
       pairs.push({ material: m, kind: k });
     }
@@ -157,7 +170,7 @@ export async function generateColumn(
   for (const c of owedRaw) if (owed.length < 3 && !owed.some(o => o.symbol === c.symbol)) owed.push(c);
   const owedIds = owedRaw.filter(c => owed.some(o => o.symbol === c.symbol)).map(c => c.id);
   const recapIn20h = store.columnKindSince(account.id, 'column.recap', now - 20 * 3600_000);
-  const haveRecap = owed.length >= RECAP_MIN_CALLS && recapIn20h === 0;
+  const haveRecap = owed.length >= RECAP_MIN_CALLS && recapIn20h === 0 && !excluded.includes('recap');
 
   if (!pairs.length && !haveRecap) {
     store.log('column_funnel', { ...funnel, outcome: 'refused', why: '没有够格的币，也没有可复盘的判断', owed: owed.length, recapIn20h });
@@ -180,8 +193,27 @@ export async function generateColumn(
     return report;
   }
 
+  if (!opts.dryRun && (laneRoom(store, settings, account.id, 'short', now) <= 0
+    || store.pendingQueueCount(account.id) >= (eff.autoPublish ? 2 : eff.postsPerDay))) {
+    store.log('column_funnel', { ...funnel, outcome: 'dropped', drop: 'queue_ready', slot_at: slot.at });
+    report.skipped.push('该号今日目标已排满，或已有足够待发布稿件');
+    return report;
+  }
+
+  if (!opts.dryRun && shouldWaitToDraft(eff, slot.at, now)) {
+    store.log('column_funnel', { ...funnel, outcome: 'dropped', drop: 'wait_for_slot', slot_at: slot.at });
+    report.skipped.push('尚未临近可发布时间，等下一轮用最新行情生成');
+    return report;
+  }
+
   const verdicts = scoreAll(store, { writeMemory: false, target: currentTarget(store, settings, now) });
-  const available: string[] = [...new Set(pairs.map(p => p.kind))];
+  const viablePairs = opts.dryRun ? pairs : pairs.filter(p => slot.at + publishSafetyMarginMs(eff) < expiresAt(p.material.category, p.material.at));
+  if (!viablePairs.length && pairs.length && !haveRecap) {
+    store.log('column_funnel', { ...funnel, outcome: 'dropped', drop: 'shelf_expired', slot_at: slot.at });
+    report.skipped.push('本轮候选素材到发布时将超过保质期（含调度余量），等待新素材');
+    return report;
+  }
+  const available: string[] = [...new Set(viablePairs.map(p => p.kind))];
   if (haveRecap) available.push('recap');
   // The draw may only spend a sample on a shape this round can actually write. A recap that is
   // drawn and then falls back is not a recap sample, and repeatedly drawing it is how the recap
@@ -231,7 +263,7 @@ export async function generateColumn(
     usedCalls = owedIds;
     variantIds = close ? [close.id] : [];
   } else {
-    const ofKind = pairs.filter(p => p.kind === kind);
+    const ofKind = viablePairs.filter(p => p.kind === kind);
     if (!ofKind.length) {
       store.log('column_funnel', { ...funnel, outcome: 'dropped', drop: 'no_material_fit', kind, slot_at: slot.at, why: '本轮没有适合这个栏目的币' });
       report.skipped.push('本轮没有适合这个栏目的币');
@@ -240,11 +272,6 @@ export async function generateColumn(
     // Within a shape, the strongest candidate: the original ranking for the ledger, otherwise the
     // largest move, so the post is about the coin where the shape is most visible.
     material = [...ofKind].sort((a, b) => Math.abs(Number(b.material.facts.chg24h ?? 0)) - Math.abs(Number(a.material.facts.chg24h ?? 0)))[0]!.material;
-    if (!opts.dryRun && slot.at >= expiresAt(material.category, material.at)) {
-      store.log('column_funnel', { ...funnel, outcome: 'dropped', drop: 'shelf_expired', kind, slot_at: slot.at, symbol: material.symbol, why: '下一个时段已超过这条费率的保质期' });
-      report.skipped.push(`${material.symbol}: 下一个时段已超过这条费率的保质期，不写注定作废的草稿`);
-      return report;
-    }
     const seed = hashString(personaSeed(material.id, account.id, slot.at));
     {
       // 旧 ledger 渲染分支已随停用形态摘除（模板与历史数据留在 content/column.ts，不删）。
@@ -255,7 +282,7 @@ export async function generateColumn(
       if (!res.ok) {
         store.log('column_funnel', { ...funnel, outcome: 'dropped', drop: res.drop, kind, slot_at: slot.at, symbol: material.symbol, why: res.why });
         report.skipped.push(`${material.symbol}: ${res.why}`);
-        return report;
+        return retry(`${kind}:${material.id}`);
       }
       text = res.text; facts = res.facts; trace = res.trace; tplId = `column.${kind}`;
       angle = angleOf(kind, material.facts);
@@ -273,13 +300,12 @@ export async function generateColumn(
     return report;
   }
 
-  // The shapes are fixed, so near-duplicate checks are against *content*, not structure.
-  // The shapes are fixed, so near-duplicate checks are against *content*, not structure.
-  const dup = isDuplicate(text, recentTexts, 0.8);
-  if (dup) {
+  const dup = publicationDuplicate(text, recentTexts, tplId);
+  const clash = collidesWithMatrix(store, settings, account.id, text, now, true);
+  if (dup || clash) {
     store.log('column_funnel', { ...funnel, outcome: 'dropped', drop: 'near_duplicate', kind, slot_at: slot.at, symbol: material?.symbol ?? null, why: '与近期帖子几乎一样' });
     report.skipped.push(`${material?.symbol ?? '对账'}: 与近期帖子几乎一样`);
-    return report;
+    return retry(material ? `${kind}:${material.id}` : 'recap');
   }
 
   // Half the column is handed to the rewriter, as the h_column_polish arm, so «does the AI make it
@@ -300,6 +326,10 @@ export async function generateColumn(
 
   // Coin tag plus topic tags, then one disclaimer at the bottom, worded differently post to post.
   text = closeColumnText(eff, text, { material, recapSymbols: owed.map(c => c.symbol), accountId: account.id, slotAt: slot.at });
+  if (publicationDuplicate(text, recentTexts, tplId) || collidesWithMatrix(store, settings, account.id, text, now, true)) {
+    store.log('column_funnel', { ...funnel, outcome: 'dropped', drop: 'near_duplicate', kind, slot_at: slot.at, why: '最终文案与近期帖子重复' });
+    return retry(material ? `${kind}:${material.id}` : 'recap');
+  }
 
   // The chart goes through the same playbook as every other post, so the h_chart arm decides it
   // and the comparison is not contaminated by this lane always attaching one.

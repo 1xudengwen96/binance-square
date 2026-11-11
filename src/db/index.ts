@@ -880,7 +880,7 @@ export class Store {
    * the list labels and the analysis; two implementations would drift, and the drift would
    * show up as the page and the summary disagreeing about what a post was.
    */
-  postsForList(opts: { statuses: string[]; sort?: 'recent' | 'views'; limit?: number }): (PostRow & ListAttribution)[] {
+  postsForList(opts: { statuses: string[]; sort?: 'recent' | 'views'; limit?: number; accountId?: number }): (PostRow & ListAttribution)[] {
     const marks = opts.statuses.map(() => '?').join(',');
     // A post with no reading must not be treated as zero views — sorted next to a real 0 it
     // would read as "measured and nobody watched", which is a different fact.
@@ -897,11 +897,11 @@ export class Store {
          LEFT JOIN templates t ON t.id = p.template_id
          LEFT JOIN accounts a ON a.id = p.account_id
          LEFT JOIN post_stats s ON s.post_id = p.id
-         WHERE p.status IN (${marks})
+         WHERE p.status IN (${marks}) ${opts.accountId ? 'AND p.account_id = ?' : ''}
          ${order}
          LIMIT ?`,
       )
-      .all(...opts.statuses, opts.limit ?? 150) as (PostRow & ListAttribution)[];
+      .all(...opts.statuses, ...(opts.accountId ? [opts.accountId] : []), opts.limit ?? 150) as (PostRow & ListAttribution)[];
   }
 
   /* ------------------------------------------------------------ templates */
@@ -984,12 +984,14 @@ export class Store {
 
   /* ----------------------------------------------------------------- lanes */
 
-  /** Drafts made today (any non-rejected status) on one lane of one account. */
+  /** Delivered today plus live reservations. Failed/rejected drafts release their capacity. */
   laneUsage(accountId: number, lane: 'short' | 'long', dayStart: number): number {
     const table = lane === 'long' ? 'studio_articles' : 'posts';
     const row = this.db
-      .prepare(`SELECT COUNT(*) AS n FROM ${table} WHERE account_id = ? AND created_at >= ? AND status != 'rejected'`)
-      .get(accountId, dayStart) as { n: number };
+      .prepare(`SELECT COUNT(*) AS n FROM ${table} WHERE account_id = @a AND
+        ((status = 'published' AND COALESCE(published_at, created_at) >= @d)
+         OR (status IN ('draft','approved','uncertain') AND created_at >= @d))`)
+      .get({ a: accountId, d: dayStart }) as { n: number };
     return row.n;
   }
 
@@ -1692,6 +1694,12 @@ export class Store {
           .prepare("SELECT MAX(published_at) AS t FROM posts WHERE account_id = ? AND status IN ('published','uncertain') AND published_at <= ?")
           .get(accountId, now);
     return (row as { t: number | null }).t ?? 0;
+  }
+
+  slotClaims(horizon: number): { id: number; account_id: number | null; at: number }[] {
+    return this.db.prepare(`SELECT id, account_id, COALESCE(scheduled_at, created_at) AS at
+      FROM posts WHERE status IN ('draft','approved') AND COALESCE(scheduled_at, created_at) <= ?
+      ORDER BY at, id`).all(horizon) as { id: number; account_id: number | null; at: number }[];
   }
 
   /**

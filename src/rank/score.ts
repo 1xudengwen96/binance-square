@@ -3,6 +3,7 @@ import { distributionRows, type Distribution } from './observations.ts';
 import { CONFIDENCE_TO_ACT, type Hypothesis, type Metric } from './hypotheses.ts';
 import { registry } from './registry.ts';
 import { remember } from '../brain/memory.ts';
+import { formatMetric, metricDescription } from './metrics.ts';
 
 const median = (xs: number[]): number | null => {
   if (!xs.length) return null;
@@ -133,6 +134,26 @@ export interface ArmStat {
   best: number | null;
 }
 
+interface StratumCell {
+  stratum: string;
+  comparable: boolean;
+  arms: { arm: string; n: number; median: number; postIds: number[] }[];
+}
+
+function controlDimensions(h: Hypothesis): string[] {
+  if (h.dimension === 'column' || h.mode === 'observed') {
+    return ['column', 'length_band', 'hour_band'].filter(d => d !== h.dimension);
+  }
+  return [];
+}
+
+function controlValue(r: Row, dimension: string): string {
+  if (dimension === 'column') {
+    return r.arms?.h_column ?? (r.template_id?.startsWith('column.') ? r.template_id.slice(7) : '未登记栏目');
+  }
+  return armOf(r, { mode: 'observed', dimension } as Hypothesis) ?? '未知';
+}
+
 export interface Verdict {
   id: string;
   claim: string;
@@ -147,6 +168,7 @@ export interface Verdict {
   effect: number;
   /** Same comparison inside (category × heat) strata. This is the number promotion is judged on. */
   stratified: {
+    controls: string[]; cells: StratumCell[];
     gap: number | null; rel: number | null; strata: number; dropped: number; winner: string | null;
     /** Strata in which the overall winner also came first — «is the direction the same once heat is held». */
     agree: number;
@@ -165,9 +187,7 @@ export interface Verdict {
 }
 
 function fmt(metric: Metric, v: number | null): string {
-  if (v == null) return '—';
-  if (metric === 'views24h') return Math.round(v).toLocaleString('en-US');
-  return v.toFixed(2);
+  return formatMetric(metric, v);
 }
 
 /**
@@ -181,7 +201,7 @@ function fmt(metric: Metric, v: number | null): string {
 export function scoreAll(store: Store, opts: { days?: number; writeMemory?: boolean; now?: number; target?: 'views' | 'engagement' | 'money'; hypotheses?: Hypothesis[] } = {}): Verdict[] {
   const days = opts.days ?? 30;
   const now = opts.now ?? Date.now();
-  const rows = distributionRows(store, days) as Row[];
+  const rows = distributionRows(store, days, now) as Row[];
   const list = opts.hypotheses ?? registry(store);
   // Pointing the system at money is a real switch, but it only becomes real once the operator
   // has entered a figure. Until then the verdicts stay on views and say so.
@@ -305,7 +325,7 @@ export function scoreAll(store: Store, opts: { days?: number; writeMemory?: bool
     const verdict: Verdict = {
       id: h.id, claim: h.claim, metric, mode: h.mode, how: h.how, risk: h.risk,
       arms, winner, loser, effect: Number(rel.toFixed(3)),
-      stratified: { gap: st.gap, rel: st.rel, strata: st.strata, dropped: st.dropped, winner: st.winner, agree: st.agree, detail: st.detail },
+      stratified: { controls: st.controls, cells: st.cells, gap: st.gap, rel: st.rel, strata: st.strata, dropped: st.dropped, winner: st.winner, agree: st.agree, detail: st.detail },
       replicated,
       confidence: Number(confidence.toFixed(2)), status,
       action: status === 'rule' ? `以后按「${st.winner}」这一档来写：同热度同格子内它比另一档高约 ${st.gap}（${((st.rel ?? 0) * 100).toFixed(0)}%）。` : null,
@@ -314,7 +334,7 @@ export function scoreAll(store: Store, opts: { days?: number; writeMemory?: bool
     out.push(verdict);
 
     if (opts.writeMemory !== false && (status === 'rule' || status === 'flat')) {
-      const detail = arms.map(a2 => `${a2.arm} ${fmt(metric, a2.median)}（${a2.n} 条）`).join('，');
+      const detail = `指标：${metricDescription(metric)}；近 ${days} 天、发布满 24 小时的有效样本；各臂中位数：` + arms.map(a2 => `${a2.arm} ${fmt(metric, a2.median)}（${a2.n} 条）`).join('，');
       remember(store, {
         kind: 'rank-rule',
         key: `rank:${h.id}`,
@@ -423,6 +443,8 @@ function stratumOf(r: Row): string {
 }
 
 interface StratumResult {
+  controls: string[];
+  cells: StratumCell[];
   /** Average of (best arm − worst arm) within each stratum, strata weighted equally. */
   gap: number | null;
   /** Relative to the pooled median, so it is comparable across metrics. */
@@ -436,12 +458,17 @@ interface StratumResult {
 }
 
 function stratify(rows: Row[], h: Hypothesis, metric: Metric): StratumResult {
+  const controls = controlDimensions(h);
   const byStratum = new Map<string, Map<string, number[]>>();
+  const ids = new Map<string, Map<string, number[]>>();
   for (const r of rows) {
     const arm = armOf(r, h);
     const v = outcome(r, metric);
     if (!arm || v == null) continue;
-    const s = stratumOf(r);
+    const s = [stratumOf(r), ...controls.map(d => `${d}=${controlValue(r, d)}`)].join('|');
+    if (!ids.has(s)) ids.set(s, new Map());
+    const armIds = ids.get(s)!;
+    (armIds.get(arm) ?? armIds.set(arm, []).get(arm)!).push(r.post_id);
     if (!byStratum.has(s)) byStratum.set(s, new Map());
     const arms = byStratum.get(s)!;
     (arms.get(arm) ?? arms.set(arm, []).get(arm)!).push(v);
@@ -450,11 +477,16 @@ function stratify(rows: Row[], h: Hypothesis, metric: Metric): StratumResult {
   const wins = new Map<string, number>();
   const pooledAll: number[] = [];
   const detail: StratumResult['detail'] = [];
+  const cells: StratumCell[] = [];
   let dropped = 0;
   for (const [stratum, arms] of byStratum) {
     const present = [...arms.entries()].filter(([, vs]) => vs.length > 0);
     for (const [, vs] of present) pooledAll.push(...vs);
-    if (present.length < 2) {
+    const comparable = present.length >= 2 && !stratum.includes('column=未登记栏目');
+    cells.push({ stratum, comparable, arms: present.map(([arm, vs]) => ({
+      arm, n: vs.length, median: Number(median(vs)!.toFixed(2)), postIds: ids.get(stratum)!.get(arm)!,
+    })) });
+    if (!comparable) {
       dropped++;
       continue;
     }
@@ -465,12 +497,13 @@ function stratify(rows: Row[], h: Hypothesis, metric: Metric): StratumResult {
     wins.set(ranked[0]!.arm, (wins.get(ranked[0]!.arm) ?? 0) + 1);
     detail.push({ stratum, arms: ranked.map(x => ({ arm: x.arm, n: x.n, median: Number(x.m.toFixed(2)) })), winner: ranked[0]!.arm });
   }
-  if (!gaps.length) return { gap: null, rel: null, winner: null, strata: 0, dropped, agree: 0, detail };
+  if (!gaps.length) return { controls, cells, gap: null, rel: null, winner: null, strata: 0, dropped, agree: 0, detail };
   const gap = gaps.reduce((a, b) => a + b, 0) / gaps.length;
   const centre = median(pooledAll) ?? 1;
   const top = [...wins.entries()].sort((a, b) => b[1] - a[1]);
   const clear = top.length > 1 ? top[0]![1] > top[1]![1] : top.length === 1;
   return {
+    controls, cells,
     gap: Number(gap.toFixed(2)),
     rel: Number((gap / Math.max(Math.abs(centre), 1)).toFixed(3)),
     winner: clear ? top[0]![0] : null,
@@ -494,7 +527,7 @@ export function heatProfile(store: Store, opts: { days?: number; now?: number } 
   unbanded: number;
 } {
   const now = opts.now ?? Date.now();
-  const rows = (distributionRows(store, opts.days ?? 30) as Row[])
+  const rows = (distributionRows(store, opts.days ?? 30, now) as Row[])
     .filter(r => now - r.published_at >= MATURITY_FLOOR_MS && r.v24h != null);
   const labels = new Map<string, string>(HEAT_BANDS.map(b => [b.key, b.label]));
   const by = new Map<string, number[]>();

@@ -32,7 +32,7 @@ export function laneCap(store: Store, settings: Settings, accountId: number, lan
   }
   const acct = store.accountById(accountId);
   if (!acct) return 0;
-  return acct.posts_per_day ?? settings.postsPerDay;
+  return Math.min(acct.posts_per_day ?? settings.postsPerDay, settings.dailyCap, 100);
 }
 
 export function laneRoom(store: Store, settings: Settings, accountId: number, lane: Lane, now = Date.now()): number {

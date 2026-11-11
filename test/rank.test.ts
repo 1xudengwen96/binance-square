@@ -311,7 +311,7 @@ test('arm assignment is reproducible and exploits a rule once it exists', () => 
       id: 'h_hashtag_count', claim: 'x', metric: 'views24h' as const, mode: 'experiment' as const,
       how: '', risk: '', arms: [{ arm: 'one', n: 9, median: 100, best: 120 }, { arm: 'two', n: 9, median: 900, best: 1000 }],
       winner: 'two', loser: 'one', effect: 0.9, confidence: 0.9, status: 'rule' as const, action: null, missing: 0,
-      stratified: { gap: 800, rel: 0.9, strata: 3, dropped: 0, winner: 'two', agree: 3, detail: [] }, replicated: true, note: null,
+      stratified: { controls: [], cells: [], gap: 800, rel: 0.9, strata: 3, dropped: 0, winner: 'two', agree: 3, detail: [] }, replicated: true, note: null,
     }];
     const a = planArms({ seed: 12345, verdicts });
     const b = planArms({ seed: 12345, verdicts });
@@ -611,5 +611,46 @@ test('every name in activeExperiments is an experiment the registry can actually
     const verdicts = scoreAll(store, { writeMemory: false });
     const plan = planArms({ seed: 4242, verdicts, only: active });
     assert.deepEqual(Object.keys(plan).sort(), [...active].sort(), 'a name in the list that draws no arm is a lie on the panel');
+  } finally { close(); }
+});
+
+
+test('column, length and hour comparisons expose overlap and refuse fully confounded strata', () => {
+  const { store, close } = tempStore();
+  try {
+    const now = Date.now();
+    const base = Math.floor(now / 86_400_000) * 86_400_000 - 4 * 86_400_000;
+    const add = (column: string, length: number, hour: number, views: number) => post(store, {
+      at: base + hour * 3600_000, text: '字'.repeat(length),
+      views: [10, 20, 30, 40, views], arms: { h_column: column },
+    });
+    const recap = add('recap', 250, 16, 800); // Beijing midnight, long
+    const question = add('question', 80, 1, 100); // Beijing morning, short
+    observeDistribution(store, now);
+    let verdicts = scoreAll(store, { now, writeMemory: false });
+    for (const id of ['h_column', 'h_length_band', 'h_hour_band']) {
+      const v = verdicts.find(v => v.id === id)!;
+      assert.equal(v.stratified.strata, 0, id + ' cannot separate fully overlapping factors');
+      assert.equal(v.stratified.cells.length, 2);
+      assert.equal(v.stratified.dropped, 2);
+      assert.ok(v.stratified.cells.every(c => !c.comparable));
+      assert.deepEqual(v.stratified.cells.flatMap(c => c.arms.flatMap(a => a.postIds)).sort(), [recap, question].sort());
+    }
+    add('question', 250, 16, 400);
+    add('recap', 80, 1, 200);
+    add('recap', 250, 1, 350);
+    observeDistribution(store, now);
+    verdicts = scoreAll(store, { now, writeMemory: false });
+    for (const [id, controls] of [
+      ['h_column', ['length_band', 'hour_band']],
+      ['h_length_band', ['column', 'hour_band']],
+      ['h_hour_band', ['column', 'length_band']],
+    ] as const) {
+      const v = verdicts.find(v => v.id === id)!;
+      assert.deepEqual(v.stratified.controls, controls);
+      assert.ok(v.stratified.strata > 0, id + ' has a controlled comparison after overlap is added');
+      assert.equal(v.stratified.cells.reduce((n, c) => n + c.arms.reduce((n, a) => n + a.n, 0), 0), 5);
+      assert.ok(v.stratified.cells.every(c => c.arms.every(a => a.n === a.postIds.length)));
+    }
   } finally { close(); }
 });

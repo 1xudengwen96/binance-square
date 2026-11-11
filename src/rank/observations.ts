@@ -86,7 +86,7 @@ export function distributionOf(store: Store, postId: number): Distribution | nul
 }
 
 /** Every distribution row joined to what the post was, for scoring and for the panel. */
-export function distributionRows(store: Store, days = 30): (Distribution & {
+export function distributionRows(store: Store, days = 30, now = Date.now()): (Distribution & {
   account_id: number | null; category: string | null; sub_type: string | null; style: string | null;
   template_id: string | null; symbol: string | null; chars: number; has_chart: number; published_at: number; text: string;
   /** Apportioned from the operator's daily entry — a guess weighted by views, not a bill. */
@@ -105,7 +105,7 @@ export function distributionRows(store: Store, days = 30): (Distribution & {
               cv.rebate_usd AS rebate_usd, cv.clicks AS click_credit,
               s.likes AS likes, s.comments AS comments, s.shares AS shares,
               CASE WHEN p.images_json IS NOT NULL AND p.images_json NOT IN ('', '[]') THEN 1 ELSE 0 END AS has_chart,
-              m.category, m.sub_type, t.style, t.id AS template_id, m.symbol
+              m.category, m.sub_type, t.style, p.template_id, m.symbol
        FROM post_distribution d JOIN posts p ON p.id = d.post_id
        LEFT JOIN materials m ON m.id = p.material_id
        LEFT JOIN templates t ON t.id = p.template_id
@@ -114,5 +114,5 @@ export function distributionRows(store: Store, days = 30): (Distribution & {
        WHERE p.status = 'published' AND p.published_at >= ?
        ORDER BY p.published_at DESC`,
     )
-    .all(Date.now() - days * 86_400_000) as never;
+    .all(now - days * 86_400_000) as never;
 }

@@ -78,7 +78,7 @@ export function sanitizeBrainSettings(body: Record<string, unknown>, cur: Settin
       case 'brainMaxTokensSentinel': set(k, Math.round(clamp(v, 200, 4000, cur.brainMaxTokensSentinel))); break;
       case 'brainMaxTokensWeekly': set(k, Math.round(clamp(v, 500, 8000, cur.brainMaxTokensWeekly))); break;
       case 'brainWakeCapPerDay': set(k, Math.round(clamp(v, 0, 10, cur.brainWakeCapPerDay))); break;
-      case 'columnPostsPerDay': set(k, Math.round(clamp(v, 1, 6, cur.columnPostsPerDay))); break;
+      case 'columnPostsPerDay': set(k, Math.round(clamp(v, 1, 100, cur.columnPostsPerDay))); break;
       case 'targetMode':
         if (v === 'auto' || v === 'manual') set(k, v); else errors.push('目标模式只能是 auto 或 manual');
         break;

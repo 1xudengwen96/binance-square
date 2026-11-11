@@ -1240,22 +1240,24 @@ async function materialsView() {
 
 async function queueView() {
   const scope = acctScope();
-  const posts = rowsInScope(await api(`/api/posts?${POST_FILTER === '全部' ? '' : 'status=' + encodeURIComponent(POST_FILTER) + '&'}sort=${POST_SORT}`), ACCT);
-  const all = await api('/api/posts').catch(() => null);
-  const counts = all === null ? [] : rowsInScope(all, ACCT);
+  const posts = rowsInScope(await api(`/api/posts?${POST_FILTER === '全部' ? '' : 'status=' + encodeURIComponent(POST_FILTER) + '&'}sort=${POST_SORT}&accountId=${ACCT}`), ACCT);
+  const summary = await api(`/api/posts/summary?accountId=${ACCT}`).catch(() => null);
   // 六格用整表算，不用被状态筛过的列表算 —— 否则选"已发布"时其余五格全成 0，那是假象。
-  // 整表拉不到时传 null：sixGrid 渲染"未取"，绝不把读不到铺成一排 0。
-  const grid = sixGrid(all === null ? null : counts);
+  // 聚合读不到时显示"未取"，绝不把读不到铺成一排 0。
+  const grid = { ok: summary !== null, cells: STATUS_SIX.map(st => [st, summary ? (summary.counts[st] ?? 0) : null]),
+    other: summary ? Object.entries(summary.counts).filter(([st]) => !STATUS_SIX.includes(st)).reduce((n, [, v]) => n + v, 0) : 0 };
   // 两表口径：pendingQueueCount 是 posts ∪ studio_articles，只看一表必然同屏出现两个真数。
   // /api/studio 是只读列表（articles 里带 status 与 account_id）；拿不到就单列"读不到"。
   const studio = await api('/api/studio').catch(() => null);
   const studioArticles = studio && Array.isArray(studio.articles) ? studio.articles : null;
   const byStatus = {};
-  for (const p of counts) byStatus[p.status] = (byStatus[p.status] ?? 0) + 1;
+  if (summary) Object.assign(byStatus, summary.counts);
+  const pending = summary ? (byStatus.draft ?? 0) + (byStatus.approved ?? 0) : null;
+  const total = summary ? Object.values(byStatus).reduce((n, v) => n + v, 0) : null;
 
-  const label = { 全部: '全部', published: '已发布', draft: '待审核', approved: '已通过', rejected: '已驳回', failed: '失败', uncertain: '状态未知' };
-  const chips = ['全部', ...STATUS_SIX]
-    .map(t => `<button class="chip ${t === POST_FILTER ? 'on' : ''}" onclick="setPostFilter('${t}')">${label[t] ?? t}${t === '全部' ? ` ${counts.length}` : ` ${byStatus[t] ?? 0}`}</button>`)
+  const label = { pending: '待发布', 全部: '全部记录', published: '已发布', draft: '待审核', approved: '已通过', rejected: '已驳回', failed: '失败', uncertain: '状态未知' };
+  const chips = ['pending', '全部', ...STATUS_SIX]
+    .map(t => `<button class="chip ${t === POST_FILTER ? 'on' : ''}" onclick="setPostFilter('${t}')">${label[t] ?? t} ${t === '全部' ? (total ?? '未取') : t === 'pending' ? (pending ?? '未取') : (summary ? (byStatus[t] ?? 0) : '未取')}</button>`)
     .join('');
 
   const n = posts.filter(p => p.stats).length;
@@ -1276,21 +1278,37 @@ async function queueView() {
 
   return `<div class="card">
     ${accountBar(scope)}
-    <div class="card-hd"><h3>发帖记录</h3><span class="sub">${counts.length} 条 · ${esc(scope.caliber)}${all && unownedCount(counts) ? ` · 其中 ${unownedCount(counts)} 条无归属账号（只展示）` : ''}</span>
+    <div class="card-hd"><h3>${POST_FILTER === 'pending' ? '待发布' : '发帖记录'}</h3><span class="sub">共 ${total ?? '未取'} 条历史记录 · ${esc(scope.caliber)}</span>
       <span class="right"><div class="seg">
         <button class="${POST_SORT === 'recent' ? 'on' : ''}" onclick="setPostSort('recent')">最新</button>
         <button class="${POST_SORT === 'views' ? 'on' : ''}" onclick="setPostSort('views')">浏览最多</button>
       </div></span></div>
     <div class="chips">${chips}</div>
     ${banner}
-    <div class="hint">按浏览量排序时，还没拿到读数的帖子排在最后，不会被当成 0 浏览。状态六格分列、不并母。</div>
+    ${queueOutcomesHtml(summary)}
+    <div class="hint">待发布仅含待审核和已通过；过期、重复及复核撤下的稿件保留在历史记录，不占待发布队列。按浏览量排序时，还没拿到读数的帖子排在最后，不会被当成 0 浏览。状态六格分列、不并母。</div>
     ${statusGridHtml(grid, scope)}
-    ${queueSplitHtml(queueSplit(all, studioArticles, ACCT), scope)}
+    ${queueSplitHtml(queueSplitFromSummary(summary, studioArticles, ACCT), scope)}
     ${breakerHtml(STATE.alerts ?? null)}
   </div>
   ${warn}
   ${posts.length ? `<div style="margin-top:14px">${posts.map(postCard).join('')}</div>`
-    : '<div class="card" style="margin-top:14px"><div class="empty"><b>这个视图里没有记录</b><span>换个号或点"全部账号"；先「抓取素材」再「生成草稿」，草稿会出现在这里等审核或直接发布。</span></div></div>'}`;
+    : `<div class="card" style="margin-top:14px"><div class="empty"><b>${POST_FILTER === 'pending' ? '当前没有待发布稿件' : '这个视图里没有记录'}</b><span>${POST_FILTER === 'pending' ? '自动短帖会在临近可发布时间时生成；历史过期、拦截记录可在「全部记录」或「已驳回」查看。' : '换个状态或账号查看历史记录。'}</span></div></div>`}`;
+}
+
+function queueSplitFromSummary(summary, studioRows, acctId) {
+  const q = queueSplit([], studioRows, acctId);
+  if (!summary) { q.ok = false; return q; }
+  q.posts = { draft: summary.counts.draft ?? 0, approved: summary.counts.approved ?? 0,
+    n: Object.values(summary.counts).reduce((n, v) => n + v, 0) };
+  q.total = q.posts.draft + q.posts.approved + q.studio.draft + q.studio.approved;
+  return q;
+}
+
+function queueOutcomesHtml(summary) {
+  if (!summary) return '<div class="hint">近 7 天生成结果：读不到</div>';
+  const r = summary.recent;
+  return `<div class="hint">近 7 天生成的 ${r.total} 条短帖：已发 ${r.published} · 待处理 ${r.pending} · 过期 ${r.expired} · 重复拦截 ${r.duplicate} · 行情前提失效 ${r.marketChanged} · 合规拦截 ${r.compliance} · 其他驳回 ${r.otherRejected} · 发布失败 ${r.failed} · 状态未知 ${r.uncertain}${r.other ? ` · 其他状态 ${r.other}` : ''}。按生成时间统计当前结果，不含未生成成稿的淘汰素材；历史作废不等于当前仍待发布。</div>`;
 }
 
 /** 状态六格分列：一格都不并母；0 就是 0，整表读不到才是"未取"。 */
@@ -1301,7 +1319,7 @@ function statusGridHtml(grid, scope) {
   return `<div class="sixgrid">${cells}</div>
     ${srcLine(tupleOf(grid.ok ? (grid.cells.reduce((a, [, n]) => a + (n || 0), 0)) : null,
       `${scope.caliber} · 状态六格分列（不并母、不合并）`,
-      grid.ok ? `列表接口全量（LIMIT 150/页 · 账号维度在面板侧过滤）${grid.other ? ` · 另有 ${grid.other} 条不在六格内` : ''}` : '整表读不到 · 六格一律显示"未取"'))}`;
+      grid.ok ? `数据库全量聚合（账号维度在服务端过滤）${grid.other ? ` · 另有 ${grid.other} 条不在六格内` : ''}` : '整表读不到 · 六格一律显示"未取"'))}`;
 }
 
 /**
@@ -1386,7 +1404,7 @@ function chartGone(el) {
 const CATEGORY_LABELS = { market_move: '行情异动', funding: '资金费率', long_short: '多空持仓', leaderboard: '涨跌幅榜', sentiment: '市场情绪', stablecoin: '稳定币', trending: '热搜话题', onchain: '链上数据', dex: 'DEX 热门', attention: '广场热度', announcement: '币安公告', newsflash: '快讯消息', liquidation: '爆仓', open_interest: '持仓异动', etf_flow: 'ETF 资金流' };
 const STYLE_LABELS = { tech: '技术结构派', capital: '资金追踪派', data: '数据派', news: '消息转述派', emotion: '情绪派', chat: '第一人称派', joke: '段子手', any: '通用', mixed: '混合风格' };
 
-let POST_FILTER = '全部';
+let POST_FILTER = 'pending';
 let POST_SORT = 'recent';
 let ANALYSIS_DAYS = 14;
 
@@ -2006,18 +2024,21 @@ async function rankView() {
   </div>`;
 
   const cards = d.verdicts.map(v => {
+    const metric = v.metricDefinition;
+    const metricLabel = metric ? `${metric.label}（${v.metric}；${metric.unit}）` : v.metric;
+    const metricValue = value => value == null ? '—' : v.metric === 'views24h' ? Math.round(value).toLocaleString('en-US') : Number(value).toFixed(2);
     const [cls, label] = RANK_STATUS[v.status] ?? ['', v.status];
     const max = Math.max(0, ...v.arms.map(a => a.median ?? 0));
     const bars = v.arms.map(a => `<div class="hbar big${a.median == null ? ' off' : ''}">
         <span>${esc(a.arm)}</span>
         <span class="track"><i style="width:${a.median == null || !max ? 0 : Math.max(3, (a.median / max) * 100)}%;background:${v.winner === a.arm ? 'var(--green)' : 'var(--blue)'}"></i></span>
-        <span class="v"${tip(`${v.id} · ${a.arm}`, [['中位', a.median == null ? '无读数' : Math.round(a.median).toLocaleString('en-US')], ['样本', `${a.n} 条`], ['最好一条', a.best == null ? '—' : Math.round(a.best).toLocaleString('en-US')]])}>${a.median == null ? '—' : Math.round(a.median).toLocaleString('en-US')}<span class="muted">${a.n} 条</span></span>
+        <span class="v"${tip(`${v.id} · ${a.arm}`, [['指标', metricLabel], ['中位数', metricValue(a.median)], ['样本', `${a.n} 条`], ['最好一条', metricValue(a.best)]])}>${metricValue(a.median)}<span class="muted">${a.n} 条</span></span>
       </div>`).join('');
     // 药丸墙换成四格「标签+值」：一眼读完，解释全部进悬浮——页面只留数字。
     const facts = [
       ['样本', `${v.arms.reduce((s, a) => s + a.n, 0)} 条`, v.arms.map(a => `${a.arm} ${a.n} 条`).join(' · ')],
       ['置信', `${(v.confidence * 100).toFixed(0)}%`, '样本量和差距同时够格，才升为规则'],
-      ['分层比', v.stratified.strata >= 1 ? `${v.stratified.agree}/${v.stratified.strata} 层同向` : '0 层·比不了', v.stratified.strata >= 1 ? `同一类别、同一成交额档里对比：领先的那一臂在 ${v.stratified.strata} 层里赢了 ${v.stratified.agree} 层${v.stratified.rel != null ? `；层内相对差距 ${(v.stratified.rel * 100).toFixed(0)}%` : ''}；只有一边有数据、被丢掉 ${v.stratified.dropped} 层` : '没有一层同时有两边的数据 —— 浏览受币的热度影响，得在同热度内比才算数'],
+      ['分层比', v.stratified.strata >= 1 ? `${v.stratified.agree}/${v.stratified.strata} 层同向` : '0 层·比不了', v.stratified.strata >= 1 ? `同一类别、同一成交额档${v.stratified.controls?.length ? `，并控制 ${v.stratified.controls.map(x => ({column: '栏目', length_band: '字数带', hour_band: '时段'}[x] || x)).join('、')}` : ''}里对比：领先的那一臂在 ${v.stratified.strata} 层里赢了 ${v.stratified.agree} 层${v.stratified.rel != null ? `；层内相对差距 ${(v.stratified.rel * 100).toFixed(0)}%` : ''}；只有一边有数据、被丢掉 ${v.stratified.dropped} 层` : '没有一层同时有两边的数据 —— 浏览受币的热度影响，得在同热度内比才算数'],
       ['两半验证', v.replicated === true ? '一致' : v.replicated === false ? '打架' : '未验证', v.replicated === false ? '前半段的赢家后半段不在——多半是噪声' : '前半段测出的赢家，后半段还在不在'],
     ];
     const mrow = facts.map(([l, val, tt]) => `<div class="mf"${tip(l, [['值', String(val)], ['说明', tt]])}><span class="l">${l}</span><b>${esc(val)}</b></div>`).join('');
@@ -2025,15 +2046,18 @@ async function rankView() {
       <div class="vf-hd">
         <span class="dotst ${cls}"></span>
         <div class="vf-t"><h3>${esc(v.claim)}</h3>
-          <span class="vf-sub">${v.mode === 'experiment' ? '主动实验 · 机器人随机分配' : '观察 · 从已发生的事里读'} · 指标 ${esc(v.metric)}${v.status === 'observing' ? ` · 还差 ${v.missing} 条` : ''}</span></div>
+          <span class="vf-sub">${v.mode === 'experiment' ? '主动实验 · 机器人随机分配' : '观察 · 从已发生的事里读'} · 指标 ${esc(metricLabel)}${v.status === 'observing' ? ` · 还差 ${v.missing} 条` : ''}</span></div>
         <span class="pill ${cls} plain">${label}</span>
       </div>
+      <div class="hint">各臂中位数 · ${d.days} 天窗口${metric ? ` · ${esc(metric.formula)}` : ''}</div>
       <div class="hbars">${bars}</div>
+      <details class="src"><summary>统计口径</summary><span>${esc(d.measurementSample || '')}${metric ? `<br>有效样本：${esc(metric.sample)}` : ''}</span></details>
       <div class="mgrid">${mrow}</div>
       ${v.action ? `<div class="alert good" style="margin-top:2px"><svg viewBox="0 0 24 24"><path d="M20 6L9 17l-5-5"/></svg><div>${esc(v.action)}</div></div>` : ''}
       ${v.note ? `<div class="alert warn" style="margin-top:2px"><svg viewBox="0 0 24 24"><path d="M12 9v4M12 17h.01M10.3 3.9L2.4 18a2 2 0 001.7 3h15.8a2 2 0 001.7-3L13.7 3.9a2 2 0 00-3.4 0z"/></svg><div>${esc(v.note)}</div></div>` : ''}
       <details class="src"><summary>方法与代价</summary><span>怎么测：${esc(v.how)} ｜ 代价：${esc(v.risk)}</span></details>
-      ${(v.stratified.detail || []).length ? `<details class="src"><summary>分层明细 · ${v.stratified.detail.length} 层</summary><span>${v.stratified.detail.map(s => `${esc(s.stratum.replace('|', ' · '))}：${s.arms.map(a => `${a.arm === s.winner ? '<b>' : ''}${esc(a.arm)} ${Math.round(a.median).toLocaleString('en-US')}（${a.n}）${a.arm === s.winner ? '</b>' : ''}`).join(' / ')}`).join('<br>')}</span></details>` : ''}
+      ${(v.stratified.cells || []).length ? `<details class="src"><summary>交叉分层覆盖 · ${v.stratified.cells.length} 层（含不可比较层）</summary><span>${v.stratified.cells.map(s => `${esc(s.stratum.replaceAll('|', ' · '))} · ${s.comparable ? '可比较' : '不可比较'}：${s.arms.map(a => `${esc(a.arm)} 中位数 ${metricValue(a.median)} ${esc(metric?.unit || v.metric)}（${a.n} 条；帖子 ${a.postIds.map(id => '#' + id).join(', ')}）`).join(' / ')}`).join('<br>')}</span></details>` : ''}
+      ${(v.stratified.detail || []).length ? `<details class="src"><summary>分层明细 · ${v.stratified.detail.length} 层</summary><span>${v.stratified.detail.map(s => `${esc(s.stratum.replace('|', ' · '))}：${s.arms.map(a => `${a.arm === s.winner ? '<b>' : ''}${esc(a.arm)} ${metricValue(a.median)} ${esc(metric?.unit || v.metric)}（n=${a.n}）${a.arm === s.winner ? '</b>' : ''}`).join(' / ')}`).join('<br>')}</span></details>` : ''}
     </div>`;
   }).join('');
 

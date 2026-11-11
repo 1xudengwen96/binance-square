@@ -2,7 +2,7 @@ import { Store, type AccountRow } from './db/index.ts';
 import { templates as builtinTemplates } from './content/templates.ts';
 import { wordBank } from './content/wordbank.ts';
 import { compose, eligibleTemplates } from './engine/compose.ts';
-import { isStructuralDuplicate } from './engine/guard.ts';
+import { publicationDuplicate } from './engine/guard.ts';
 import { hashString } from './engine/prng.ts';
 import { detectFundingExtremes, detectLeaderboards, detectLongShortSkew, detectMaCrosses, detectOpenInterestMoves, detectPriceMoves } from './collectors/detectors.ts';
 import { fearAndGreed, stablecoinShifts } from './collectors/sentiment.ts';
@@ -12,7 +12,7 @@ import { announcements } from './collectors/announce.ts';
 import { newsflashes } from './collectors/flash.ts';
 import { hyperliquid } from './collectors/hyperliquid.ts';
 import { nextSlot, nextSlotFor, settingsForAccount, settingsFrom } from './schedule.ts';
-import { expiresAt, ttlFor } from './lifecycle.ts';
+import { expiresAt, publishSafetyMarginMs, shouldWaitToDraft, ttlFor } from './lifecycle.ts';
 import { refreshPool, pool, dossier, type PoolEntry } from './hot/pool.ts';
 import {
   CROSS_ACCOUNT_THRESHOLD, accountBlockedTemplates, accountStyles, allocate, collidesWithMatrix, materialAllowedForAccount, personaSeed,
@@ -35,6 +35,8 @@ import { matrixEligibleAccounts } from './studio/lock.ts';
 import { beijingDayStart } from './schedule.ts';
 import { ALERT_KINDS, raise as raiseAlert } from './alerts/bus.ts';
 import { labelRenderable } from './labels.ts';
+import { laneRoom } from './lanes.ts';
+import { automaticDraftBlockReason } from './drafting.ts';
 import { exploreRepeat, planArms, recordArms } from './rank/experiments.ts';
 import { playbook, type Playbook } from './rank/playbook.ts';
 import { followCta, stanceLine, tensionLine } from './content/voice.ts';
@@ -392,6 +394,8 @@ export async function generate(
   // table scan, not something to repeat per post.
   const rankVerdicts: Verdict[] = scoreAll(store, { writeMemory: false });
   const eff = account ? settingsForAccount(settings, account) : settings;
+  const draftingBlock = opts.dryRun ? null : automaticDraftBlockReason(store, settings, eff);
+  if (draftingBlock) { report.skipped.push(draftingBlock); return report; }
   const styles = account ? accountStyles(account) : [eff.style];
   // A draft now reserves its minute a day ahead, so generation is bounded by what the queue can
   // actually deliver: unbounded drafting buries the day's target in material that expires before
@@ -399,12 +403,14 @@ export async function generate(
   // be blocked by how busy it already is.
   if (!opts.dryRun) {
     const pending = store.pendingQueueCount(account?.id ?? null);
-    const room = eff.postsPerDay - pending;
+    const room = Math.min(eff.postsPerDay - pending,
+      account ? laneRoom(store, settings, account.id, 'short') : Infinity);
     if (room <= 0) {
       report.skipped.push(`待发布已有 ${pending} 条，达到该号每天 ${eff.postsPerDay} 条的目标，本轮不再生成`);
       return report;
     }
-    want = Math.min(want, room);
+    // Keep time-sensitive automatic drafts close to delivery instead of filling a whole day.
+    want = Math.min(want, room, eff.autoPublish ? Math.max(0, 2 - pending) : room);
   }
   // P0-7 渲染闸门：persona 核心字段为空 → 直接 fail，不出稿。上一轮的根病是无定位发帖；
   // 灯上写明拒稿原因，运营的标签手册灌入即恢复。dryRun 预览不受闸门影响。
@@ -433,7 +439,7 @@ export async function generate(
   let pastShelfLife = 0;
   for (const m of pool) {
     if (report.created.length >= want) break;
-    const when = Date.now() + report.created.length * nominalGap(eff);
+    const when = Date.now();
     const slot = account ? nextSlotFor(store, settings, account, when, null, true) : nextSlot(store, eff, when, null, true);
     if (!slot.allowed) {
       report.skipped.push(slot.reason);
@@ -443,10 +449,14 @@ export async function generate(
       report.skipped.push('今天的发帖时段已经排满，再写就只能排到明天 —— 停在这里，不写过期的草稿');
       break;
     }
+    if (!opts.dryRun && shouldWaitToDraft(eff, slot.at, when)) {
+      report.skipped.push('尚未临近可发布时间，等下一轮用最新行情生成');
+      break;
+    }
     // The slot has to land while the material is still true. A draft reserved past its own shelf
     // life is not a queued post, it is work the sweeper will delete — and since the ceiling above
     // counts pending drafts, deleting it reopens the ceiling and the next tick writes more.
-    if (!opts.dryRun && slot.at >= expiresAt(m.category, m.at)) {
+    if (!opts.dryRun && slot.at + publishSafetyMarginMs(eff) >= expiresAt(m.category, m.at)) {
       pastShelfLife++;
       continue;
     }
@@ -575,10 +585,6 @@ export async function generate(
   return report;
 }
 
-function nominalGap(settings: Settings): number {
-  return Math.max(settings.minIntervalMinutes, 20) * 60_000;
-}
-
 /**
  * A slot rolled into tomorrow means today's window is already full. Writing another draft then
  * produces a post whose material expires before its minute arrives — the queue cap counts posts,
@@ -704,17 +710,17 @@ export async function publishDue(
     // Last gate before the network: approval can come from the CLI in bulk, so the
     // duplicate check lives here where it cannot be stepped around.
     const alreadySent = store.recentPostTexts(30, ['published', 'uncertain'], acct?.id ?? null);
-    const dupOf = isStructuralDuplicate(post.text, [...alreadySent, ...justSent]);
+    const dupOf = publicationDuplicate(post.text, [...alreadySent, ...justSent], post.template_id);
     if (dupOf) {
-      store.updatePost(post.id, { status: 'draft', error: '发布前发现与已发帖子结构重复，已退回草稿' });
-      report.failed.push({ id: post.id, label: '与已发布内容同句换币，已退回草稿' });
+      store.updatePost(post.id, { status: 'rejected', error: '发布前发现与已发帖子重复，已作废并释放排期' });
+      report.failed.push({ id: post.id, label: '与已发布内容重复，已作废并释放排期' });
       continue;
     }
     // And the matrix gate: another account must not have said this already.
     if (acct) {
-      const clash = collidesWithMatrix(store, settings, acct.id, post.text);
+      const clash = collidesWithMatrix(store, settings, acct.id, post.text, Date.now(), post.template_id?.startsWith('column.'));
       if (clash) {
-        store.updatePost(post.id, { status: 'draft', error: `与「${clash.ownerLabel}」近期文案句式相同（相似度 ${(clash.signature * 100).toFixed(0)}%），已退回草稿` });
+        store.updatePost(post.id, { status: 'rejected', error: `与「${clash.ownerLabel}」近期文案重复（相似度 ${(clash.signature * 100).toFixed(0)}%），已作废并释放排期` });
         report.failed.push({ id: post.id, label: `跨账号撞句（${clash.ownerLabel}）` });
         continue;
       }
@@ -894,6 +900,8 @@ export async function generateFromPool(
   const rankVerdicts: Verdict[] = scoreAll(store, { writeMemory: false });
   const acct = opts.account ?? null;
   const eff = acct ? settingsForAccount(settings, acct) : settings;
+  const draftingBlock = automaticDraftBlockReason(store, settings, eff);
+  if (draftingBlock) { report.skipped.push({ symbol: '*', why: draftingBlock }); return report; }
   const styles = acct ? accountStyles(acct) : [eff.style];
 
   if (opts.refresh !== false && !opts.poolEntries) {
@@ -923,15 +931,18 @@ export async function generateFromPool(
 
   // Same ceiling as `generate`, and the same reason: a draft whose minute lands after tonight's
   // window is a draft that expires before anyone reads it.
-  const room = eff.postsPerDay - store.pendingQueueCount(acct?.id ?? null);
+  const pending = store.pendingQueueCount(acct?.id ?? null);
+  const room = Math.min(eff.postsPerDay - pending,
+    acct ? laneRoom(store, settings, acct.id, 'short') : Infinity,
+    eff.autoPublish ? Math.max(0, 2 - pending) : Infinity);
   if (room <= 0) {
     report.skipped.push({ symbol: '*', why: `待发布已排到 ${eff.postsPerDay} 条上限，本轮不再生成` });
     return report;
   }
   const budget = Math.min(opts.count ?? 2, room);
 
-  for (const [i, e] of mature.slice(0, budget).entries()) {
-    const when = Date.now() + i * nominalGap(eff);
+  for (const e of mature.slice(0, budget)) {
+    const when = Date.now();
     const slot = acct ? nextSlotFor(store, settings, acct, when, null, true) : nextSlot(store, eff, when, null, true);
     if (!slot.allowed) {
       report.skipped.push({ symbol: e.symbol, why: slot.reason });
@@ -941,9 +952,13 @@ export async function generateFromPool(
       report.skipped.push({ symbol: e.symbol, why: '今天的发帖时段已排满，再写就只能排到明天' });
       break;
     }
+    if (shouldWaitToDraft(eff, slot.at, when)) {
+      report.skipped.push({ symbol: e.symbol, why: '尚未临近可发布时间，等下一轮用最新行情生成' });
+      break;
+    }
     // This material is minted fresh, so its clock starts now — but the slot may be hours out, and
     // a热度跟进 posted after the热度 has moved on is worse than not posting it.
-    if (slot.at >= expiresAt('attention', Date.now())) {
+    if (slot.at + publishSafetyMarginMs(eff) >= expiresAt('attention', Date.now())) {
       report.skipped.push({ symbol: e.symbol, why: `下一个可用时段已超出热度保质期（${Math.round(ttlFor('attention') / 60)} 小时），不写注定作废的草稿` });
       continue;
     }

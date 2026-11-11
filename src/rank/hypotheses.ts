@@ -135,13 +135,13 @@ export const HYPOTHESES: Hypothesis[] = [
   },
   {
     id: 'h_hour_band',
-    claim: '发帖时刻决定第一小时的推送量',
+    claim: '不同发帖时段的帖子，其 24 小时浏览量存在差异',
     mode: 'observed',
     dimension: 'hour_band',
     arms: ['morning', 'midday', 'afternoon', 'evening', 'late'],
     metric: 'views24h',
     minSamples: 5,
-    how: '按北京时间时段带分组比较 24 小时浏览量与首小时增速。',
+    how: '按北京时间时段带分组比较 24 小时浏览量；这是观察关联，不据此判断首小时推送量或因果。',
     risk: '观察：时段与当时有什么素材相关，热门币本来就集中在某些小时。',
   },
   {
@@ -185,13 +185,13 @@ export const HYPOTHESES: Hypothesis[] = [
   // evidence among the things that quietly destroy account weight.
   {
     id: 'h_hook_form',
-    claim: '首句先给结论、把数字放到第二句，比直接以数据开头更能留住前三秒',
+    claim: '首句先给结论、把数字放到第二句，比直接以数据开头获得更多 24 小时浏览量',
     mode: 'experiment',
     dimension: 'hook_form',
     arms: ['data', 'tension'],
     metric: 'views24h',
     minSamples: 10,
-    how: '随机让一半帖子以一句方向重述开头（不含新数字），另一半保持现在的 $币 加数据开头，比较 24 小时浏览量。',
+    how: '随机让一半帖子以一句方向重述开头（不含新数字），另一半保持现在的 $币 加数据开头，比较 24 小时浏览量；平台未提供前三秒留存读数，浏览量不能验证前三秒留存。',
     risk: '首句变短变软，可能让挂币识别变弱；另一半是对现状的对照，不会比现在更差。',
   },
   {

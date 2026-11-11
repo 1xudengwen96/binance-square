@@ -9,6 +9,7 @@ import { liveKnobs, proposeChange } from '../rank/params.ts';
 import { signalLabel } from '../stats/insight.ts';
 import { settingsFrom } from '../schedule.ts';
 import { UPGRADE_AREAS, fileFromReply, upgradesForSnapshot } from './upgrades.ts';
+import { formatMetric, metricDescription, MEASUREMENT_SAMPLE } from '../rank/metrics.ts';
 
 /**
  * The part that behaves like a person who writes regularly: before drafting, it re-reads what it
@@ -73,7 +74,7 @@ export async function reflect(store: Store, brain: Brain | null, opts: { days?: 
 
   const registered = registry(store);
   const evidence = verdicts
-    .map(v => `${v.id} [${v.status}] ${v.claim}｜${v.arms.map(a => `${a.arm}=${a.median == null ? '—' : Math.round(a.median)}/${a.n}`).join(' ')}`)
+    .map(v => `${v.id} [${v.status}] ${v.claim}｜实际判定指标：${metricDescription(v.metric)}｜${v.arms.map(a => `${a.arm}: median=${formatMetric(v.metric, a.median)}, n=${a.n}`).join('；')}`)
     .join('\n');
   const vocabulary = DIMENSION_NAMES
     .map(d => `${d}（${DIMENSIONS[d].label}，臂 ${DIMENSIONS[d].arms.join('/')}，${DIMENSIONS[d].kind === 'knob' ? '可随机分配' : '只能观察'}）`)
@@ -106,7 +107,7 @@ export async function reflect(store: Store, brain: Brain | null, opts: { days?: 
    领域代号：${Object.keys(UPGRADE_AREAS).join(' / ')}。下面「已登记的升级需求」里有的不要换个说法再提。
 
 **已经登记在测的比较见下面，复述它们会被系统拒绝。如果你觉得答案就是"继续攒样本"，那就只输出第 3 类或者什么都不输出。**`,
-    context: `最近 30 天各假设的测量结果（median/样本数）：\n${evidence}\n\n已经在测的主张：\n${registered.map(h => `- ${h.id}: ${h.claim}`).join('\n')}\n\n还没结论的实验：${stuck.map(v => `${v.id}(还需 ${v.missing} 条)`).join('、') || '无'}\n\n已登记的升级需求：${upgradesForSnapshot(store).open.map(u => `#${u.id} ${u.title}`).join('；') || '无'}`,
+    context: `最近 ${opts.days ?? 30} 天各假设的测量结果：\n统计口径：${MEASUREMENT_SAMPLE}\n${evidence}\n\n已经在测的主张：\n${registered.map(h => `- ${h.id}: ${h.claim}（登记指标：${h.metric}）`).join('\n')}\n\n还没结论的实验：${stuck.map(v => `${v.id}(还需 ${v.missing} 条)`).join('、') || '无'}\n\n已登记的升级需求：${upgradesForSnapshot(store).open.map(u => `#${u.id} ${u.title}`).join('；') || '无'}`,
     maxTokens: settings.brainMaxTokensDaily,
   });
   if (!r.ok) {
